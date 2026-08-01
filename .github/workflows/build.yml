@@ -86,7 +86,10 @@ jobs:
           export CC="/usr/bin/clang -arch x86_64"
           export CXX="/usr/bin/clang++ -arch x86_64"
           export PKG_CONFIG_PATH="$NIX_PKG_CONFIG_PATH"
-          export CFLAGS="-O2 -Wno-error=implicit-function-declaration $NIX_INCS"
+          export CFLAGS="-O3 -Wno-error=implicit-function-declaration $NIX_INCS"
+          # the PE half is built by llvm-mingw and takes CROSSCFLAGS, which
+          # otherwise defaults to "-g -O2"
+          export CROSSCFLAGS="-g -O3"
           export LDFLAGS="$NIX_LDFS"
           export ac_cv_lib_soname_freetype="libfreetype.6.dylib"
           export ac_cv_lib_soname_gnutls="libgnutls.30.dylib"

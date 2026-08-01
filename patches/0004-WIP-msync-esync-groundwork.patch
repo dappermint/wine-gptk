@@ -1,9 +1,9 @@
 WIP: msync/esync on wine 11.14 - client complete, server minimal.
 
-wine 11 renamed ntdll_get_thread_data to get_thread_data, takes a WAIT_TYPE
-in NtWaitForMultipleObjects, and converted object_ops to designated
-initialisers (dropping no_add_queue, default_get_sd and friends), so the
-copied sources are adjusted to match.
+Adjusted for wine 11: ntdll_get_thread_data became get_thread_data,
+NtWaitForMultipleObjects takes a WAIT_TYPE, object_ops moved to designated
+initialisers (dropping no_add_queue, default_get_sd and friends), and
+receive_fd was renamed and exported as wine_server_receive_fd.
 
 diff --git a/README.esync b/README.esync
 new file mode 100644
@@ -223,7 +223,7 @@ index 9a15bc319a..30c6a3f0a1 100644
  	unix/process.c \
 diff --git a/dlls/ntdll/unix/esync.c b/dlls/ntdll/unix/esync.c
 new file mode 100644
-index 0000000000..dcdd03ee0e
+index 0000000000..45adc4a67f
 --- /dev/null
 +++ b/dlls/ntdll/unix/esync.c
 @@ -0,0 +1,1477 @@
@@ -496,7 +496,7 @@ index 0000000000..dcdd03ee0e
 +            req->handle = wine_server_obj_handle( handle );
 +            if (!(ret = wine_server_call( req )))
 +            {
-+                writefd = receive_fd( &fd_handle );
++                writefd = wine_server_receive_fd( &fd_handle );
 +                assert( wine_server_ptr_handle(fd_handle) == handle );
 +            }
 +        }
@@ -586,7 +586,7 @@ index 0000000000..dcdd03ee0e
 +            {
 +                type = reply->type;
 +                shm_idx = reply->shm_idx;
-+                fd = receive_fd( &fd_handle );
++                fd = wine_server_receive_fd( &fd_handle );
 +                assert( wine_server_ptr_handle(fd_handle) == handle );
 +            }
 +        }
@@ -661,7 +661,7 @@ index 0000000000..dcdd03ee0e
 +            *handle = wine_server_ptr_handle( reply->handle );
 +            type = reply->type;
 +            shm_idx = reply->shm_idx;
-+            fd = receive_fd( &fd_handle );
++            fd = wine_server_receive_fd( &fd_handle );
 +            assert( wine_server_ptr_handle(fd_handle) == *handle );
 +        }
 +    }
@@ -701,7 +701,7 @@ index 0000000000..dcdd03ee0e
 +            *handle = wine_server_ptr_handle( reply->handle );
 +            type = reply->type;
 +            shm_idx = reply->shm_idx;
-+            fd = receive_fd( &fd_handle );
++            fd = wine_server_receive_fd( &fd_handle );
 +            assert( wine_server_ptr_handle(fd_handle) == *handle );
 +        }
 +    }
@@ -1182,7 +1182,7 @@ index 0000000000..dcdd03ee0e
 +        {
 +            if (!(ret = wine_server_call( req )))
 +            {
-+                fd = receive_fd( &fd_handle );
++                fd = wine_server_receive_fd( &fd_handle );
 +                assert( fd_handle == GetCurrentThreadId() );
 +            }
 +        }
