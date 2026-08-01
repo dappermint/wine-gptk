@@ -1,8 +1,9 @@
 WIP: msync/esync on wine 11.14 - client complete, server minimal.
 
-wine 11 renamed ntdll_get_thread_data to get_thread_data, and
-NtWaitForMultipleObjects takes a WAIT_TYPE rather than a wait_any
-boolean, so the dispatch hooks are adjusted accordingly.
+wine 11 renamed ntdll_get_thread_data to get_thread_data, takes a WAIT_TYPE
+in NtWaitForMultipleObjects, and converted object_ops to designated
+initialisers (dropping no_add_queue, default_get_sd and friends), so the
+copied sources are adjusted to match.
 
 diff --git a/README.esync b/README.esync
 new file mode 100644
@@ -4081,10 +4082,10 @@ index 0dd53951c4..4d42597ccf 100644
  	inproc_sync.c \
 diff --git a/server/esync.c b/server/esync.c
 new file mode 100644
-index 0000000000..b69f778cbb
+index 0000000000..d5fb4947e4
 --- /dev/null
 +++ b/server/esync.c
-@@ -0,0 +1,697 @@
+@@ -0,0 +1,682 @@
 +/*
 + * eventfd-based synchronization objects
 + *
@@ -4218,28 +4219,13 @@ index 0000000000..b69f778cbb
 +
 +const struct object_ops esync_ops =
 +{
-+    sizeof(struct esync),      /* size */
-+    &no_type,                  /* type */
-+    esync_dump,                /* dump */
-+    no_add_queue,              /* add_queue */
-+    NULL,                      /* remove_queue */
-+    NULL,                      /* signaled */
-+    NULL,                      /* satisfied */
-+    no_signal,                 /* signal */
-+    no_get_fd,                 /* get_fd */
-+    esync_map_access,          /* map_access */
-+    default_get_sd,            /* get_sd */
-+    default_set_sd,            /* set_sd */
-+    default_get_full_name,     /* get_full_name */
-+    no_lookup_name,            /* lookup_name */
-+    directory_link_name,       /* link_name */
-+    default_unlink_name,       /* unlink_name */
-+    no_open_file,              /* open_file */
-+    no_kernel_obj_list,        /* get_kernel_obj_list */
-+    no_close_handle,           /* close_handle */
-+    esync_destroy,             /* destroy */
-+    esync_get_esync_fd,        /* get_esync_fd */
-+    NULL,                      /* get_msync_idx */
++    .size          = sizeof(struct esync),
++    .type          = &no_type,
++    .dump          = esync_dump,
++    .map_access    = esync_map_access,
++    .link_name     = directory_link_name,
++    .destroy       = esync_destroy,
++    .get_esync_fd = esync_get_esync_fd,
 +};
 +
 +static void esync_dump( struct object *obj, int verbose )
@@ -4937,10 +4923,10 @@ index 46419a09cb..c53cfe3436 100644
      init_signals();
 diff --git a/server/msync.c b/server/msync.c
 new file mode 100644
-index 0000000000..9a5b3a878b
+index 0000000000..40e053d94f
 --- /dev/null
 +++ b/server/msync.c
-@@ -0,0 +1,1042 @@
+@@ -0,0 +1,1027 @@
 +/*
 + * mach semaphore-based synchronization objects
 + *
@@ -5565,28 +5551,13 @@ index 0000000000..9a5b3a878b
 +
 +const struct object_ops msync_ops =
 +{
-+    sizeof(struct msync),      /* size */
-+    &no_type,                  /* type */
-+    msync_dump,                /* dump */
-+    no_add_queue,              /* add_queue */
-+    NULL,                      /* remove_queue */
-+    NULL,                      /* signaled */
-+    NULL,                      /* satisfied */
-+    no_signal,                 /* signal */
-+    no_get_fd,                 /* get_fd */
-+    msync_map_access,          /* map_access */
-+    default_get_sd,            /* get_sd */
-+    default_set_sd,            /* set_sd */
-+    no_get_full_name,          /* get_full_name */
-+    no_lookup_name,            /* lookup_name */
-+    directory_link_name,       /* link_name */
-+    default_unlink_name,       /* unlink_name */
-+    no_open_file,              /* open_file */
-+    no_kernel_obj_list,        /* get_kernel_obj_list */
-+    no_close_handle,           /* close_handle */
-+    msync_destroy,             /* destroy */
-+    NULL,                      /* get_esync_fd */
-+    msync_get_msync_idx,       /* get_msync_idx */
++    .size          = sizeof(struct msync),
++    .type          = &no_type,
++    .dump          = msync_dump,
++    .map_access    = msync_map_access,
++    .link_name     = directory_link_name,
++    .destroy       = msync_destroy,
++    .get_msync_idx = msync_get_msync_idx,
 +};
 +
 +static void msync_dump( struct object *obj, int verbose )
