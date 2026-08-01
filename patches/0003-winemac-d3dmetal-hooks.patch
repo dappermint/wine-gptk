@@ -1,22 +1,24 @@
 winemac: Add the D3DMetal graphics driver hooks.
 
-Ported from CrossOver 25.1.0 (dlls/winemac.drv/d3dmetal.c, Brendan Shanks
-for CodeWeavers, LGPL like the rest of wine).  D3DMetal, the Direct3D half
-of Apple's Game Porting Toolkit, binds to the exported macdrv_functions
-symbol; the two C_ASSERTs on the struct sizes are the ABI contract with
-Apple's closed source dylib and must not be changed.
+Ported from CrossOver 25.1.0 (Brendan Shanks for CodeWeavers, LGPL like the
+rest of wine).  D3DMetal, the Direct3D half of Apple's Game Porting Toolkit,
+binds to the exported macdrv_functions symbol; the two C_ASSERTs on the struct
+sizes are the ABI contract with Apple's closed source dylib and must not change.
 
-Adapted for wine 11: macdrv_win_data lost cocoa_view and client_cocoa_view
-in favour of a single client_view, and lost swap_interval.
+The shim calls back into the PE side for registry access, so this also carries
+the regcreateopenkeyexa/regqueryvalueexa/regsetvalueexa callback plumbing across
+unixlib.h, macdrv.h, macdrv_main.c and dllmain.c, mirroring the existing
+app_icon_callback pattern including the wow64 thunk.
 
-KNOWN RISK, untested: in wine 10 client_cocoa_view was a persistent per
-window view created on demand.  In wine 11 client_view is owned by the
-client surface and is NULL until one attaches (window.c sets it on attach
-and clears it on detach).  If D3DMetal expects a view to already exist,
-this needs to force one via macdrv_CreateClientSurface() instead of just
-reading the field.  Note upstream 6bb2b21dc3 warns about taking the window
-lock while creating a client surface, so that cannot simply be done inline
-inside get_win_data().
+Adapted for wine 11: macdrv_win_data lost cocoa_view and client_cocoa_view in
+favour of a single client_view, and lost swap_interval.
+
+KNOWN RISK, untested: in wine 10 client_cocoa_view was a persistent per window
+view.  In wine 11 client_view is owned by the client surface and is NULL until
+one attaches (window.c sets it on attach, clears it on detach).  If D3DMetal
+expects a view to already exist this needs to force one via
+macdrv_CreateClientSurface(), though not inline while holding the window lock,
+see upstream 6bb2b21dc3.
 
 diff --git a/dlls/winemac.drv/Makefile.in b/dlls/winemac.drv/Makefile.in
 index 576a2fbd0c..4ba1bd9d25 100644
@@ -443,3 +445,203 @@ index 0000000000..99c3b633bf
 +};
 +
 +#endif
+diff --git a/dlls/winemac.drv/dllmain.c b/dlls/winemac.drv/dllmain.c
+index bbd528d53b..a5394e743c 100644
+--- a/dlls/winemac.drv/dllmain.c
++++ b/dlls/winemac.drv/dllmain.c
+@@ -25,6 +25,7 @@
+ #include "ntgdi.h"
+ #include "macdrv_res.h"
+ #include "shellapi.h"
++#include "winreg.h"
+ #include "unixlib.h"
+ #include "wine/debug.h"
+ 
+@@ -369,6 +370,56 @@ cleanup:
+ }
+ 
+ 
++static NTSTATUS WINAPI macdrv_regcreateopenkeyexa(void *arg, ULONG size)
++{
++    struct regcreateopenkeyexa_params *params = arg;
++    LONG result;
++
++    TRACE("()\n");
++
++    if (params->create)
++        result = RegCreateKeyExA(UlongToHandle(params->hkey), param_ptr(params->name),
++                                 params->reserved, param_ptr(params->class), params->options,
++                                 params->access, param_ptr(params->security),
++                                 param_ptr(params->retkey), param_ptr(params->disposition));
++    else
++        result = RegOpenKeyExA(UlongToHandle(params->hkey), param_ptr(params->name),
++                               params->options, params->access, param_ptr(params->retkey));
++
++    *(LONG *)param_ptr(params->result) = result;
++    return 0;
++}
++
++static NTSTATUS WINAPI macdrv_regqueryvalueexa(void *arg, ULONG size)
++{
++    struct regqueryvalueexa_params *params = arg;
++    LONG result;
++
++    TRACE("()\n");
++
++    result = RegQueryValueExA(UlongToHandle(params->hkey), param_ptr(params->name),
++                              param_ptr(params->reserved), param_ptr(params->type),
++                              param_ptr(params->data), param_ptr(params->count));
++
++    *(LONG *)param_ptr(params->result) = result;
++    return 0;
++}
++
++static NTSTATUS WINAPI macdrv_regsetvalueexa(void *arg, ULONG size)
++{
++    struct regsetvalueexa_params *params = arg;
++    LONG result;
++
++    TRACE("()\n");
++
++    result = RegSetValueExA(UlongToHandle(params->hkey), param_ptr(params->name),
++                            params->reserved, params->type,
++                            param_ptr(params->data), params->count);
++
++    *(LONG *)param_ptr(params->result) = result;
++    return 0;
++}
++
+ static BOOL process_attach(void)
+ {
+     struct init_params params;
+@@ -398,6 +449,9 @@ static BOOL process_attach(void)
+         str->len = LoadStringW(macdrv_module, str->id, (WCHAR *)&str->str, 0);
+     params.strings = strings;
+     params.app_icon_callback = (UINT_PTR)macdrv_app_icon;
++    params.regcreateopenkeyexa_callback = (UINT_PTR)macdrv_regcreateopenkeyexa;
++    params.regqueryvalueexa_callback = (UINT_PTR)macdrv_regqueryvalueexa;
++    params.regsetvalueexa_callback = (UINT_PTR)macdrv_regsetvalueexa;
+     params.app_quit_request_callback = (UINT_PTR)macdrv_app_quit_request;
+ 
+     if (MACDRV_CALL(init, &params)) return FALSE;
+diff --git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
+index aeeadae122..1998038769 100644
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -43,6 +43,9 @@
+ extern BOOL allow_software_rendering;
+ 
+ extern UINT64 app_icon_callback;
++extern UINT64 regcreateopenkeyexa_callback;
++extern UINT64 regqueryvalueexa_callback;
++extern UINT64 regsetvalueexa_callback;
+ extern UINT64 app_quit_request_callback;
+ 
+ extern const char* debugstr_cf(CFTypeRef t);
+diff --git a/dlls/winemac.drv/macdrv_main.c b/dlls/winemac.drv/macdrv_main.c
+index 96168242cc..b9ea188639 100644
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -60,6 +60,9 @@ bool enable_app_nap = false;
+ 
+ pthread_key_t macdrv_thread_data_key = 0;
+ UINT64 app_icon_callback = 0;
++UINT64 regcreateopenkeyexa_callback = 0;
++UINT64 regqueryvalueexa_callback = 0;
++UINT64 regsetvalueexa_callback = 0;
+ UINT64 app_quit_request_callback = 0;
+ 
+ CFDictionaryRef localized_strings;
+@@ -430,6 +433,9 @@ static NTSTATUS macdrv_init(void *arg)
+     OSStatus status;
+ 
+     app_icon_callback = params->app_icon_callback;
++    regcreateopenkeyexa_callback = params->regcreateopenkeyexa_callback;
++    regqueryvalueexa_callback = params->regqueryvalueexa_callback;
++    regsetvalueexa_callback = params->regsetvalueexa_callback;
+     app_quit_request_callback = params->app_quit_request_callback;
+ 
+     status = SessionGetInfo(callerSecuritySession, NULL, &attributes);
+@@ -622,12 +628,18 @@ static NTSTATUS wow64_init(void *arg)
+         ULONG strings;
+         UINT64 app_icon_callback;
+         UINT64 app_quit_request_callback;
++        UINT64 regcreateopenkeyexa_callback;
++        UINT64 regqueryvalueexa_callback;
++        UINT64 regsetvalueexa_callback;
+     } *params32 = arg;
+     struct init_params params;
+ 
+     params.strings = UlongToPtr(params32->strings);
+     params.app_icon_callback = params32->app_icon_callback;
+     params.app_quit_request_callback = params32->app_quit_request_callback;
++    params.regcreateopenkeyexa_callback = params32->regcreateopenkeyexa_callback;
++    params.regqueryvalueexa_callback = params32->regqueryvalueexa_callback;
++    params.regsetvalueexa_callback = params32->regsetvalueexa_callback;
+     return macdrv_init(&params);
+ }
+ 
+diff --git a/dlls/winemac.drv/unixlib.h b/dlls/winemac.drv/unixlib.h
+index dc22da02d2..c6a1787faf 100644
+--- a/dlls/winemac.drv/unixlib.h
++++ b/dlls/winemac.drv/unixlib.h
+@@ -40,6 +40,9 @@
+ {
+     struct localized_string *strings;
+     UINT64 app_icon_callback;
++    UINT64 regcreateopenkeyexa_callback;
++    UINT64 regqueryvalueexa_callback;
++    UINT64 regsetvalueexa_callback;
+     UINT64 app_quit_request_callback;
+ };
+ 
+@@ -71,6 +74,49 @@
+     UINT32 hwnd;
+ };
+ 
++/* macdrv_regcreateopenkeyexa params */
++struct regcreateopenkeyexa_params
++{
++    struct dispatch_callback_params dispatch;
++    UINT32 create;
++    UINT32 hkey;
++    UINT64 name;
++    UINT32 reserved;
++    UINT64 class;
++    UINT32 options;
++    UINT32 access;
++    UINT64 security;
++    UINT64 retkey;
++    UINT64 disposition;
++    UINT32 result;
++};
++
++/* macdrv_regqueryvalueexa params */
++struct regqueryvalueexa_params
++{
++    struct dispatch_callback_params dispatch;
++    UINT32 hkey;
++    UINT64 name;
++    UINT64 reserved;
++    UINT64 type;
++    UINT64 data;
++    UINT64 count;
++    UINT32 result;
++};
++
++/* macdrv_regsetvalueexa params */
++struct regsetvalueexa_params
++{
++    struct dispatch_callback_params dispatch;
++    UINT32 hkey;
++    UINT64 name;
++    UINT32 reserved;
++    UINT32 type;
++    UINT64 data;
++    UINT32 count;
++    UINT32 result;
++};
++
+ static inline void *param_ptr(UINT64 param)
+ {
+     return (void *)(UINT_PTR)param;
