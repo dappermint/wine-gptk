@@ -2,8 +2,10 @@ WIP: msync/esync on wine 11.14 - client complete, server minimal.
 
 Adjusted for wine 11: ntdll_get_thread_data became get_thread_data,
 NtWaitForMultipleObjects takes a WAIT_TYPE, object_ops moved to designated
-initialisers (dropping no_add_queue, default_get_sd and friends), and
-receive_fd was renamed and exported as wine_server_receive_fd.
+initialisers, and receive_fd is now the exported wine_server_receive_fd.
+
+The esync_msgwait and msync_msgwait handlers live in queue.c rather than
+in esync.c/msync.c, since they poke the message queue.
 
 diff --git a/README.esync b/README.esync
 new file mode 100644
@@ -6145,6 +6147,71 @@ index 1399b694ed..31795c6f04 100644
 +@REPLY
 +    unsigned int shm_idx;
 +@END
+diff --git a/server/queue.c b/server/queue.c
+index b89a0dc5c6..ce54092b2e 100644
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -126,6 +126,8 @@ struct msg_queue
+     int                    quit_message;    /* is there a pending quit message? */
+     int                    exit_code;       /* exit code of pending quit message */
+     int                    cursor_count;    /* per-queue cursor show count */
++    int                    esync_in_msgwait; /* our thread is currently waiting on us */
++    int                    msync_in_msgwait; /* our thread is currently waiting on us */
+     struct list            msg_list[NB_MSG_KINDS];  /* lists of messages */
+     struct list            send_result;     /* stack of sent messages waiting for result */
+     struct list            callback_result; /* list of callback messages waiting for result */
+@@ -272,6 +274,8 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
+         queue->hotkey_count    = 0;
+         queue->quit_message    = 0;
+         queue->cursor_count    = 0;
++        queue->esync_in_msgwait = 0;
++        queue->msync_in_msgwait = 0;
+         queue->recv_result     = NULL;
+         queue->next_timer_id   = 0x7fff;
+         queue->timeout         = NULL;
+@@ -3092,6 +3096,42 @@ DECL_HANDLER(set_queue_fd)
+ }
+ 
+ 
++/* tell the server whether the client is blocked in a message wait, so that
++ * esync/msync can decide whether the queue needs to be polled */
++DECL_HANDLER(esync_msgwait)
++{
++    struct msg_queue *queue = get_current_queue();
++    queue_shm_t *queue_shm;
++
++    if (!queue) return;
++    queue_shm = queue->shared;
++    queue->esync_in_msgwait = req->in_msgwait;
++
++    if (current->process->idle_event && !(queue_shm->wake_mask & QS_SMRESULT))
++        set_event( current->process->idle_event );
++
++    /* and start/stop waiting on the driver */
++    if (queue->fd)
++        set_fd_events( queue->fd, req->in_msgwait ? POLLIN : 0 );
++}
++
++DECL_HANDLER(msync_msgwait)
++{
++    struct msg_queue *queue = get_current_queue();
++    queue_shm_t *queue_shm;
++
++    if (!queue) return;
++    queue_shm = queue->shared;
++    queue->msync_in_msgwait = req->in_msgwait;
++
++    if (current->process->idle_event && !(queue_shm->wake_mask & QS_SMRESULT))
++        set_event( current->process->idle_event );
++
++    /* and start/stop waiting on the driver */
++    if (queue->fd)
++        set_fd_events( queue->fd, req->in_msgwait ? POLLIN : 0 );
++}
++
+ /* set the current message queue wakeup mask */
+ DECL_HANDLER(set_queue_mask)
+ {
 diff --git a/server/request_handlers.h b/server/request_handlers.h
 index 05287957ed..07ec318a0b 100644
 --- a/server/request_handlers.h
