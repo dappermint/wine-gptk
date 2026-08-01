@@ -1,32 +1,12 @@
-WIP: msync/esync on wine 11.14.
+WIP: msync/esync on wine 11.14 - client complete, server minimal.
 
-Client side is complete; the server side object providers are not.
+17 dispatch hooks in ntdll/unix/sync.c, protocol + generated headers,
+object_ops extended, thread/fd struct fields and initialisers, and the
+default_fd_get_esync_fd / default_fd_get_msync_idx helpers.
 
-Done:
-  - 9 new files (msync/esync, ntdll + server)
-  - 11 new protocol.def requests, appended so request numbering is stable
-  - the three generated protocol headers regenerated via tools/make_requests
-  - object_ops extended with get_esync_fd / get_msync_idx
-  - thread_data fields next to upstream's alert_fd, initialised in virtual.c
-  - msync_init/esync_init wired into loader.c
-  - all 17 dispatch hooks in ntdll/unix/sync.c, covering every Nt* sync entry
-    point: Create/Open/Query/Release Semaphore, Create/Open/Query/Set/Reset/
-    Pulse Event, Create/Open/Query/Release Mutant, WaitForMultipleObjects,
-    SignalAndWaitForSingleObject and DelayExecution
-
-Not done:
-  - per object get_esync_fd / get_msync_idx providers in server/*.c
-    (event, semaphore, mutex, queue, timer, console, device, fd, process,
-    thread).  These are optional and incremental: every call site null checks
-    the op, and wine 11 uses designated initialisers for object_ops, so an
-    object without them simply falls back to the server wait path.
-  - nothing has been compiled yet
-
-Note wine 11 already has its own fast sync path (server/inproc_sync.c,
-thread_data.alert_fd), but it is Linux only, wrapping /dev/ntsync.  It is a
-per object fd design and msync is a shared memory plus __ulock_wait design,
-so they cannot share a backend; this keeps msync as a parallel path the way
-CrossOver does.
+Per object providers (event, semaphore, mutex, queue, timer, console,
+device, process, thread) are still absent; they are null checked so
+those types fall back to the server wait path.
 
 diff --git a/README.esync b/README.esync
 new file mode 100644
@@ -4855,6 +4835,84 @@ index 0000000000..7dbf5bf36a
 +void esync_set_event( struct esync *esync );
 +void esync_reset_event( struct esync *esync );
 +void esync_abandon_mutexes( struct thread *thread );
+diff --git a/server/fd.c b/server/fd.c
+index b5a7d13bef..3c11a67c17 100644
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -97,6 +97,8 @@
+ #include "ntstatus.h"
+ #include "object.h"
+ #include "file.h"
++#include "esync.h"
++#include "msync.h"
+ #include "handle.h"
+ #include "process.h"
+ #include "request.h"
+@@ -134,6 +136,8 @@ struct closed_fd
+ 
+ struct fd
+ {
++    struct esync_fd     *esync_fd;      /* esync file descriptor */
++    unsigned int         msync_idx;
+     struct object        obj;         /* object header */
+     const struct fd_ops *fd_ops;      /* file descriptor operations */
+     struct object       *sync;        /* sync object for wait/signal */
+@@ -1678,6 +1682,8 @@ static struct fd *alloc_fd_object(void)
+     fd->cacheable  = 0;
+     fd->fs_locks   = 1;
+     fd->poll_index = -1;
++    fd->esync_fd   = NULL;
++    fd->msync_idx  = 0;
+     fd->completion = NULL;
+     fd->comp_flags = 0;
+     init_async_queue( &fd->read_q );
+@@ -1720,6 +1726,8 @@ struct fd *alloc_pseudo_fd( const struct fd_ops *fd_user_ops, struct object *use
+     fd->cacheable  = 0;
+     fd->fs_locks   = 0;
+     fd->poll_index = -1;
++    fd->esync_fd   = NULL;
++    fd->msync_idx  = 0;
+     fd->completion = NULL;
+     fd->comp_flags = 0;
+     fd->no_fd_status = STATUS_BAD_DEVICE_TYPE;
+@@ -2180,6 +2188,24 @@ WCHAR *default_fd_get_full_name( struct object *obj, data_size_t max, data_size_
+     return ret;
+ }
+ 
++struct esync_fd *default_fd_get_esync_fd( struct object *obj, enum esync_type *type )
++{
++    struct fd *fd = get_obj_fd( obj );
++    struct esync_fd *ret = fd->esync_fd;
++    *type = ESYNC_MANUAL_SERVER;
++    release_object( fd );
++    return ret;
++}
++
++unsigned int default_fd_get_msync_idx( struct object *obj, enum msync_type *type )
++{
++    struct fd *fd = get_obj_fd( obj );
++    unsigned int ret = fd->msync_idx;
++    *type = MSYNC_MANUAL_SERVER;
++    release_object( fd );
++    return ret;
++}
++
+ int default_fd_get_poll_events( struct fd *fd )
+ {
+     int events = 0;
+diff --git a/server/file.h b/server/file.h
+index 030db069e7..f01e5fc0e9 100644
+--- a/server/file.h
++++ b/server/file.h
+@@ -110,6 +110,8 @@ extern void get_nt_name( struct fd *fd, struct unicode_str *name );
+ 
+ extern struct object *default_fd_get_sync( struct object *obj );
+ extern WCHAR *default_fd_get_full_name( struct object *obj, data_size_t max, data_size_t *ret_len );
++extern struct esync_fd *default_fd_get_esync_fd( struct object *obj, enum esync_type *type );
++extern unsigned int default_fd_get_msync_idx( struct object *obj, enum msync_type *type );
+ extern int default_fd_get_poll_events( struct fd *fd );
+ extern void default_poll_event( struct fd *fd, int event );
+ extern void fd_cancel_async( struct fd *fd, struct async *async );
 diff --git a/server/main.c b/server/main.c
 index 46419a09cb..c53cfe3436 100644
 --- a/server/main.c
@@ -6403,3 +6461,33 @@ index 50fa4a9644..5e944b4362 100644
  };
  
  static const struct
+diff --git a/server/thread.c b/server/thread.c
+index f0f128ad4d..36e6a49523 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -354,6 +354,10 @@ static inline void init_thread_structure( struct thread *thread )
+     thread->teb             = 0;
+     thread->entry_point     = 0;
+     thread->system_regs     = 0;
++    thread->esync_fd        = NULL;
++    thread->esync_apc_fd    = NULL;
++    thread->msync_idx       = 0;
++    thread->msync_apc_idx   = 0;
+     thread->queue           = NULL;
+     thread->wait            = NULL;
+     thread->error           = 0;
+diff --git a/server/thread.h b/server/thread.h
+index 96c643c64f..bf38df47f0 100644
+--- a/server/thread.h
++++ b/server/thread.h
+@@ -59,6 +59,10 @@ struct thread
+     thread_id_t            id;            /* thread id */
+     struct list            mutex_list;    /* list of currently owned mutexes */
+     struct list            d3dkmt_mutexes;/* list of currently owned d3dkmt mutexes */
++    struct esync_fd       *esync_fd;      /* esync file descriptor (signalled on exit) */
++    struct esync_fd       *esync_apc_fd;  /* esync apc fd (signalled when APCs are present) */
++    unsigned int           msync_idx;
++    unsigned int           msync_apc_idx;
+     unsigned int           system_regs;   /* which system regs have been set */
+     struct msg_queue      *queue;         /* message queue */
+     struct thread_wait    *wait;          /* current wait condition if sleeping */
