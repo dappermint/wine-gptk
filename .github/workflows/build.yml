@@ -99,7 +99,7 @@ jobs:
           mkdir build && cd build
           ../winecx/configure \
             --host=x86_64-apple-darwin24 \
-            --enable-archs=i386,x86_64 \
+            --enable-archs=x86_64 \
             --disable-tests \
             --without-x --without-wayland --without-gstreamer \
             --without-oss --without-alsa --without-pulse --without-sane \

@@ -16,10 +16,11 @@ layer on a view created for the purpose (macdrv_win_data.ca_host_view) rather
 than on a window's content view, and disposes of it with the window.
 
 
-diff -ruN --exclude=.git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
---- a/dlls/winemac.drv/cocoa_window.m	2026-08-02 02:28:25
-+++ b/dlls/winemac.drv/cocoa_window.m	2026-08-02 02:27:58
-@@ -4081,18 +4081,20 @@
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+index 8ca5dd7663..1de9f0a99f 100644
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -4081,18 +4081,20 @@ @interface CAContextSwapChain : NSObject <WineMetalSwapChain>
  {
      void* hwnd;
      macdrv_metal_device device;
@@ -42,7 +43,7 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/co
  {
      self = [super init];
      if (!self) return nil;
-@@ -4105,7 +4107,8 @@
+@@ -4105,7 +4107,8 @@ - (instancetype) initWithHwnd:(void*)newHwnd bounds:(CGRect)bounds
      }
  
      offscreen_layer = [[CAMetalLayer alloc] init];
@@ -52,13 +53,13 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/co
      {
          macdrv_release_metal_device(device);
          device = NULL;
-@@ -4118,15 +4121,24 @@
+@@ -4118,15 +4121,24 @@ - (instancetype) initWithHwnd:(void*)newHwnd bounds:(CGRect)bounds
      offscreen_layer.magnificationFilter = kCAFilterNearest;
      offscreen_layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
      offscreen_layer.contentsScale = retina_on ? 2.0 : 1.0;
 -    [offscreen_layer setBounds:cgrect_mac_from_win(bounds)];
 -    [offscreen_layer setAnchorPoint:CGPointMake(0, 0)];
- 
++
 +    /* The hosting end takes its size from the layer tree we publish and ignores
 +     * whatever frame it sets locally, so a window which only covers part of its
 +     * top level has to be positioned here.  Wrap the drawable in a container the
@@ -69,7 +70,7 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/co
 +    container_layer.geometryFlipped = YES;
 +    [container_layer addSublayer:offscreen_layer];
 +    [self setContainer:container frame:frame];
-+
+ 
      /* Export the CAMetalLayer from the rendering process, then have the
       * target HWND's owner host it using CALayerHost. */
      OnMainThread(^{
@@ -80,7 +81,7 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/co
          context_id = [remote_context contextId];
      });
  
-@@ -4140,6 +4152,21 @@
+@@ -4140,6 +4152,21 @@ - (instancetype) initWithHwnd:(void*)newHwnd bounds:(CGRect)bounds
      return self;
  }
  
@@ -102,7 +103,7 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/co
  - (CAMetalLayer*) layer
  {
      return offscreen_layer;
-@@ -4150,12 +4177,14 @@
+@@ -4150,12 +4177,14 @@ - (void) dealloc
      if (context_id) macdrv_release_remote_layer(hwnd, context_id);
      CAContext *context = remote_context;
      CAMetalLayer *layer = offscreen_layer;
@@ -117,7 +118,7 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/co
          if (dev) macdrv_release_metal_device(dev);
      });
  
-@@ -4169,9 +4198,9 @@
+@@ -4169,9 +4198,9 @@ macdrv_metal_swapchain macdrv_create_view_swapchain(macdrv_view v)
      return (macdrv_metal_swapchain)[[MetalViewSwapChain alloc] initWithView:v];
  }
  
@@ -129,12 +130,10 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/co
  }
  
  macdrv_metal_layer macdrv_swapchain_get_layer(macdrv_metal_swapchain swapchain)
-@@ -4183,6 +4212,46 @@
- void macdrv_destroy_swapchain(macdrv_metal_swapchain swapchain)
- {
+@@ -4185,6 +4214,46 @@ void macdrv_destroy_swapchain(macdrv_metal_swapchain swapchain)
      [(id<WineMetalSwapChain>)swapchain release];
-+}
-+
+ }
+ 
 +void macdrv_swapchain_set_frame(macdrv_metal_swapchain swapchain, CGRect container, CGRect frame)
 +{
 +@autoreleasepool
@@ -173,12 +172,15 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/co
 +            [view removeCALayerHostView:context_id];
 +    });
 +}
- }
- 
++}
++
  void macdrv_window_create_ca_layer_host_view(macdrv_window w, unsigned int context_id)
-diff -ruN --exclude=.git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
---- a/dlls/winemac.drv/macdrv.h	2026-08-02 02:28:25
-+++ b/dlls/winemac.drv/macdrv.h	2026-08-02 02:27:58
+ {
+ @autoreleasepool
+diff --git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
+index aeeadae122..18134dcd55 100644
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
 @@ -43,6 +43,9 @@
  extern BOOL allow_software_rendering;
  
@@ -189,7 +191,7 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
  extern UINT64 app_quit_request_callback;
  
  extern const char* debugstr_cf(CFTypeRef t);
-@@ -182,6 +185,7 @@
+@@ -182,6 +185,7 @@ extern BOOL macdrv_SystemParametersInfo(UINT action, UINT int_param, void *ptr_p
      HWND                hwnd;                   /* hwnd that this private data belongs to */
      macdrv_window       cocoa_window;
      macdrv_view         client_view;
@@ -197,7 +199,7 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
      struct window_rects rects;                  /* window rects in monitor DPI, relative to parent client area */
      int                 pixel_format;           /* pixel format for GL */
      HANDLE              drag_event;             /* event to signal that Cocoa-driven window dragging has ended */
-@@ -199,6 +203,7 @@
+@@ -199,6 +203,7 @@ extern BOOL macdrv_SystemParametersInfo(UINT action, UINT int_param, void *ptr_p
      struct client_surface   client;
      macdrv_view             cocoa_view;
      macdrv_metal_swapchain  metal_swapchain;
@@ -205,10 +207,11 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
  };
  
  extern struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client);
-diff -ruN --exclude=.git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/macdrv_cocoa.h
---- a/dlls/winemac.drv/macdrv_cocoa.h	2026-08-02 02:28:25
-+++ b/dlls/winemac.drv/macdrv_cocoa.h	2026-08-02 02:27:58
-@@ -529,7 +529,10 @@
+diff --git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/macdrv_cocoa.h
+index 9a91edbe8e..346489f8a5 100644
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -529,7 +529,10 @@ extern void macdrv_order_cocoa_window(macdrv_window w, macdrv_window prev,
  extern macdrv_metal_layer macdrv_view_get_metal_layer(macdrv_metal_view v);
  extern void macdrv_view_release_metal_view(macdrv_metal_view v);
  extern macdrv_metal_swapchain macdrv_create_view_swapchain(macdrv_view v);
@@ -220,10 +223,11 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/ma
  extern macdrv_metal_layer macdrv_swapchain_get_layer(macdrv_metal_swapchain swapchain);
  extern void macdrv_destroy_swapchain(macdrv_metal_swapchain swapchain);
  extern void macdrv_window_create_ca_layer_host_view(macdrv_window w, unsigned int context_id);
-diff -ruN --exclude=.git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
---- a/dlls/winemac.drv/window.c	2026-08-02 02:28:25
-+++ b/dlls/winemac.drv/window.c	2026-08-02 02:27:58
-@@ -1162,6 +1162,19 @@
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index c0384f3f0d..020046b21b 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -1162,6 +1162,19 @@ struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format)
      return &surface->client;
  }
  
@@ -243,7 +247,7 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
  BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface *surface)
  {
      HWND hwnd = surface->client.hwnd;
-@@ -1176,16 +1189,18 @@
+@@ -1176,16 +1189,18 @@ BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface
      }
      else
      {
@@ -267,7 +271,7 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
      }
  
      return surface->metal_swapchain != NULL;
-@@ -1271,6 +1286,12 @@
+@@ -1271,6 +1286,12 @@ void macdrv_DestroyWindow(HWND hwnd)
  
      if (data->drag_event) NtSetEvent(data->drag_event, NULL);
  
@@ -280,7 +284,7 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
      destroy_cocoa_window(data);
  
      CFDictionaryRemoveValue(win_datas, hwnd);
-@@ -1558,7 +1579,21 @@
+@@ -1558,7 +1579,21 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
          if ((data = get_win_data(hwnd)))
          {
              TRACE("WM_MACDRV_CREATE_REMOTE_LAYER context_id %u\n", (unsigned int)lp);
@@ -303,7 +307,7 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
              release_win_data(data);
          }
          return 0;
-@@ -1566,7 +1601,10 @@
+@@ -1566,7 +1601,10 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
          if ((data = get_win_data(hwnd)))
          {
              TRACE("WM_MACDRV_RELEASE_REMOTE_LAYER context_id %u\n", (unsigned int)lp);

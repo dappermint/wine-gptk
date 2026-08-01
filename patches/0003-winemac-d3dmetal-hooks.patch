@@ -534,7 +534,7 @@ index bbd528d53b..a5394e743c 100644
  
      if (MACDRV_CALL(init, &params)) return FALSE;
 diff --git a/dlls/winemac.drv/macdrv_main.c b/dlls/winemac.drv/macdrv_main.c
-index 96168242cc..b9ea188639 100644
+index 96168242cc..19ee345eed 100644
 --- a/dlls/winemac.drv/macdrv_main.c
 +++ b/dlls/winemac.drv/macdrv_main.c
 @@ -60,6 +60,9 @@ bool enable_app_nap = false;
@@ -557,16 +557,17 @@ index 96168242cc..b9ea188639 100644
      app_quit_request_callback = params->app_quit_request_callback;
  
      status = SessionGetInfo(callerSecuritySession, NULL, &attributes);
-@@ -622,12 +628,18 @@ static NTSTATUS wow64_init(void *arg)
+@@ -621,6 +627,9 @@ static NTSTATUS wow64_init(void *arg)
+     {
          ULONG strings;
          UINT64 app_icon_callback;
-         UINT64 app_quit_request_callback;
 +        UINT64 regcreateopenkeyexa_callback;
 +        UINT64 regqueryvalueexa_callback;
 +        UINT64 regsetvalueexa_callback;
+         UINT64 app_quit_request_callback;
      } *params32 = arg;
      struct init_params params;
- 
+@@ -628,6 +637,9 @@ static NTSTATUS wow64_init(void *arg)
      params.strings = UlongToPtr(params32->strings);
      params.app_icon_callback = params32->app_icon_callback;
      params.app_quit_request_callback = params32->app_quit_request_callback;
