@@ -4,10 +4,13 @@ WIP: msync/esync on wine 11.14 - client complete, server minimal.
 object_ops extended, thread/fd struct fields and initialisers, and the
 default_fd_get_esync_fd / default_fd_get_msync_idx helpers.
 
+wine 11 renamed struct ntdll_thread_data to thread_data and its accessor
+to get_thread_data(), so the copied sources are adjusted to match.
+
 Per object providers (event, semaphore, mutex, queue, timer, console,
 device, process, thread) are still absent; they are null checked and
-wine 11 uses designated initialisers for object_ops, so those types
-fall back to the server wait path.
+wine 11 uses designated initialisers, so those types fall back to the
+server wait path.
 
 diff --git a/README.esync b/README.esync
 new file mode 100644
@@ -227,7 +230,7 @@ index 9a15bc319a..30c6a3f0a1 100644
  	unix/process.c \
 diff --git a/dlls/ntdll/unix/esync.c b/dlls/ntdll/unix/esync.c
 new file mode 100644
-index 0000000000..730d8a4138
+index 0000000000..dcdd03ee0e
 --- /dev/null
 +++ b/dlls/ntdll/unix/esync.c
 @@ -0,0 +1,1477 @@
@@ -1175,7 +1178,7 @@ index 0000000000..730d8a4138
 +    int i, j, ret;
 +
 +    /* Grab the APC fd if we don't already have it. */
-+    if (alertable && ntdll_get_thread_data()->esync_apc_fd == -1)
++    if (alertable && get_thread_data()->esync_apc_fd == -1)
 +    {
 +        obj_handle_t fd_handle;
 +        sigset_t sigset;
@@ -1193,7 +1196,7 @@ index 0000000000..730d8a4138
 +        SERVER_END_REQ;
 +        server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
 +
-+        ntdll_get_thread_data()->esync_apc_fd = fd;
++        get_thread_data()->esync_apc_fd = fd;
 +    }
 +
 +    NtQuerySystemTime( &now );
@@ -1353,7 +1356,7 @@ index 0000000000..730d8a4138
 +        }
 +        if (alertable)
 +        {
-+            fds[i].fd = ntdll_get_thread_data()->esync_apc_fd;
++            fds[i].fd = get_thread_data()->esync_apc_fd;
 +            fds[i].events = POLLIN;
 +            i++;
 +        }
@@ -1453,7 +1456,7 @@ index 0000000000..730d8a4138
 +            if (alertable)
 +            {
 +                /* We also need to wait on APCs. */
-+                fds[1].fd = ntdll_get_thread_data()->esync_apc_fd;
++                fds[1].fd = get_thread_data()->esync_apc_fd;
 +                fds[1].events = POLLIN;
 +                pollcount++;
 +            }
@@ -1799,7 +1802,7 @@ index c1321ce679..3521c6c06d 100644
      init_files();
 diff --git a/dlls/ntdll/unix/msync.c b/dlls/ntdll/unix/msync.c
 new file mode 100644
-index 0000000000..bee01b9d89
+index 0000000000..ad094a1f74
 --- /dev/null
 +++ b/dlls/ntdll/unix/msync.c
 @@ -0,0 +1,1658 @@
@@ -2915,11 +2918,11 @@ index 0000000000..bee01b9d89
 +    if (alertable)
 +    {
 +        struct msync apc_obj;
-+        int *apc_addr = ntdll_get_thread_data()->msync_apc_addr;
++        int *apc_addr = get_thread_data()->msync_apc_addr;
 +
 +        apc_obj.type = MSYNC_AUTO_EVENT;
 +        apc_obj.shm = (void *)apc_addr;
-+        apc_obj.shm_idx = ntdll_get_thread_data()->msync_apc_idx;
++        apc_obj.shm_idx = get_thread_data()->msync_apc_idx;
 +
 +        if (__atomic_load_n( apc_addr, __ATOMIC_SEQ_CST ))
 +            return STATUS_USER_APC;
@@ -2957,7 +2960,7 @@ index 0000000000..bee01b9d89
 +    current_tid = current_tid ? current_tid : GetCurrentThreadId();
 +
 +    /* Grab the APC idx if we don't already have it. */
-+    if (alertable && !ntdll_get_thread_data()->msync_apc_addr)
++    if (alertable && !get_thread_data()->msync_apc_addr)
 +    {
 +        unsigned int idx = 0;
 +        SERVER_START_REQ( get_msync_apc_idx )
@@ -2970,8 +2973,8 @@ index 0000000000..bee01b9d89
 +        if (idx)
 +        {
 +            struct event *apc_event = get_shm( idx );
-+            ntdll_get_thread_data()->msync_apc_addr = &apc_event->signaled;
-+            ntdll_get_thread_data()->msync_apc_idx = idx;
++            get_thread_data()->msync_apc_addr = &apc_event->signaled;
++            get_thread_data()->msync_apc_idx = idx;
 +        }
 +    }
 +
@@ -3037,7 +3040,7 @@ index 0000000000..bee01b9d89
 +                apc_obj.type = MSYNC_AUTO_EVENT;
 +                /* We must check this first! The server may set an event that
 +                 * we're waiting on, but we need to return STATUS_USER_APC. */
-+                if (__atomic_load_n( ntdll_get_thread_data()->msync_apc_addr, __ATOMIC_SEQ_CST ))
++                if (__atomic_load_n( get_thread_data()->msync_apc_addr, __ATOMIC_SEQ_CST ))
 +                    goto userapc;
 +            }
 +
@@ -3136,8 +3139,8 @@ index 0000000000..bee01b9d89
 +            if (alertable)
 +            {
 +                /* We already checked if it was signaled; don't bother doing it again. */
-+                apc_obj.shm = (void *)ntdll_get_thread_data()->msync_apc_addr;
-+                apc_obj.shm_idx = ntdll_get_thread_data()->msync_apc_idx;
++                apc_obj.shm = (void *)get_thread_data()->msync_apc_addr;
++                apc_obj.shm_idx = get_thread_data()->msync_apc_idx;
 +                objs[i] = &apc_obj;
 +                i++;
 +            }
