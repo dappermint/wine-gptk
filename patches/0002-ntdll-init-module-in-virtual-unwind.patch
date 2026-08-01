@@ -1,0 +1,19 @@
+ntdll: initialise module in virtual_unwind().
+
+RtlLookupFunctionTable() only assigns module on some paths, so a foreign
+or JIT frame leaves it holding stack garbage which is then dereferenced
+when picking the personality routine.  Still unfixed in 11.14.
+
+diff --git a/dlls/ntdll/signal_x86_64.c b/dlls/ntdll/signal_x86_64.c
+index b94e4a23a9..c996220059 100644
+--- a/dlls/ntdll/signal_x86_64.c
++++ b/dlls/ntdll/signal_x86_64.c
+@@ -99,7 +99,7 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);
+  */
+ static NTSTATUS virtual_unwind( ULONG type, DISPATCHER_CONTEXT *dispatch, CONTEXT *context )
+ {
+-    LDR_DATA_TABLE_ENTRY *module;
++    LDR_DATA_TABLE_ENTRY *module = NULL;
+     NTSTATUS status;
+ 
+     dispatch->ImageBase = 0;
