@@ -15,9 +15,10 @@ A child window has no Cocoa window of its own, so the receiving side hosts the
 layer on a view created for the purpose (macdrv_win_data.ca_host_view) rather
 than on a window's content view, and disposes of it with the window.
 
+
 diff -ruN --exclude=.git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
---- a/dlls/winemac.drv/cocoa_window.m	2026-08-02 01:37:53
-+++ b/dlls/winemac.drv/cocoa_window.m	2026-08-02 01:34:52
+--- a/dlls/winemac.drv/cocoa_window.m	2026-08-02 02:28:25
++++ b/dlls/winemac.drv/cocoa_window.m	2026-08-02 02:27:58
 @@ -4081,18 +4081,20 @@
  {
      void* hwnd;
@@ -176,9 +177,19 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/co
  
  void macdrv_window_create_ca_layer_host_view(macdrv_window w, unsigned int context_id)
 diff -ruN --exclude=.git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
---- a/dlls/winemac.drv/macdrv.h	2026-08-02 01:37:54
-+++ b/dlls/winemac.drv/macdrv.h	2026-08-02 01:35:52
-@@ -185,6 +185,7 @@
+--- a/dlls/winemac.drv/macdrv.h	2026-08-02 02:28:25
++++ b/dlls/winemac.drv/macdrv.h	2026-08-02 02:27:58
+@@ -43,6 +43,9 @@
+ extern BOOL allow_software_rendering;
+ 
+ extern UINT64 app_icon_callback;
++extern UINT64 regcreateopenkeyexa_callback;
++extern UINT64 regqueryvalueexa_callback;
++extern UINT64 regsetvalueexa_callback;
+ extern UINT64 app_quit_request_callback;
+ 
+ extern const char* debugstr_cf(CFTypeRef t);
+@@ -182,6 +185,7 @@
      HWND                hwnd;                   /* hwnd that this private data belongs to */
      macdrv_window       cocoa_window;
      macdrv_view         client_view;
@@ -186,7 +197,7 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
      struct window_rects rects;                  /* window rects in monitor DPI, relative to parent client area */
      int                 pixel_format;           /* pixel format for GL */
      HANDLE              drag_event;             /* event to signal that Cocoa-driven window dragging has ended */
-@@ -202,6 +203,7 @@
+@@ -199,6 +203,7 @@
      struct client_surface   client;
      macdrv_view             cocoa_view;
      macdrv_metal_swapchain  metal_swapchain;
@@ -195,8 +206,8 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
  
  extern struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client);
 diff -ruN --exclude=.git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/macdrv_cocoa.h
---- a/dlls/winemac.drv/macdrv_cocoa.h	2026-08-02 01:37:53
-+++ b/dlls/winemac.drv/macdrv_cocoa.h	2026-08-02 01:34:12
+--- a/dlls/winemac.drv/macdrv_cocoa.h	2026-08-02 02:28:25
++++ b/dlls/winemac.drv/macdrv_cocoa.h	2026-08-02 02:27:58
 @@ -529,7 +529,10 @@
  extern macdrv_metal_layer macdrv_view_get_metal_layer(macdrv_metal_view v);
  extern void macdrv_view_release_metal_view(macdrv_metal_view v);
@@ -210,8 +221,8 @@ diff -ruN --exclude=.git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/ma
  extern void macdrv_destroy_swapchain(macdrv_metal_swapchain swapchain);
  extern void macdrv_window_create_ca_layer_host_view(macdrv_window w, unsigned int context_id);
 diff -ruN --exclude=.git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
---- a/dlls/winemac.drv/window.c	2026-08-02 01:37:53
-+++ b/dlls/winemac.drv/window.c	2026-08-02 01:35:52
+--- a/dlls/winemac.drv/window.c	2026-08-02 02:28:25
++++ b/dlls/winemac.drv/window.c	2026-08-02 02:27:58
 @@ -1162,6 +1162,19 @@
      return &surface->client;
  }
