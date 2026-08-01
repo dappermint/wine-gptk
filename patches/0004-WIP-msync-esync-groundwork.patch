@@ -1,12 +1,13 @@
 WIP: msync/esync on wine 11.14 - client complete, server minimal.
 
-17 dispatch hooks in ntdll/unix/sync.c, protocol + generated headers,
+17 dispatch hooks in ntdll/unix/sync.c, protocol + regenerated headers,
 object_ops extended, thread/fd struct fields and initialisers, and the
 default_fd_get_esync_fd / default_fd_get_msync_idx helpers.
 
 Per object providers (event, semaphore, mutex, queue, timer, console,
-device, process, thread) are still absent; they are null checked so
-those types fall back to the server wait path.
+device, process, thread) are still absent; they are null checked and
+wine 11 uses designated initialisers for object_ops, so those types
+fall back to the server wait path.
 
 diff --git a/README.esync b/README.esync
 new file mode 100644
@@ -3817,9 +3818,6 @@ index db820a8952..5ed32d7750 100644
  #ifdef VALGRIND_STACK_REGISTER
          VALGRIND_STACK_REGISTER( (char *)data + signal_stack_mask + 1, (char *)data + view->size );
  #endif
-diff --git a/dlls/winemac.drv/d3dmetal.c b/dlls/winemac.drv/d3dmetal.c
-deleted file mode 100644
-index e69de29bb2..0000000000
 diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
 index b667504c34..51b2cfe0b3 100644
 --- a/include/wine/server_protocol.h
