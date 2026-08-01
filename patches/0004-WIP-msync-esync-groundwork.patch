@@ -4,8 +4,10 @@ Adjusted for wine 11: ntdll_get_thread_data became get_thread_data,
 NtWaitForMultipleObjects takes a WAIT_TYPE, object_ops moved to designated
 initialisers, and receive_fd is now the exported wine_server_receive_fd.
 
-The esync_msgwait and msync_msgwait handlers live in queue.c rather than
-in esync.c/msync.c, since they poke the message queue.
+The esync_msgwait/msync_msgwait handlers live in queue.c since they poke
+the message queue.  Note the new struct fd members go after the object
+header, which has to stay first because fd and object are cast to each
+other.
 
 diff --git a/README.esync b/README.esync
 new file mode 100644
@@ -4817,7 +4819,7 @@ index 0000000000..7dbf5bf36a
 +void esync_reset_event( struct esync *esync );
 +void esync_abandon_mutexes( struct thread *thread );
 diff --git a/server/fd.c b/server/fd.c
-index b5a7d13bef..3c11a67c17 100644
+index b5a7d13bef..3f04bc41bc 100644
 --- a/server/fd.c
 +++ b/server/fd.c
 @@ -97,6 +97,8 @@
@@ -4829,15 +4831,15 @@ index b5a7d13bef..3c11a67c17 100644
  #include "handle.h"
  #include "process.h"
  #include "request.h"
-@@ -134,6 +136,8 @@ struct closed_fd
+@@ -161,6 +163,8 @@ struct fd
+     struct completion   *completion;  /* completion object attached to this fd */
+     apc_param_t          comp_key;    /* completion key to set in completion events */
+     unsigned int         comp_flags;  /* completion flags */
++    struct esync_fd     *esync_fd;    /* esync file descriptor */
++    unsigned int         msync_idx;   /* msync shm index */
+ };
  
- struct fd
- {
-+    struct esync_fd     *esync_fd;      /* esync file descriptor */
-+    unsigned int         msync_idx;
-     struct object        obj;         /* object header */
-     const struct fd_ops *fd_ops;      /* file descriptor operations */
-     struct object       *sync;        /* sync object for wait/signal */
+ static void fd_dump( struct object *obj, int verbose );
 @@ -1678,6 +1682,8 @@ static struct fd *alloc_fd_object(void)
      fd->cacheable  = 0;
      fd->fs_locks   = 1;
