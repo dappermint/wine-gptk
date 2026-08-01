@@ -1,16 +1,8 @@
 WIP: msync/esync on wine 11.14 - client complete, server minimal.
 
-17 dispatch hooks in ntdll/unix/sync.c, protocol + regenerated headers,
-object_ops extended, thread/fd struct fields and initialisers, and the
-default_fd_get_esync_fd / default_fd_get_msync_idx helpers.
-
-wine 11 renamed struct ntdll_thread_data to thread_data and its accessor
-to get_thread_data(), so the copied sources are adjusted to match.
-
-Per object providers (event, semaphore, mutex, queue, timer, console,
-device, process, thread) are still absent; they are null checked and
-wine 11 uses designated initialisers, so those types fall back to the
-server wait path.
+wine 11 renamed ntdll_get_thread_data to get_thread_data, and
+NtWaitForMultipleObjects takes a WAIT_TYPE rather than a wait_any
+boolean, so the dispatch hooks are adjusted accordingly.
 
 diff --git a/README.esync b/README.esync
 new file mode 100644
@@ -3547,7 +3539,7 @@ index 730a0cd9a9..d61737d9dd 100644
      {
          req->handle = wine_server_obj_handle( handle );
 diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
-index fbf054e9d9..f0dbf1c86d 100644
+index fbf054e9d9..01c14dbeff 100644
 --- a/dlls/ntdll/unix/sync.c
 +++ b/dlls/ntdll/unix/sync.c
 @@ -71,6 +71,8 @@
@@ -3742,38 +3734,38 @@ index fbf054e9d9..f0dbf1c86d 100644
      if (class != MutantBasicInformation)
      {
          FIXME( "(%p, %d, %d) Unknown class\n", handle, class, len );
-@@ -2303,6 +2390,18 @@ NTSTATUS WINAPI NtQueryTimer( HANDLE handle, TIMER_INFORMATION_CLASS class,
- NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WAIT_TYPE type,
-                                           BOOLEAN alertable, const LARGE_INTEGER *timeout )
- {
+@@ -2310,6 +2397,18 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
+     if (!count || count > MAXIMUM_WAIT_OBJECTS) return STATUS_INVALID_PARAMETER_1;
+     if (type != WaitAll && type != WaitAny) FIXME( "Unsupported wait type %u\n", type );
+ 
 +    if (do_msync())
 +    {
-+        NTSTATUS ret = msync_wait_objects( count, handles, wait_any, alertable, timeout );
++        NTSTATUS ret = msync_wait_objects( count, handles, type == WaitAny, alertable, timeout );
 +        if (ret != STATUS_NOT_IMPLEMENTED) return ret;
 +    }
 +
 +    if (do_esync())
 +    {
-+        NTSTATUS ret = esync_wait_objects( count, handles, wait_any, alertable, timeout );
++        NTSTATUS ret = esync_wait_objects( count, handles, type == WaitAny, alertable, timeout );
 +        if (ret != STATUS_NOT_IMPLEMENTED) return ret;
 +    }
 +
-     union select_op select_op;
-     UINT i, flags = SELECT_INTERRUPTIBLE;
-     unsigned int ret;
-@@ -2370,6 +2469,12 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
- NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
-                                                 BOOLEAN alertable, const LARGE_INTEGER *timeout )
- {
+     if (TRACE_ON(sync))
+     {
+         TRACE( "type %u, alertable %u, handles {%p", type, alertable, handles[0] );
+@@ -2374,6 +2473,12 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
+     UINT flags = SELECT_INTERRUPTIBLE;
+     NTSTATUS ret;
+ 
 +    if (do_msync())
 +        return msync_signal_and_wait( signal, wait, alertable, timeout );
 +
 +    if (do_esync())
 +        return esync_signal_and_wait( signal, wait, alertable, timeout );
 +
-     union select_op select_op;
-     UINT flags = SELECT_INTERRUPTIBLE;
-     NTSTATUS ret;
+     TRACE( "signal %p, wait %p, alertable %u, timeout %s\n", signal, wait, alertable, debugstr_timeout(timeout) );
+ 
+     if (!signal) return STATUS_INVALID_HANDLE;
 @@ -2423,6 +2528,18 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
      /* if alertable, we need to query the server */
      if (alertable)
