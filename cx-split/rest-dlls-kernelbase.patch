@@ -1,0 +1,346 @@
+--- a/dlls/kernelbase/debug.c
++++ b/dlls/kernelbase/debug.c
+@@ -723,12 +723,25 @@
+                                                IMAGE_DIRECTORY_ENTRY_RESOURCE, &size )))
+         return FALSE;
+     if (addr < rsrc || (char *)addr >= (char *)rsrc + size) return FALSE;
+     TRACE( "Broken app is writing to the resource data, enabling work-around\n" );
+     VirtualProtect( rsrc, size, PAGE_READWRITE, &old_prot );
+     return TRUE;
++}
++
++/* CrossOver Hack #22795 */
++static BOOL is_quicken_updateicons(void)
++{
++    WCHAR path[MAX_PATH];
++    DWORD exe_len = wcslen( L"UpdateIcons.exe" );
++    DWORD path_len = GetModuleFileNameW( NULL, path, MAX_PATH );
++
++    if (!wcsstr( path, L"quickenPatch" ))
++        return FALSE;
++
++    return exe_len <= path_len && !lstrcmpiW( path + path_len - exe_len, L"UpdateIcons.exe" );
+ }
+ 
+ 
+ /*******************************************************************
+  *         UnhandledExceptionFilter   (kernelbase.@)
+  */
+@@ -758,12 +771,19 @@
+         if (top_filter)
+         {
+             LONG ret = top_filter( epointers );
+             if (ret != EXCEPTION_CONTINUE_SEARCH) return ret;
+         }
+ 
++        /* CrossOver Hack #22795 */
++        if (is_quicken_updateicons())
++        {
++            FIXME( "HACK: crashing without error dialog for Quicken UpdateIcons.exe\n" );
++            TerminateProcess( GetCurrentProcess(), 1 );
++        }
++
+         if ((GetErrorMode() & SEM_NOGPFAULTERRORBOX) ||
+             !start_debugger_atomic( epointers ) || !NtCurrentTeb()->Peb->BeingDebugged)
+             return EXCEPTION_EXECUTE_HANDLER;
+     }
+     return EXCEPTION_CONTINUE_SEARCH;
+ }
+--- a/dlls/kernelbase/file.c
++++ b/dlls/kernelbase/file.c
+@@ -977,13 +977,26 @@
+ 
+ /*************************************************************************
+  *	CreateSymbolicLinkW   (kernelbase.@)
+  */
+ BOOLEAN WINAPI /* DECLSPEC_HOTPATCH */ CreateSymbolicLinkW( LPCWSTR link, LPCWSTR target, DWORD flags )
+ {
+-    FIXME( "(%s %s %ld): stub\n", debugstr_w(link), debugstr_w(target), flags );
++    char name[MAX_PATH], *p;
++
++    FIXME("(%s %s %ld): stub\n", debugstr_w(link), debugstr_w(target), flags);
++
++    /* CXHACK 13427 */
++    GetModuleFileNameA(GetModuleHandleA(NULL), name, sizeof(name));
++    p = strrchr(name, '\\');
++    p = p ? p+1 : name;
++    if(!strcasecmp(p, "OfficeClickToRun.exe"))
++    {
++        FIXME("CXHACK 13427: Using CopyFile\n");
++        return CopyFileW(target, link, FALSE);
++    }
++
+     return TRUE;
+ }
+ 
+ 
+ /***********************************************************************
+  *	DeleteFileA   (kernelbase.@)
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -1010,26 +1026,49 @@
+ 
+ /**********************************************************************
+  *           IsWow64Process2   (kernelbase.@)
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH IsWow64Process2( HANDLE process, USHORT *machine, USHORT *native_machine )
+ {
+-    return set_ntstatus( RtlWow64GetProcessMachines( process, machine, native_machine ));
++    /* CX HACK 20810: in Wow64 with a 32-bit-only bottle, pretend we aren't in Wow64 */
++    UNICODE_STRING val_str, name_str = RTL_CONSTANT_STRING( L"WINEWOW6432BPREFIXMODE" );
++    val_str.MaximumLength = 0;
++
++    if (RtlQueryEnvironmentVariable_U( NULL, &name_str, &val_str ) != STATUS_VARIABLE_NOT_FOUND)
++    {
++        *machine = IMAGE_FILE_MACHINE_UNKNOWN;
++        if (native_machine) *native_machine = IMAGE_FILE_MACHINE_I386;
++        return STATUS_SUCCESS;
++    }
++    else
++        return set_ntstatus( RtlWow64GetProcessMachines( process, machine, native_machine ));
+ }
+ 
+ 
+ /**********************************************************************
+  *           IsWow64Process   (kernelbase.@)
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH IsWow64Process( HANDLE process, PBOOL wow64 )
+ {
+     ULONG_PTR pbi;
+     NTSTATUS status;
+ 
+-    status = NtQueryInformationProcess( process, ProcessWow64Information, &pbi, sizeof(pbi), NULL );
+-    if (!status) *wow64 = !!pbi;
++    /* CX HACK 20810: in Wow64 with a 32-bit-only bottle, pretend we aren't in Wow64 */
++    UNICODE_STRING val_str, name_str = RTL_CONSTANT_STRING( L"WINEWOW6432BPREFIXMODE" );
++    val_str.MaximumLength = 0;
++
++    if (RtlQueryEnvironmentVariable_U( NULL, &name_str, &val_str ) != STATUS_VARIABLE_NOT_FOUND)
++    {
++        status = STATUS_SUCCESS;
++        if (!status) *wow64 = FALSE;
++    }
++    else
++    {
++        status = NtQueryInformationProcess( process, ProcessWow64Information, &pbi, sizeof(pbi), NULL );
++        if (!status) *wow64 = !!pbi;
++    }
+     return set_ntstatus( status );
+ }
+ 
+ /*********************************************************************
+  *           GetProcessInformation   (kernelbase.@)
+  */
+--- a/dlls/kernelbase/security.c
++++ b/dlls/kernelbase/security.c
+@@ -1147,15 +1147,60 @@
+  */
+ BOOL WINAPI SetFileSecurityW( LPCWSTR name, SECURITY_INFORMATION info, PSECURITY_DESCRIPTOR descr )
+ {
+     HANDLE file;
+     DWORD access = 0;
+     NTSTATUS status;
++    static int is_office = 2;
+ 
+     TRACE( "(%s, 0x%lx, %p)\n", debugstr_w(name), info, descr );
+ 
++    /* CX HACK 10834 -- msoffice sets FILE_EXECUTE on files it saves and Wine
++     * maps that to the x permission on files. Some Linux file managers decide
++     * to try to execute the file instead of opening it with the assigned
++     * application. So, skip setting that bit for msoffice programs. */
++    if (is_office == 2)
++    {
++        char name[MAX_PATH], *p;
++        GetModuleFileNameA(GetModuleHandleW(0), name, sizeof(name));
++        p = strrchr(name, '\\');
++        if(p)
++            ++p;
++        else
++            p = name;
++        if(strcasecmp(p, "CLVIEW.EXE") == 0 ||
++                strcasecmp(p, "CNFNOT32.EXE") == 0 ||
++                strcasecmp(p, "DSSM.EXE") == 0 ||
++                strcasecmp(p, "excelcnv.exe") == 0 ||
++                strcasecmp(p, "EXCEL.EXE") == 0 ||
++                strcasecmp(p, "GRAPH.EXE") == 0 ||
++                strcasecmp(p, "MSOHTMED.EXE") == 0 ||
++                strcasecmp(p, "MSQRY32.EXE") == 0 ||
++                strcasecmp(p, "MSTORDB.EXE") == 0 ||
++                strcasecmp(p, "MSTORE.EXE") == 0 ||
++                strcasecmp(p, "OIS.EXE") == 0 ||
++                strcasecmp(p, "OUTLOOK.EXE") == 0 ||
++                strcasecmp(p, "POWERPNT.EXE") == 0 ||
++                strcasecmp(p, "PPTVIEW.EXE") == 0 ||
++                strcasecmp(p, "SCANOST.EXE") == 0 ||
++                strcasecmp(p, "SCANPST.EXE") == 0 ||
++                strcasecmp(p, "SELFCERT.EXE") == 0 ||
++                strcasecmp(p, "SETLANG.EXE") == 0 ||
++                strcasecmp(p, "VPREVIEW.EXE") == 0 ||
++                strcasecmp(p, "WINWORD.EXE") == 0 ||
++                strcasecmp(p, "Wordconv.exe") == 0)
++            is_office = 1;
++        else
++            is_office = 0;
++    }
++    if(is_office){
++        TRACE("CX HACK 10834: Skipping SetFileSecurity\n");
++        return TRUE;
++    }
++    /* End hack */
++
+     if (info & (OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION)) access |= WRITE_OWNER;
+     if (info & SACL_SECURITY_INFORMATION) access |= ACCESS_SYSTEM_SECURITY;
+     if (info & DACL_SECURITY_INFORMATION) access |= WRITE_DAC;
+ 
+     if (!(status = open_file( name, access, &file )))
+     {
+--- a/dlls/kernelbase/string.c
++++ b/dlls/kernelbase/string.c
+@@ -147,12 +147,17 @@
+     return dst;
+ }
+ 
+ INT WINAPI KERNELBASE_lstrlenA( LPCSTR str )
+ {
+     INT ret;
++
++    /* CX HACK 22631: Avoid the exception here for Quicken. */
++    if (!str)
++        return 0;
++
+     __TRY
+     {
+         ret = strlen(str);
+     }
+     __EXCEPT_PAGE_FAULT
+     {
+@@ -163,12 +168,17 @@
+     return ret;
+ }
+ 
+ INT WINAPI KERNELBASE_lstrlenW( LPCWSTR str )
+ {
+     INT ret;
++
++    /* CX HACK 22631: Avoid the exception here for Quicken. */
++    if (!str)
++        return 0;
++
+     __TRY
+     {
+         ret = wcslen(str);
+     }
+     __EXCEPT_PAGE_FAULT
+     {
+--- a/dlls/kernelbase/thread.c
++++ b/dlls/kernelbase/thread.c
+@@ -1110,12 +1110,31 @@
+ LPVOID WINAPI DECLSPEC_HOTPATCH ConvertThreadToFiberEx( LPVOID param, DWORD flags )
+ {
+     struct fiber_data *fiber;
+ 
+     if (NtCurrentTeb()->Tib.FiberData)
+     {
++        /* CrossOver hack for bug 20987 */
++        static int is_halo_mcc = -1;
++
++        if (is_halo_mcc == -1)
++        {
++            static const WCHAR mcc[] = {'M','C','C','-','W','i','n','6','4','-',
++                'S','h','i','p','p','i','n','g','.','e','x','e',0};
++            WCHAR path[MAX_PATH];
++            DWORD len = ARRAY_SIZE(mcc) - 1, len2 = GetModuleFileNameW( NULL, path, MAX_PATH );
++
++            is_halo_mcc = len <= len2 && !lstrcmpiW( path + len2 - len, mcc );
++        }
++
++        if (is_halo_mcc)
++        {
++            TRACE("CrossOver hack: faking success\n");
++            return NtCurrentTeb()->Tib.FiberData;
++        }
++
+         SetLastError( ERROR_ALREADY_FIBER );
+         return NULL;
+     }
+ 
+     if (!(fiber = HeapAlloc( GetProcessHeap(), 0, sizeof(*fiber) )))
+     {
+--- a/dlls/kernelbase/version.c
++++ b/dlls/kernelbase/version.c
+@@ -770,13 +793,13 @@
+         SetLastError(ERROR_BAD_PATHNAME);
+         return 0;
+     }
+     if (flags & ~FILE_VER_GET_LOCALISED)
+         FIXME("flags 0x%lx ignored\n", flags & ~FILE_VER_GET_LOCALISED);
+ 
+-    if ((hModule = LoadLibraryExW( filename, 0, LOAD_LIBRARY_AS_IMAGE_RESOURCE )))
++    if (!manor_lords_hack && (hModule = LoadLibraryExW( filename, 0, LOAD_LIBRARY_AS_IMAGE_RESOURCE )))
+     {
+         HRSRC hRsrc = NULL;
+         if (!(flags & FILE_VER_GET_LOCALISED))
+         {
+             LANGID english = MAKELANGID( LANG_ENGLISH, SUBLANG_DEFAULT );
+             hRsrc = FindResourceExW( hModule, (LPWSTR)VS_FILE_INFO,
+--- a/dlls/kernelbase/volume.c
++++ b/dlls/kernelbase/volume.c
+@@ -202,12 +202,30 @@
+         status = NtOpenFile( &handle, SYNCHRONIZE, &attr, &io, 0,
+                                       FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT );
+     }
+ 
+     if (!set_ntstatus( status )) goto done;
+ 
++    /* CrossOver hack 5870 */
++    if (GetEnvironmentVariableA("CX_HACK_FILESYSTEM_TYPE",NULL,0) > 0)
++    {
++        WCHAR buffer[8];
++
++        if ((ret = GetVolumeInformationByHandleW( handle, label, label_len, serial, filename_len, flags, buffer, 8 )))
++        {
++            if (!wcscmp( buffer, L"NTFS" ))
++            {
++                wcscpy( buffer, L"UNIXFS" );
++                if (flags) *flags = FILE_CASE_PRESERVED_NAMES;
++            }
++            if (fsname) lstrcpynW( fsname, buffer, fsname_len );
++        }
++        NtClose( handle );
++        goto done;
++    }
++
+     ret = GetVolumeInformationByHandleW( handle, label, label_len, serial, filename_len, flags,
+                                          fsname, fsname_len );
+     NtClose( handle );
+ 
+ done:
+     RtlFreeUnicodeString( &nt_name );
+@@ -596,12 +614,27 @@
+     {
+         SetLastError( RtlNtStatusToDosError(status) );
+         ret = DRIVE_UNKNOWN;
+     }
+     else
+     {
++        char type_hack[255];
++        DWORD e_ret = GetEnvironmentVariableA("CX_HACK_REMOTE_DRIVES", type_hack, 255);
++        if (e_ret > 0)
++        {
++            char drive;
++            if (root) drive = root[0];
++            else
++            {
++                WCHAR path[MAX_PATH];
++                GetCurrentDirectoryW( MAX_PATH, path );
++                drive = path[0];
++            }
++            if (strchr( type_hack, tolower(drive) )) return DRIVE_REMOTE;
++        }
++
+         switch (info.DeviceType)
+         {
+         case FILE_DEVICE_CD_ROM_FILE_SYSTEM:  ret = DRIVE_CDROM; break;
+         case FILE_DEVICE_VIRTUAL_DISK:        ret = DRIVE_RAMDISK; break;
+         case FILE_DEVICE_NETWORK_FILE_SYSTEM: ret = DRIVE_REMOTE; break;
+         case FILE_DEVICE_DISK_FILE_SYSTEM:

@@ -1,0 +1,732 @@
+--- a/server/hook.c
++++ b/server/hook.c
+@@ -399,22 +399,45 @@
+             hook = next;
+         }
+     }
+ }
+ 
+ /* return the thread that owns the first global hook */
+-struct thread *get_first_global_hook( struct desktop *desktop, int id )
++struct thread *get_first_global_hook( struct desktop *desktop, int id, thread_id_t *thread_id, client_ptr_t *proc )
+ {
+     struct hook *hook;
+     struct hook_table *global_hooks = desktop->global_hooks;
+ 
+     if (!global_hooks) return NULL;
+     if (!(hook = get_first_valid_hook( global_hooks, id - WH_MINHOOK, EVENT_MIN, 0, 0, 0 ))) return NULL;
++    *thread_id = hook->owner->id;
++    *proc = hook->proc;
+     return hook->owner;
+ }
++
++void disable_hung_hook( struct desktop *desktop, int id, thread_id_t thread_id, client_ptr_t proc )
++{
++    struct hook_table *global_hooks = desktop->global_hooks;
++    int index = id - WH_MINHOOK;
++    struct hook *hook;
+ 
++    if (!global_hooks || !proc) return;
++
++    hook = get_first_hook( global_hooks, index );
++
++    while (hook)
++    {
++        if (hook->proc == proc && hook->owner->id == thread_id)
++        {
++            hook->proc = 0;
++            return;
++        }
++        hook = HOOK_ENTRY( list_next( &global_hooks->hooks[index], &hook->chain ) );
++    }
++}
++
+ /* set a window hook */
+ DECL_HANDLER(set_hook)
+ {
+     struct process *process = NULL;
+     struct thread *thread = NULL;
+     struct desktop *desktop;
+--- a/server/mach.c
++++ b/server/mach.c
+@@ -45,12 +45,13 @@
+ 
+ #include <mach/mach.h>
+ #include <mach/mach_error.h>
+ #include <mach/thread_act.h>
+ #include <mach/mach_vm.h>
+ #include <servers/bootstrap.h>
++#include <sys/sysctl.h>
+ 
+ static mach_port_t server_mach_port;
+ 
+ void sigchld_callback(void)
+ {
+     assert(0);  /* should never be called on MacOS */
+@@ -167,12 +168,32 @@
+     }
+ }
+ 
+ /* initialize registers in new thread if necessary */
+ void init_thread_context( struct thread *thread )
+ {
++}
++
++/* CX HACK 21217 */
++static int is_apple_silicon( void )
++{
++    static int apple_silicon_status, did_check = 0;
++    if (!did_check)
++    {
++        /* returns 0 for native process or on error, 1 for translated */
++        int ret = 0;
++        size_t size = sizeof(ret);
++        if (sysctlbyname( "sysctl.proc_translated", &ret, &size, NULL, 0 ) == -1)
++            apple_silicon_status = 0;
++        else
++            apple_silicon_status = ret;
++
++        did_check = 1;
++    }
++
++    return apple_silicon_status;
+ }
+ 
+ /* retrieve the thread x86 registers */
+ void get_thread_context( struct thread *thread, struct context_data *context, unsigned int flags )
+ {
+ #if defined(__i386__) || defined(__x86_64__)
+@@ -248,12 +269,19 @@
+         default:
+             set_error( STATUS_INVALID_PARAMETER );
+             goto done;
+         }
+         context->flags |= SERVER_CTX_DEBUG_REGISTERS;
+     }
++    else if (is_apple_silicon())
++    {
++        /* CX HACK 21217: Fake debug registers on Apple Silicon */
++        fprintf( stderr, "%04x: thread_get_state failed on Apple Silicon - faking zero debug registers\n", thread->id );
++        memset( &context->debug, 0, sizeof(context->debug) );
++        context->flags |= SERVER_CTX_DEBUG_REGISTERS;
++    }
+     else
+         mach_set_error( ret );
+ done:
+     mach_port_deallocate( mach_task_self(), port );
+ #endif
+ }
+--- a/server/mapping.c
++++ b/server/mapping.c
+@@ -86,12 +86,13 @@
+ /* file backing the shared sections of a PE image mapping */
+ struct shared_map
+ {
+     struct object   obj;             /* object header */
+     struct fd      *fd;              /* file descriptor of the mapped PE file */
+     struct file    *file;            /* temp file holding the shared data */
++    char            tmp_name[16];    /* name of temp file */
+     struct list     entry;           /* entry in global shared maps list */
+ };
+ 
+ static void shared_map_dump( struct object *obj, int verbose );
+ static void shared_map_destroy( struct object *obj );
+ 
+@@ -156,12 +157,13 @@
+ {
+     struct object   obj;             /* object header */
+     mem_size_t      size;            /* mapping size */
+     unsigned int    flags;           /* SEC_* flags */
+     struct fd      *fd;              /* fd for mapped file */
+     struct pe_image_info image;      /* image info (for PE image mapping) */
++    char            tmp_name[16];    /* name of temp file if any */
+     struct ranges  *committed;       /* list of committed ranges in this mapping */
+     struct shared_map *shared;       /* temp file for shared PE mapping */
+ };
+ 
+ static void mapping_dump( struct object *obj, int verbose );
+ static struct fd *mapping_get_fd( struct object *obj );
+@@ -254,12 +256,14 @@
+     .blocks = LIST_INIT(session.blocks),
+     .free_objects = LIST_INIT(session.free_objects),
+ };
+ 
+ #define ROUND_SIZE(size)  (((size) + page_mask) & ~page_mask)
+ 
++static void unlink_temp_file( char *name );
++
+ void init_memory(void)
+ {
+     page_mask = sysconf( _SC_PAGESIZE ) - 1;
+     free_map_addr( 0x60000000, 0x1c000000 );
+     free_map_addr( 0x600000000000, 0x100000000000 );
+     if (page_mask != 0xfff)
+@@ -286,12 +290,13 @@
+ }
+ 
+ static void shared_map_destroy( struct object *obj )
+ {
+     struct shared_map *shared = (struct shared_map *)obj;
+ 
++    unlink_temp_file( shared->tmp_name );
+     release_object( shared->fd );
+     release_object( shared->file );
+     list_remove( &shared->entry );
+ }
+ 
+ /* extend a file beyond the current end of file */
+@@ -347,16 +352,17 @@
+     }
+     close( fd );
+     unlink( tmpfn );
+     return (ret != MAP_FAILED);
+ }
+ 
++static int temp_dir_fd = -1;
++
+ /* create a temp file for anonymous mappings */
+-static int create_temp_file( file_pos_t size )
++static int create_temp_file( file_pos_t size, char *name )
+ {
+-    static int temp_dir_fd = -1;
+     char tmpfn[16];
+     int fd;
+ 
+     if (temp_dir_fd == -1)
+     {
+         temp_dir_fd = server_dir_fd;
+@@ -377,20 +383,30 @@
+     {
+         if (!grow_file( fd, size ))
+         {
+             close( fd );
+             fd = -1;
+         }
+-        unlink( tmpfn );
++        if (name) strcpy( name, tmpfn );
++        else unlink( tmpfn );
+     }
+     else file_set_error();
+ 
+     if (temp_dir_fd != server_dir_fd) fchdir( server_dir_fd );
+     return fd;
+ }
+ 
++/* unlink a temp file */
++static void unlink_temp_file( char *name )
++{
++    if (!name[0]) return;
++    if (temp_dir_fd != server_dir_fd) fchdir( temp_dir_fd );
++    unlink( name );
++    if (temp_dir_fd != server_dir_fd) fchdir( server_dir_fd );
++}
++
+ /* find a memory view from its base address */
+ struct memory_view *find_mapped_view( struct process *process, client_ptr_t base )
+ {
+     struct memory_view *view;
+ 
+     LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
+@@ -618,12 +634,13 @@
+     mem_size_t total_size;
+     size_t file_size, map_size, max_size;
+     off_t shared_pos, read_pos, write_pos;
+     char *buffer = NULL;
+     int shared_fd;
+     long toread;
++    char tmp_name[16];
+ 
+     /* compute the total size of the shared mapping */
+ 
+     total_size = max_size = 0;
+     for (i = 0; i < nb_sec; i++)
+     {
+@@ -638,14 +655,14 @@
+     if (!total_size) return 1;  /* nothing to do */
+ 
+     if ((mapping->shared = get_shared_file( mapping->fd ))) return 1;
+ 
+     /* create a temp file for the mapping */
+ 
+-    if ((shared_fd = create_temp_file( total_size )) == -1) return 0;
+-    if (!(file = create_file_for_fd( shared_fd, FILE_GENERIC_READ|FILE_GENERIC_WRITE, 0 ))) return 0;
++    if ((shared_fd = create_temp_file( total_size, tmp_name )) == -1) return 0;
++    if (!(file = create_file_for_fd( shared_fd, FILE_GENERIC_READ|FILE_GENERIC_WRITE, 0 ))) goto error;
+ 
+     if (!(buffer = malloc( max_size ))) goto error;
+ 
+     /* copy the shared sections data into the temp file */
+ 
+     shared_pos = 0;
+@@ -673,19 +690,21 @@
+         if (pwrite( shared_fd, buffer, file_size, write_pos ) != file_size) goto error;
+     }
+ 
+     if (!(shared = alloc_object( &shared_map_ops ))) goto error;
+     shared->fd = (struct fd *)grab_object( mapping->fd );
+     shared->file = file;
++    strcpy( shared->tmp_name, tmp_name );
+     list_add_head( &shared_map_list, &shared->entry );
+     mapping->shared = shared;
+     free( buffer );
+     return 1;
+ 
+  error:
+-    release_object( file );
++    if (file) release_object( file );
++    unlink_temp_file( tmp_name );
+     free( buffer );
+     return 0;
+ }
+ 
+ /* load a data directory header from its section */
+ static int load_data_dir( void *dir, size_t dir_size, size_t va, size_t size, int unix_fd,
+@@ -1010,12 +1029,13 @@
+         return mapping;  /* Nothing else to do */
+ 
+     mapping->size        = size;
+     mapping->fd          = NULL;
+     mapping->shared      = NULL;
+     mapping->committed   = NULL;
++    mapping->tmp_name[0] = 0;
+ 
+     if (!(mapping->flags = get_mapping_flags( handle, flags ))) goto error;
+ 
+     if (handle)
+     {
+         const unsigned int sharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+@@ -1074,13 +1094,13 @@
+         {
+             set_error( STATUS_INVALID_PARAMETER );
+             goto error;
+         }
+         if ((flags & SEC_RESERVE) && !(mapping->committed = create_ranges())) goto error;
+         mapping->size = (mapping->size + page_mask) & ~((mem_size_t)page_mask);
+-        if ((unix_fd = create_temp_file( mapping->size )) == -1) goto error;
++        if ((unix_fd = create_temp_file( mapping->size, mapping->tmp_name )) == -1) goto error;
+         if (!(mapping->fd = create_anonymous_fd( &mapping_fd_ops, unix_fd, &mapping->obj,
+                                                  FILE_SYNCHRONOUS_IO_NONALERT ))) goto error;
+         allow_fd_caching( mapping->fd );
+     }
+     return mapping;
+ 
+@@ -1207,12 +1227,13 @@
+ }
+ 
+ static void mapping_destroy( struct object *obj )
+ {
+     struct mapping *mapping = (struct mapping *)obj;
+     assert( obj->ops == &mapping_ops );
++    unlink_temp_file( mapping->tmp_name );
+     if (mapping->fd) release_object( mapping->fd );
+     if (mapping->committed) release_object( mapping->committed );
+     if (mapping->shared) release_object( mapping->shared );
+ }
+ 
+ static enum server_fd_type mapping_get_fd_type( struct fd *fd )
+@@ -1607,13 +1628,13 @@
+         view->committed = NULL;
+         view->shared    = mapping->shared ? (struct shared_map *)grab_object( mapping->shared ) : NULL;
+         view->image     = mapping->image;
+         if (add_process_view( current, view ))
+         {
+             current->entry_point = view->base + req->entry;
+-            current->process->machine = (view->image.image_flags & IMAGE_FLAGS_ComPlusNativeReady) ?
++            current->process->machine = ((view->image.image_flags & IMAGE_FLAGS_ComPlusNativeReady) && !wow64_using_32bit_prefix) ?
+                                          native_machine : req->machine;
+         }
+ 
+         if (view->base != (mapping->image.map_addr ? mapping->image.map_addr : mapping->image.base))
+             set_error( STATUS_IMAGE_NOT_AT_BASE );
+         if (req->machine != current->process->machine)
+--- a/server/object.h
++++ b/server/object.h
+@@ -244,12 +248,13 @@
+ 
+ /* registry functions */
+ 
+ extern unsigned int supported_machines_count;
+ extern unsigned short supported_machines[8];
+ extern unsigned short native_machine;
++extern int wow64_using_32bit_prefix;
+ extern void init_registry(void);
+ extern void flush_registry(void);
+ 
+ static inline int is_machine_32bit( unsigned short machine )
+ {
+     return machine == IMAGE_FILE_MACHINE_I386 || machine == IMAGE_FILE_MACHINE_ARMNT;
+--- a/server/process.c
++++ b/server/process.c
+@@ -468,12 +474,167 @@
+ static unsigned int last_free_ptid;         /* last free entry */
+ static unsigned int num_free_ptids;         /* number of free ptids */
+ 
+ static void kill_all_processes(void);
+ 
+ #define PTID_OFFSET 8  /* offset for first ptid value */
++
++/* crossover usage logging support */
++
++#include <sys/types.h>
++#include <sys/stat.h>
++
++/* get the next char value taking surrogates into account */
++static inline unsigned int get_surrogate_value( const WCHAR *src, unsigned int srclen )
++{
++    if (src[0] >= 0xd800 && src[0] <= 0xdfff)  /* surrogate pair */
++    {
++        if (src[0] > 0xdbff || /* invalid high surrogate */
++            srclen <= 1 ||     /* missing low surrogate */
++            src[1] < 0xdc00 || src[1] > 0xdfff) /* invalid low surrogate */
++            return 0;
++        return 0x10000 + ((src[0] & 0x3ff) << 10) + (src[1] & 0x3ff);
++    }
++    return src[0];
++}
++
++/* query necessary dst length for src string */
++static inline int get_length_utf8( const WCHAR *src, unsigned int srclen )
++{
++    int len;
++    unsigned int val;
++
++    for (len = 0; srclen; srclen--, src++)
++    {
++        if (*src < 0x80)  /* 0x00-0x7f: 1 byte */
++        {
++            len++;
++            continue;
++        }
++        if (*src < 0x800)  /* 0x80-0x7ff: 2 bytes */
++        {
++            len += 2;
++            continue;
++        }
++        if (!(val = get_surrogate_value( src, srclen ))) continue;
++        if (val < 0x10000)  /* 0x800-0xffff: 3 bytes */
++            len += 3;
++        else   /* 0x10000-0x10ffff: 4 bytes */
++        {
++            len += 4;
++            src++;
++            srclen--;
++        }
++    }
++    return len;
++}
++
++/* wide char to UTF-8 string conversion */
++/* return -1 on dst buffer overflow, -2 on invalid input char */
++static int utf8_wcstombs( const WCHAR *src, int srclen, char *dst, int dstlen )
++{
++    int len;
++
++    for (len = dstlen; srclen; srclen--, src++)
++    {
++        WCHAR ch = *src;
++        unsigned int val;
++
++        if (ch < 0x80)  /* 0x00-0x7f: 1 byte */
++        {
++            *dst++ = ch;
++            continue;
++        }
++        if (ch < 0x800)  /* 0x80-0x7ff: 2 bytes */
++        {
++            dst[1] = 0x80 | (ch & 0x3f);
++            ch >>= 6;
++            dst[0] = 0xc0 | ch;
++            dst += 2;
++            continue;
++        }
++        if (!(val = get_surrogate_value( src, srclen ))) continue;
++        if (val < 0x10000)  /* 0x800-0xffff: 3 bytes */
++        {
++            dst[2] = 0x80 | (val & 0x3f);
++            val >>= 6;
++            dst[1] = 0x80 | (val & 0x3f);
++            val >>= 6;
++            dst[0] = 0xe0 | val;
++            dst += 3;
++        }
++        else   /* 0x10000-0x10ffff: 4 bytes */
++        {
++            dst[3] = 0x80 | (val & 0x3f);
++            val >>= 6;
++            dst[2] = 0x80 | (val & 0x3f);
++            val >>= 6;
++            dst[1] = 0x80 | (val & 0x3f);
++            val >>= 6;
++            dst[0] = 0xf0 | val;
++            dst += 4;
++            src++;
++            srclen--;
++        }
++    }
++    return dstlen - len;
++}
++
++static void log_process_event( struct process *process, const char *fmt, ... )
++{
++    static unsigned int bottle_inode = 0;
++    const char *name = getenv( "CX_WINE_USAGE_LOGFILE" );
++    const char *appid = getenv( "CX_BOTTLE_CREATOR_APPID" );
++    struct memory_view *exe;
++    struct unicode_str nt_name;
++    char *ptr, *buffer, prefix[128], bottleid[12];
++    int fd, len1, len2, len3, len4;
++    va_list args;
++
++    appid = appid ? appid : "--unknown--";
++
++    if (!name || name[0] != '/') return;  /* needs to be an absolute path */
++
++    if ((fd = open( name, O_WRONLY | O_APPEND | O_CREAT, 0600 )) == -1) return;
++
++    if (!(exe = get_exe_view( process )) || !get_view_nt_name( exe, &nt_name ))
++        goto done;
++
++    if (!bottle_inode)
++    {
++        struct stat st;
++        if (!fstat( config_dir_fd, &st ))
++            bottle_inode = st.st_ino;
++    }
++
++    va_start( args, fmt );
++    len1 = vsnprintf( prefix, sizeof(prefix), fmt, args );
++    va_end( args );
++    len2 = snprintf( bottleid, sizeof(bottleid), "%u ", bottle_inode );
++    len3 = get_length_utf8( nt_name.str, nt_name.len/sizeof(WCHAR) );
++    len4 = strlen( appid );
++
++    if (len1 < 0 || len1 >= sizeof(prefix) ||
++        len2 < 0 || len2 >= sizeof(bottleid) ||
++        len3 < 0)
++        goto done;
++    if (!(buffer = ptr = malloc( len1 + len2 + len3 + len4 + 3 ))) goto done;
++    memcpy( ptr, prefix, len1 );
++    ptr += len1;
++    memcpy( ptr, bottleid, len2 );
++    ptr += len2;
++    ptr += utf8_wcstombs( nt_name.str, nt_name.len/sizeof(WCHAR), ptr, len3 );
++    *ptr++ = ' ';
++    memcpy( ptr, appid, len4 );
++    ptr += len4;
++    *ptr++ = '\n';
++    write( fd, buffer, ptr - buffer );
++    free( buffer );
++done:
++    close( fd );
++}
+ 
+ static unsigned int index_from_ptid(unsigned int id) { return id / 4; }
+ static unsigned int ptid_from_index(unsigned int index) { return index * 4; }
+ 
+ /* allocate a new process or thread id */
+ unsigned int alloc_ptid( void *ptr )
+@@ -968,12 +1153,15 @@
+     process->desktop = 0;
+     cancel_process_asyncs( process );
+     close_process_handles( process );
+     if (process->idle_event) release_object( process->idle_event );
+     process->idle_event = NULL;
+     assert( !process->console );
++
++    if (!process->is_system)
++        log_process_event( process, "exit %x %u ", process->exit_code, (unsigned)((process->end_time-process->start_time)/TICKS_PER_SEC) );
+ 
+     destroy_process_classes( process );
+     free_mapped_views( process );
+     free_process_user_handles( process );
+     remove_process_locks( process );
+     set_process_startup_state( process, STARTUP_ABORTED );
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -67,12 +69,14 @@
+     struct message        *hardware_msg;  /* hardware message if low-level hook result */
+     struct desktop        *desktop;       /* desktop for hardware message */
+     struct message        *callback_msg;  /* message to queue for callback */
+     void                  *data;          /* message reply data */
+     unsigned int           data_size;     /* size of message reply data */
+     struct timeout_user   *timeout;       /* result timeout */
++    thread_id_t            hook_thread_id;/* Hook owner thread id. */
++    client_ptr_t           hook_proc;     /* Hook proc address. */
+ };
+ 
+ struct message
+ {
+     struct list            entry;     /* entry in message list */
+     enum message_type      type;      /* message type */
+@@ -976,24 +1004,32 @@
+     result->timeout = NULL;
+ 
+     if (result->msg)  /* not received yet */
+     {
+         struct message *msg = result->msg;
+ 
++        if (result->sender && result->hook_thread_id && result->hook_proc)
++        {
++            if (debug_level > 1)
++                fprintf( stderr, "disabling hung hook: tid %04x, proc %#lx\n",
++                         result->hook_thread_id, (unsigned long)result->hook_proc );
++            disable_hung_hook( result->sender->input->desktop, msg->msg, result->hook_thread_id, result->hook_proc );
++        }
+         result->msg = NULL;
+         msg->result = NULL;
+         remove_queue_message( result->receiver, msg, SEND_MESSAGE );
+         result->receiver = NULL;
+     }
+     store_message_result( result, 0, STATUS_TIMEOUT );
+ }
+ 
+ /* allocate and fill a message result structure */
+ static struct message_result *alloc_message_result( struct msg_queue *send_queue,
+                                                     struct msg_queue *recv_queue,
+-                                                    struct message *msg, timeout_t timeout )
++                                                    struct message *msg, timeout_t timeout,
++                                                    thread_id_t hook_thread_id, client_ptr_t hook_proc)
+ {
+     struct message_result *result = mem_alloc( sizeof(*result) );
+     if (result)
+     {
+         result->msg          = msg;
+         result->sender       = send_queue;
+@@ -1002,12 +1038,14 @@
+         result->data         = NULL;
+         result->data_size    = 0;
+         result->timeout      = NULL;
+         result->hardware_msg = NULL;
+         result->desktop      = NULL;
+         result->callback_msg = NULL;
++        result->hook_thread_id = hook_thread_id;
++        result->hook_proc = hook_proc;
+ 
+         if (msg->type == MSG_CALLBACK)
+         {
+             struct message *callback_msg = mem_alloc( sizeof(*callback_msg) );
+ 
+             if (!callback_msg)
+@@ -1962,14 +2023,16 @@
+                                  int id, lparam_t lparam, struct msg_queue *sender )
+ {
+     struct thread *hook_thread;
+     struct msg_queue *queue;
+     struct message *msg;
+     timeout_t timeout = 2000 * -10000;  /* FIXME: load from registry */
++    thread_id_t hook_thread_id;
++    client_ptr_t hook_proc;
+ 
+-    if (!(hook_thread = get_first_global_hook( desktop, id ))) return 0;
++    if (!(hook_thread = get_first_global_hook( desktop, id, &hook_thread_id, &hook_proc ))) return 0;
+     if (!(queue = hook_thread->queue)) return 0;
+     if (is_queue_hung( queue )) return 0;
+ 
+     if (!(msg = mem_alloc( sizeof(*msg) ))) return 0;
+ 
+     msg->type      = MSG_HOOK_LL;
+@@ -1981,13 +2044,13 @@
+     msg->y         = hardware_msg->y;
+     msg->time      = hardware_msg->time;
+     msg->data_size = hardware_msg->data_size;
+     msg->result    = NULL;
+ 
+     if (!(msg->data = memdup( hardware_msg->data, hardware_msg->data_size )) ||
+-        !(msg->result = alloc_message_result( sender, queue, msg, timeout )))
++        !(msg->result = alloc_message_result( sender, queue, msg, timeout, hook_thread_id, hook_proc )))
+     {
+         free_message( msg );
+         return 0;
+     }
+     msg->result->hardware_msg = hardware_msg;
+     msg->result->desktop = (struct desktop *)grab_object( desktop );
+@@ -3188,13 +3262,13 @@
+         switch(msg->type)
+         {
+         case MSG_OTHER_PROCESS:
+         case MSG_ASCII:
+         case MSG_UNICODE:
+         case MSG_CALLBACK:
+-            if (!(msg->result = alloc_message_result( send_queue, recv_queue, msg, req->timeout )))
++            if (!(msg->result = alloc_message_result( send_queue, recv_queue, msg, req->timeout, 0, 0 )))
+             {
+                 free_message( msg );
+                 break;
+             }
+             /* fall through */
+         case MSG_NOTIFY:
+--- a/server/registry.c
++++ b/server/registry.c
+@@ -144,12 +144,13 @@
+ static int save_branch_count;
+ static struct save_branch_info save_branch_info[MAX_SAVE_BRANCH_INFO];
+ 
+ unsigned int supported_machines_count = 0;
+ unsigned short supported_machines[8];
+ unsigned short native_machine = 0;
++int wow64_using_32bit_prefix = 0;
+ 
+ /* information about a file being loaded */
+ struct file_load_info
+ {
+     const char *filename; /* input file name */
+     FILE       *file;     /* input file */
+@@ -1848,12 +1849,20 @@
+ {
+     unsigned int count = 0;
+ #ifdef __i386__
+     if (prefix_type == PREFIX_32BIT) supported_machines[count++] = IMAGE_FILE_MACHINE_I386;
+ #elif defined(__x86_64__)
+     if (prefix_type == PREFIX_64BIT) supported_machines[count++] = IMAGE_FILE_MACHINE_AMD64;
++#ifdef IS_WOW64_BUILD
++    else
++    {
++        supported_machines[count++] = IMAGE_FILE_MACHINE_AMD64;
++        supported_machines[count++] = IMAGE_FILE_MACHINE_I386;
++        wow64_using_32bit_prefix = 1;
++    }
++#endif
+     supported_machines[count++] = IMAGE_FILE_MACHINE_I386;
+ #elif defined(__arm__)
+     if (prefix_type == PREFIX_32BIT) supported_machines[count++] = IMAGE_FILE_MACHINE_ARMNT;
+ #elif defined(__aarch64__)
+     if (prefix_type == PREFIX_64BIT)
+     {
+--- a/server/user.h
++++ b/server/user.h
+@@ -113,14 +113,15 @@
+ extern void cleanup_clipboard_thread( struct thread *thread );
+ 
+ /* hook functions */
+ 
+ extern void remove_thread_hooks( struct thread *thread );
+ extern unsigned int get_active_hooks(void);
+-extern struct thread *get_first_global_hook( struct desktop *desktop, int id );
++extern struct thread *get_first_global_hook( struct desktop *desktop, int id, thread_id_t *thread_id, client_ptr_t *proc );
+ extern void add_desktop_hook_count( struct desktop *desktop, struct thread *thread, int count );
++extern void disable_hung_hook( struct desktop *desktop, int id, thread_id_t thread_id, client_ptr_t proc );
+ 
+ /* queue functions */
+ 
+ extern void free_msg_queue( struct thread *thread );
+ extern struct hook_table *get_queue_hooks( struct thread *thread );
+ extern void set_queue_hooks( struct thread *thread, struct hook_table *hooks );
+--- a/server/window.c
++++ b/server/window.c
+@@ -1216,13 +1216,15 @@
+ }
+ 
+ 
+ /* get the top-level window to clip against for a given window */
+ static inline struct window *get_top_clipping_window( struct window *win )
+ {
+-    while (!(win->paint_flags & PAINT_HAS_SURFACE) && win->parent && !is_desktop_window(win->parent))
++    while ((!(win->paint_flags & PAINT_HAS_SURFACE) || !win->thread ||
++            win->thread->process != current->process) /* CX HACK 23950 */
++           && win->parent && !is_desktop_window(win->parent))
+         win = win->parent;
+     return win;
+ }
+ 
+ 
+ /* compute the visible region of a window, in window coordinates */

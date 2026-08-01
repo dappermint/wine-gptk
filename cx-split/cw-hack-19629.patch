@@ -1,0 +1,30 @@
+--- a/dlls/winebus.sys/bus_sdl.c
++++ b/dlls/winebus.sys/bus_sdl.c
+@@ -1138,20 +1139,27 @@
+     LOAD_FUNCPTR(SDL_HapticUpdateEffect);
+     LOAD_FUNCPTR(SDL_JoystickIsHaptic);
+     LOAD_FUNCPTR(SDL_GameControllerAddMapping);
+     LOAD_FUNCPTR(SDL_RegisterEvents);
+     LOAD_FUNCPTR(SDL_PushEvent);
+     LOAD_FUNCPTR(SDL_GetTicks);
++    LOAD_FUNCPTR(SDL_SetHint);
+ #undef LOAD_FUNCPTR
+     pSDL_JoystickRumble = dlsym(sdl_handle, "SDL_JoystickRumble");
+     pSDL_JoystickRumbleTriggers = dlsym(sdl_handle, "SDL_JoystickRumbleTriggers");
+     pSDL_JoystickGetProduct = dlsym(sdl_handle, "SDL_JoystickGetProduct");
+     pSDL_JoystickGetProductVersion = dlsym(sdl_handle, "SDL_JoystickGetProductVersion");
+     pSDL_JoystickGetVendor = dlsym(sdl_handle, "SDL_JoystickGetVendor");
+     pSDL_JoystickGetType = dlsym(sdl_handle, "SDL_JoystickGetType");
+     pSDL_JoystickGetSerial = dlsym(sdl_handle, "SDL_JoystickGetSerial");
++
++#ifdef __APPLE__
++    /* CW HACK 19629: Enable rumble over BT for PS4/PS5 controllers. */
++    pSDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
++    pSDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
++#endif
+ 
+     if (pSDL_Init(SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC) < 0)
+     {
+         ERR("could not init SDL: %s\n", pSDL_GetError());
+         goto failed;
+     }

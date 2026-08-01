@@ -1,0 +1,74 @@
+--- a/dlls/localspl/cups.c
++++ b/dlls/localspl/cups.c
+@@ -33,12 +33,20 @@
+ #include <signal.h>
+ #include <sys/wait.h>
+ #ifdef HAVE_CUPS_CUPS_H
+ #include <cups/cups.h>
+ #endif
+ 
++#ifdef __APPLE__
++
++#include <crt_externs.h>
++#include <spawn.h>
++#include <sys/wait.h>
++
++#endif
++
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+ #include "wine/debug.h"
+ 
+ #include "localspl_private.h"
+ 
+@@ -57,13 +65,14 @@
+     DO_FUNC(cupsFinishDocument); \
+     DO_FUNC(cupsFreeDests); \
+     DO_FUNC(cupsFreeOptions); \
+     DO_FUNC(cupsGetOption); \
+     DO_FUNC(cupsParseOptions); \
+     DO_FUNC(cupsStartDocument); \
+-    DO_FUNC(cupsWriteRequestData)
++    DO_FUNC(cupsWriteRequestData); \
++    DO_FUNC(cupsPrintFile)
+ #define CUPS_OPT_FUNCS \
+     DO_FUNC(cupsGetNamedDest); \
+     DO_FUNC(cupsLastErrorString)
+ 
+ #define DO_FUNC(f) static typeof(f) *p##f
+ CUPS_FUNCS;
+@@ -350,12 +497,17 @@
+                 doc->cups.num_options, &doc->cups.options);
+ 
+         TRACE("printing via cups with options:\n");
+         for (i = 0; i < doc->cups.num_options; i++)
+             TRACE("\t%d: %s = %s\n", i, doc->cups.options[i].name, doc->cups.options[i].value);
+ 
++#ifdef __APPLE__
++        /* We will write all data to a .ps file on disk here and then convert it to PDF in cups_end_doc */
++        if (doc->cups.filename == NULL)
++        {
++#endif
+         if (pcupsGetOption("raw", doc->cups.num_options, doc->cups.options))
+             format = CUPS_FORMAT_RAW;
+         else if (!(format = pcupsGetOption("document-format", doc->cups.num_options, doc->cups.options)))
+             format = CUPS_FORMAT_AUTO;
+ 
+         job_id = pcupsCreateJob(CUPS_HTTP_DEFAULT, doc->cups.queue,
+@@ -372,12 +524,16 @@
+         {
+             if (pcupsLastErrorString)
+                 WARN("cupsStartDocument failed: %s\n", debugstr_a(pcupsLastErrorString()));
+             return FALSE;
+         }
+ 
++#ifdef __APPLE__
++        }
++#endif
++
+         doc->cups.state = doc_initialized;
+     }
+ 
+     if (doc->cups.restore_ps_header)
+     {
+         if (!cups_write(ps_adobe, sizeof(ps_adobe) - 1))

@@ -1,0 +1,200 @@
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -3058,13 +3635,14 @@
+     DWORD i, len;
+     NTSTATUS status = STATUS_DLL_NOT_FOUND;
+     BOOL found_image = FALSE;
+ 
+     if (contains_path( name )) return status;
+ 
+-    if (!is_prefix_bootstrap)
++    /* CW HACK 20810: In Wow64/32-bit-bottle mode, 64-bit DLLs (like wow64*) won't be present in the prefix. */
++    if (!is_prefix_bootstrap && !wow64_using_32bit_prefix)
+     {
+         /* 16-bit files can't be loaded from the prefix */
+         if (!name[1] || wcscmp( name + wcslen(name) - 2, L"16" )) return status;
+     }
+ 
+     if (!get_env_var( L"WINEBUILDDIR", 20 + 2 * wcslen(name) + wcslen(pe_dir), new_name ))
+@@ -3135,12 +3713,28 @@
+ {
+     WCHAR *name;
+     BOOL found_image = FALSE;
+     NTSTATUS status = STATUS_DLL_NOT_FOUND;
+     ULONG len;
+ 
++    /* CW HACK 20810:
++     * 32-bit bottles from CrossOver 20 and earlier contain a stub wow64cpu.dll.
++     * In Wow64/32-bit-bottle mode, this causes problems and isn't usable.
++     * Return DLL_NOT_FOUND so the builtin gets used instead.
++     */
++    if (wow64_using_32bit_prefix && !wcscmp(search, L"wow64cpu.dll"))
++        return STATUS_DLL_NOT_FOUND;
++
++    /* CW HACK 20810:
++     * 32-bit bottles from CrossOver 22 and earlier contain a fake win32u.dll.
++     * In Wow64/32-bit-bottle mode, this causes problems and isn't usable.
++     * Return DLL_NOT_FOUND so the builtin gets used instead.
++     */
++    if (wow64_using_32bit_prefix && !wcscmp(search, L"win32u.dll"))
++        return STATUS_DLL_NOT_FOUND;
++
+     if (!paths) paths = default_load_path;
+     len = wcslen( paths );
+ 
+     if (len < wcslen( system_dir )) len = wcslen( system_dir );
+     len += wcslen( search ) + 2;
+ 
+@@ -4224,14 +4834,28 @@
+         NTSTATUS status;
+         static const WCHAR wow64_path[] = L"C:\\windows\\system32\\wow64.dll";
+ 
+         build_wow64_main_module();
+         build_ntdll_module();
+ 
+-        if ((status = load_dll( NULL, wow64_path, 0, &wm, FALSE )))
++        /* CW HACK 20810: In Wow64/32-bit-bottle mode, load by name rather than full path */
++        if (wow64_using_32bit_prefix)
+         {
++            RTL_USER_PROCESS_PARAMETERS *params = NtCurrentTeb()->Peb->ProcessParameters;
++            static const WCHAR wow64_dll[] = L"wow64.dll";
++
++            default_load_path = params->DllPath.Buffer;
++            if (!default_load_path)
++                get_dll_load_path( params->ImagePathName.Buffer, NULL, dll_safe_mode, &default_load_path );
++            status = load_dll( NULL, wow64_dll, 0, &wm, FALSE );
++        }
++        else
++            status = load_dll( NULL, wow64_path, 0, &wm, FALSE );
++
++        if (status)
++        {
+             ERR( "could not load %s, status %lx\n", debugstr_w(wow64_path), status );
+             NtTerminateProcess( GetCurrentProcess(), status );
+         }
+         wow64 = wm->ldr.DllBase;
+ #define GET_PTR(name) \
+         if (!(p ## name = RtlFindExportedRoutineByName( wow64, #name ))) ERR( "failed to load %s\n", #name )
+--- a/dlls/ntdll/unix/env.c
++++ b/dlls/ntdll/unix/env.c
+@@ -1109,12 +1110,15 @@
+         append_envA( env, pos, size, "WINEUNIXCP", str );
+     }
+     else append_envW( env, pos, size, "WINEUNIXCP", NULL );
+     append_envA( env, pos, size, "WINEUSERLOCALE", user_locale );
+     append_envA( env, pos, size, "SystemDrive", "C:" );
+     append_envA( env, pos, size, "SystemRoot", "C:\\windows" );
++
++    /* CW HACK 20810: Set this environment variable so PE code can look for it. */
++    if (wow64_using_32bit_prefix) append_envA( env, pos, size, "WINEWOW6432BPREFIXMODE", "1" );
+ }
+ 
+ 
+ static WCHAR *expand_value( WCHAR *env, SIZE_T size, const WCHAR *src, SIZE_T src_len )
+ {
+     SIZE_T len, retlen = src_len + 1, count = 0;
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -2957,13 +2988,20 @@
+         }
+         else ret = STATUS_INFO_LENGTH_MISMATCH;
+         break;
+     }
+ 
+     case SystemCpuInformation:  /* 1 */
+-        if (size >= (len = sizeof(cpu_info))) memcpy(info, &cpu_info, len);
++        if (size >= (len = sizeof(cpu_info)))
++        {
++            /* CW HACK 20810: report the emulated processor when in 32-bit-bottle/Wow64 mode */
++            if (wow64_using_32bit_prefix)
++                return NtQuerySystemInformation(SystemEmulationProcessorInformation, info, size, ret_size);
++            else
++                memcpy(info, &cpu_info, len);
++        }
+         else ret = STATUS_INFO_LENGTH_MISMATCH;
+         break;
+ 
+     case SystemPerformanceInformation:  /* 2 */
+     {
+         SYSTEM_PERFORMANCE_INFORMATION spi;
+@@ -3792,12 +3830,24 @@
+         {
+             ret = STATUS_BUFFER_TOO_SMALL;
+             break;
+         }
+         memset( machines, 0, len );
+ 
++        /* CW HACK 20810: report i386-only when in 32-bit-bottle/Wow64 mode */
++        if (wow64_using_32bit_prefix)
++        {
++            machines[0].Machine = IMAGE_FILE_MACHINE_I386;
++            machines[0].UserMode = 1;
++            machines[0].KernelMode = 1;
++            machines[0].Native = 1;
++            machines[0].Process = 1;
++            ret = STATUS_SUCCESS;
++            break;
++        }
++
+         /* native machine */
+         machines[0].Machine = supported_machines[0];
+         machines[0].UserMode = 1;
+         machines[0].KernelMode = 1;
+         machines[0].Native = 1;
+         machines[0].Process = (supported_machines[0] == machine || is_machine_64bit( machine ));
+--- a/dlls/wow64/file.c
++++ b/dlls/wow64/file.c
+@@ -137,12 +137,21 @@
+     const WCHAR *name = attr->ObjectName->Buffer;
+     unsigned int i, prefix_len = 0, len = attr->ObjectName->Length / sizeof(WCHAR);
+     const WCHAR *syswow64dir;
+     UNICODE_STRING redir;
+ 
+     if (!len) return FALSE;
++
++    /* CW HACK 20810: disable FS redirection when 32-bit-only bottle is being used */
++    {
++        UNICODE_STRING val_str, name_str = RTL_CONSTANT_STRING( L"WINEWOW6432BPREFIXMODE" );
++
++        val_str.MaximumLength = 0;
++        if (RtlQueryEnvironmentVariable_U( NULL, &name_str, &val_str ) != STATUS_VARIABLE_NOT_FOUND)
++            return FALSE;
++    }
+ 
+     if (!attr->RootDirectory)
+     {
+         prefix_len = wcslen( windirW );
+         if (len < prefix_len || wcsnicmp( name, windirW, prefix_len )) return FALSE;
+     }
+--- a/dlls/wow64/syscall.c
++++ b/dlls/wow64/syscall.c
+@@ -711,16 +711,27 @@
+ static HMODULE load_64bit_module( const WCHAR *name )
+ {
+     NTSTATUS status;
+     HMODULE module;
+     UNICODE_STRING str;
+     WCHAR path[MAX_PATH];
++    UNICODE_STRING val_str, name_str = RTL_CONSTANT_STRING( L"WINEWOW6432BPREFIXMODE" );
+     const WCHAR *dir = get_machine_wow64_dir( IMAGE_FILE_MACHINE_TARGET_HOST );
+ 
+-    swprintf( path, MAX_PATH, L"%s\\%s", dir, name );
+-    RtlInitUnicodeString( &str, path );
++    /* CW HACK 20810: In Wow64/32-bit-bottle mode, load 64-bit DLLs by name rather than full path */
++    val_str.MaximumLength = 0;
++    if (RtlQueryEnvironmentVariable_U( NULL, &name_str, &val_str ) != STATUS_VARIABLE_NOT_FOUND)
++    {
++        RtlInitUnicodeString( &str, name );
++    }
++    else
++    {
++        swprintf( path, MAX_PATH, L"%s\\%s", dir, name );
++        RtlInitUnicodeString( &str, path );
++    }
++
+     if ((status = LdrLoadDll( dir, 0, &str, &module )))
+     {
+         ERR( "failed to load dll %lx\n", status );
+         NtTerminateProcess( GetCurrentProcess(), status );
+     }
+     return module;

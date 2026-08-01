@@ -1,0 +1,84 @@
+--- a/dlls/wow64cpu/cpu.c
++++ b/dlls/wow64cpu/cpu.c
+@@ -37,27 +37,65 @@
+     BYTE  ljmp;   /* jump far, absolute indirect */
+     BYTE  modrm;  /* address=disp32, opcode=5 */
+     DWORD op;
+     DWORD addr;
+     WORD  cs;
+ };
++struct thunk_32to64_rosetta2_workaround
++{
++    BYTE  lcall;  /* call far, absolute indirect */
++    BYTE  modrm;  /* address=disp32, opcode=3 */
++    DWORD op;
++    DWORD addr;
++    WORD  cs;
++
++    BYTE add;
++    BYTE add_modrm;
++    BYTE add_op;
++
++    BYTE jmp;
++    BYTE jmp_modrm;
++    DWORD jmp_op;
++    ULONG64 jmp_addr;
++};
+ struct thunk_opcodes
+ {
+-    struct thunk_32to64 syscall_thunk;
+-    struct thunk_32to64 unix_thunk;
++    union
++    {
++        struct thunk_32to64 syscall_thunk;
++        struct thunk_32to64_rosetta2_workaround syscall_thunk_rosetta;
++    };
++    union
++    {
++        struct thunk_32to64 unix_thunk;
++        struct thunk_32to64_rosetta2_workaround unix_thunk_rosetta;
++    };
+ };
+ #include "poppack.h"
+ 
+ static BYTE DECLSPEC_ALIGN(4096) code_buffer[0x1000];
+ 
+ static USHORT cs64_sel;
+ static USHORT ds64_sel;
+ static USHORT fs32_sel;
+ 
+ void **__wine_unix_call_dispatcher = NULL;
+ 
++BOOL use_rosetta2_workaround;
++
++static BOOL is_rosetta2(void)
++{
++    char buffer[64];
++    NTSTATUS status = NtQuerySystemInformation( SystemProcessorBrandString, buffer, sizeof(buffer), NULL );
++
++    if (status || !strstr( buffer, "VirtualApple" ))
++        return FALSE;
++
++    return TRUE;
++}
++
+ BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, void *reserved )
+ {
+     if (reason == DLL_PROCESS_ATTACH) LdrDisableThreadCalloutsForDll( inst );
+     return TRUE;
+ }
+ 
+@@ -283,13 +348,12 @@
+                    ".seh_endprologue\n\t"
+                    "movq %gs:0x30,%r12\n\t"
+                    "movq 0x1488(%r12),%rcx\n\t" /* NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED] */
+                    "leaq 4(%rcx),%r13\n"        /* cpu->Context */
+                    "jmp syscall_32to64_return\n" )
+ 
+-
+ /**********************************************************************
+  *           BTCpuProcessInit  (wow64cpu.@)
+  */
+ NTSTATUS WINAPI BTCpuProcessInit(void)
+ {
+     struct thunk_opcodes *thunk = (struct thunk_opcodes *)code_buffer;

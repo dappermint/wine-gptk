@@ -1,0 +1,377 @@
+--- a/dlls/winex11.drv/clipboard.c
++++ b/dlls/winex11.drv/clipboard.c
+@@ -1536,14 +1536,19 @@
+     UINT start = 0, end = 0;
+     BOOL ret = TRUE;
+ 
+     p = data;
+     while (*p && *p != '<')
+     {
+-        if (!strncmp( p, "StartFragment:", 14 )) start = atoi( p + 14 );
+-        else if (!strncmp( p, "EndFragment:", 12 )) end = atoi( p + 12 );
++        /* CROSSOVER HACK: Bug 6613.
++         * Export all of the HTML instead of just the fragment. This ensures that
++         * any classes/styles defined outside the fragment are in the text/html
++         * export. Ideally, we should parse the HTML to find them and ensure that
++         * they are included but that "real" elements outside the fragment are not. */
++        if (!strncmp( p, "StartHTML:", 10 )) start = atoi( p + 10 );
++        else if (!strncmp( p, "EndHTML:", 8 )) end = atoi( p + 8 );
+         if (!(p = strpbrk( p, "\r\n" ))) break;
+         while (*p == '\r' || *p == '\n') p++;
+     }
+     if (start && start < end && end <= size)
+         put_property( display, win, prop, target, 8, (char *)data + start, end - start );
+     else
+@@ -1659,13 +1664,60 @@
+         if (RtlGetLastWin32Error() != ERROR_INSUFFICIENT_BUFFER) return NULL;
+     }
+     register_win32_formats( ids, *size );
+     return ids;
+ }
+ 
++/* CROSSOVER HACK: bug 5027 - OLE clipboard doesn't work across servers */
++static int is_local_format( UINT format )
++{
++    static const WCHAR DataObject[] = {'D','a','t','a','O','b','j','e','c','t',0};
++    static const WCHAR WineMarshalledDataObject[] = {'W','i','n','e',' ','M','a','r','s','h','a','l','l','e','d',' ','D','a','t','a','O','b','j','e','c','t',0};
++    static const WCHAR OlePrivateData[] = {'O','l','e',' ','P','r','i','v','a','t','e',' ','D','a','t','a',0};
++    static const WCHAR EmbedSource[] = {'E','m','b','e','d',' ','S','o','u','r','c','e',0};
++    static const WCHAR EmbeddedObject[] = {'E','m','b','e','d','d','e','d',' ','O','b','j','e','c','t',0};
++    static const WCHAR LinkSource[] = {'L','i','n','k',' ','S','o','u','r','c','e',0};
++    static const WCHAR CustomLinkSource[] = {'C','u','s','t','o','m',' ','L','i','n','k',' ','S','o','u','r','c','e',0};
++    static const WCHAR ObjectDescriptor[] = {'O','b','j','e','c','t',' ','D','e','s','c','r','i','p','t','o','r',0};
++    static const WCHAR LinkSourceDescriptor[] = {'L','i','n','k',' ','S','o','u','r','c','e',' ','D','e','s','c','r','i','p','t','o','r',0};
++    static const WCHAR OwnerLink[] = {'O','w','n','e','r','L','i','n','k',0};
++    static const WCHAR FileName[] = {'F','i','l','e','N','a','m','e',0};
++    static const WCHAR OfficeArt[] = {'+','O','f','f','i','c','e',' ','A','r','t',0};
++    static const WCHAR* local_formats[] = {
++        DataObject,
++        WineMarshalledDataObject,
++        OlePrivateData,
++        EmbedSource,
++        EmbeddedObject,
++        LinkSource,
++        CustomLinkSource,
++        ObjectDescriptor,
++        LinkSourceDescriptor,
++        OwnerLink,
++        FileName,
++        NULL};
++    int i;
++    WCHAR buffer[256];
++
++    NtUserGetClipboardFormatName( format, buffer, 256 );
++    for (i=0; local_formats[i]; i++)
++        if (wcscmp(buffer, local_formats[i]) == 0)
++            return TRUE;
+ 
++    for (i=0; buffer[i]; i++)
++        if (buffer[i] == '+')
++        {
++            if (wcscmp(&buffer[i], OfficeArt) == 0)
++                return TRUE;
++            break;
++        }
++
++    return FALSE;
++}
++
++
+ /***********************************************************************
+  *           is_format_available
+  *
+  * Check if a clipboard format is included in the list.
+  * Helper for export_targets.
+  */
+@@ -1697,12 +1749,13 @@
+     }
+ 
+     pos = 0;
+     LIST_FOR_EACH_ENTRY( format, &format_list, struct clipboard_format, entry )
+     {
+         if (!format->export) continue;
++        if (is_local_format( format->id )) continue;
+         /* formats with id==0 are always exported */
+         if (format->id && !is_format_available( format->id, formats, count )) continue;
+         TRACE( "%d: %s -> %s\n", pos, debugstr_format( format->id ), debugstr_xatom( format->atom ));
+         targets[pos++] = format->atom;
+     }
+ 
+--- a/dlls/winex11.drv/event.c
++++ b/dlls/winex11.drv/event.c
+@@ -759,22 +759,16 @@
+         TRACE( "  enabled %u, visible %u, style %#x, focus %p, active %p, last %p\n",
+                 NtUserIsWindowEnabled( hwnd ), NtUserIsWindowVisible( hwnd ), (int)NtUserGetWindowLongW( hwnd, GWL_STYLE ),
+                 get_focus(), get_active_window(), last_focus );
+ 
+         if (can_activate_window(hwnd))
+         {
+-            /* simulate a mouse click on the menu to find out
+-             * whether the window wants to be activated */
+-            LRESULT ma = send_message( hwnd, WM_MOUSEACTIVATE,
+-                                       (WPARAM)NtUserGetAncestor( hwnd, GA_ROOT ),
+-                                       MAKELONG( HTMENU, WM_LBUTTONDOWN ) );
+-            if (ma != MA_NOACTIVATEANDEAT && ma != MA_NOACTIVATE)
+-            {
+-                set_focus( event->display, hwnd, event_time );
+-                return;
+-            }
++            /* CrossOver Bug 18896: don't send WM_MOUSEACTIVATE, it breaks Unity games */
++            /* CrossOver Bug 22868: don't send WM_MOUSEACTIVATE, it breaks Office 2010/2016 right click menus */
++            set_focus( event->display, hwnd, event_time );
++            return;
+         }
+         else if (hwnd == NtUserGetDesktopWindow())
+         {
+             hwnd = foreground;
+             if (!hwnd) hwnd = last_focus;
+             if (!hwnd) hwnd = NtUserGetDesktopWindow();
+--- a/dlls/winex11.drv/opengl.c
++++ b/dlls/winex11.drv/opengl.c
+@@ -335,12 +335,13 @@
+ static void (*pglXCopyContext)( Display *dpy, GLXContext src, GLXContext dst, unsigned long mask );
+ static void (*pglXSwapBuffers)( Display *dpy, GLXDrawable drawable );
+ static Bool (*pglXQueryVersion)( Display *dpy, int *maj, int *min );
+ static Bool (*pglXIsDirect)( Display *dpy, GLXContext ctx );
+ static GLXContext (*pglXGetCurrentContext)( void );
+ static GLXDrawable (*pglXGetCurrentDrawable)( void );
++static void (*pglXWaitGL)( void );
+ 
+ /* GLX 1.1 */
+ static const char *(*pglXQueryExtensionsString)( Display *dpy, int screen );
+ static const char *(*pglXQueryServerString)( Display *dpy, int screen, int name );
+ static const char *(*pglXGetClientString)( Display *dpy, int name );
+ 
+@@ -591,12 +592,13 @@
+     LOAD_FUNCPTR(glXGetCurrentContext);
+     LOAD_FUNCPTR(glXGetCurrentDrawable);
+     LOAD_FUNCPTR(glXDestroyContext);
+     LOAD_FUNCPTR(glXIsDirect);
+     LOAD_FUNCPTR(glXMakeCurrent);
+     LOAD_FUNCPTR(glXSwapBuffers);
++    LOAD_FUNCPTR(glXWaitGL);
+     LOAD_FUNCPTR(glXQueryVersion);
+ 
+     /* GLX 1.1 */
+     LOAD_FUNCPTR(glXGetClientString);
+     LOAD_FUNCPTR(glXQueryExtensionsString);
+     LOAD_FUNCPTR(glXQueryServerString);
+@@ -2864,14 +2866,19 @@
+             break;
+         }
+         pglXSwapBuffers(gdi_display, gl->drawable);
+         break;
+     }
+ 
+-    if (ctx && drawable && pglXWaitForSbcOML)
+-        pglXWaitForSbcOML( gdi_display, gl->drawable, target_sbc, &ust, &msc, &sbc );
++    if (ctx && drawable)
++    {
++        if (pglXWaitForSbcOML)
++            pglXWaitForSbcOML( gdi_display, gl->drawable, target_sbc, &ust, &msc, &sbc );
++        else if (pglXWaitGL)
++            pglXWaitGL();
++    }
+ 
+     present_gl_drawable( hwnd, ctx ? ctx->hdc : hdc, gl, !pglXWaitForSbcOML, FALSE );
+     update_gl_drawable_size( gl );
+     release_gl_drawable( gl );
+     return TRUE;
+ }
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -378,23 +378,149 @@
+  */
+ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, const RECT *window_rect )
+ {
+     DWORD style, ex_style;
+ 
+     if (!managed_mode) return FALSE;
++
++    /*
++     * CODEWEAVERS HACK
++     * Hack needed to have the mabinogi window not resized incorrectly
++     * by the x11 window manager.
++     */
++    if (1)
++    {
++        static const WCHAR launcherW[] = {'d','e','v','c','a','t','_','l','a','u','n','c','h','e','r',0};
++        static const WCHAR netuiW[] = {'N','e','t',' ','U','I',' ','T','o','o','l',' ','W','i','n','d','o','w',0};
++        WCHAR class[80];
++        UNICODE_STRING name = { .Buffer = class, .MaximumLength = sizeof(class) };
++        NtUserGetClassName( hwnd, FALSE, &name );
++
++        if (wcscmp(class,launcherW) == 0)
++            return FALSE;
++
++        /* Office 2010 right-click menus, hack for bug 15617. */
++        if (wcscmp(class, netuiW) == 0)
++            return FALSE;
++    }
+ 
+     /* child windows are not managed */
+     style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+     if ((style & (WS_CHILD|WS_POPUP)) == WS_CHILD) return FALSE;
+     /* activated windows are managed */
+     if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
+     if (hwnd == get_active_window()) return TRUE;
+     /* windows with caption are managed */
+     if ((style & WS_CAPTION) == WS_CAPTION) return TRUE;
+     /* windows with thick frame are managed */
+     if (style & WS_THICKFRAME) return TRUE;
++
++    /*
++     * CODEWEAVERS HACKS
++     */
++    if (1)
++    {
++        static const WCHAR menuW[] = {'#','3','2','7','7','0',0};
++        static const WCHAR splashW[] = {'S','p','l','a','s','h','W','n','d',0};
++        static const WCHAR itunesW[] = {'i','T','u','n','e','s',0};
++        static const WCHAR qtplayermainW[] = {'Q','u','i','c','k','T','i','m','e','P','l','a','y','e','r','M','a','i','n',0};
++        static const WCHAR qtplayerW[] = {'Q','u','i','c','k','T','i','m','e','P','l','a','y','e','r','.','e','x','e',0};
++        static const WCHAR psfloatW[] = {'P','S','F','l','o','a','t','C',0};
++        static const WCHAR msosplashW[] = {'M','s','o','S','p','l','a','s','h',0};
++        static const WCHAR ieframeW[] = {'I','E','F','r','a','m','e',0};
++        static const WCHAR tfrmsplashW[] = {'T','f','r','m','S','p','l','a','s','h',0};
++        static const WCHAR ebusetupW[] = {'E','B','U','S','e','t','u','p','W','n','d',0};
++        static const WCHAR wtllineW[] = {'W','T','L','_','L','i','n','e','S','t','y','l','e','C','o','l','o','r','D','D',0};
++        static const WCHAR wtlpatternW[] = {'W','T','L','_','P','a','t','t','e','r','n','C','o','l','o','r','D','D',0};
++        static const WCHAR dlgcacW[] = {'D','l','g','c','a','c','C','l','s','N','a','m','e',0};
++        static const WCHAR popupW[] = {'p','o','p','u','p','s','h','a','d','o','w',0};
++        static const WCHAR relistboxW[] = {'R','E','L','i','s','t','B','o','x','2','0','W',0};
++        static const WCHAR nuidialogW[] = {'N','U','I','D','i','a','l','o','g',0};
++        static const WCHAR sessionW[] = {'S','e','s','s','i','o','n','C','h','a','t','R','o','o','m','D','e','t','a','i','l','W','n','d',0};
++        WCHAR *p, class[80];
++        UNICODE_STRING name = { .Buffer = class, .MaximumLength = sizeof(class) };
++        NtUserGetClassName( hwnd, FALSE, &name );
++
++        ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
++        /*
++         * In Scientific Word, the startup dialog should be managed.
++         * In SAP Netweaver, the tooltips should not (WS_EX_TOPMOST).
++         */
++        if ( (wcscmp(class,menuW)==0) &&
++            !(ex_style & WS_EX_TOPMOST) )
++            return TRUE;
++        if (wcscmp(class,splashW)==0)
++            return TRUE;
++        if (wcscmp(class,itunesW)==0)
++            return TRUE;
++        if (wcscmp(class,qtplayermainW) == 0)
++            return TRUE; /* QuickTime 7.1 */
++        if ((p = wcsrchr(class, '\\')) && wcscmp(p+1,qtplayerW) == 0)
++            return TRUE; /* QuickTime 6.x */
++        if (wcscmp(class,psfloatW)==0)
++            return TRUE;
++        /* the office 97 splash screen is not a toolbar */
++        if (wcscmp(class,msosplashW) == 0)
++            return TRUE;
++        if ((wcscmp(class,ieframeW) == 0) && (style & WS_SYSMENU))
++            return TRUE;
++        /* for CRPSClient for WorldVistA */
++        if (wcscmp(class,tfrmsplashW) == 0)
++            return TRUE;
++        /* Halo setup window */
++        if (wcscmp(class,ebusetupW) == 0)
++            return TRUE;
++        /* AWR line style popup */
++        if (wcscmp(class,wtllineW) == 0)
++            return TRUE;
++        /* AWR fill style popup */
++        if (wcscmp(class,wtlpatternW) == 0)
++            return TRUE;
++        /* Quickbooks InstallShield window */
++        if (wcscmp(class,dlgcacW) == 0)
++            return TRUE;
++        /* WeChat popup shadow, bug 18028 */
++        if (wcscmp(class,popupW) == 0)
++        {
++            WCHAR parent_class[80];
++            UNICODE_STRING parent_name = { .Buffer = parent_class, .MaximumLength = sizeof(parent_class) };
++
++            /* Bug 21523 WeChat chat room detail window doesn't show. */
++            NtUserGetClassName( NtUserGetParent( hwnd ), FALSE, &parent_name );
++            if (wcscmp( parent_class, sessionW ) == 0)
++                return FALSE;
++
++            return TRUE;
++        }
++
++#ifdef __APPLE__
++        {
++            static const WCHAR eveW[] = {'e','v','e','S','p','l','a','t','t','e','r',0};
++            static const WCHAR triuiW[] = {'t','r','i','u','i','S','c','r','e','e','n',0};
++        /* Macos does not like those windows to be managed, but Linux needs that(handled below in the
++         * POPUP | SYSMENU case
++         */
++        /* EVE online - Does not redraw otherwise*/
++        if(wcscmp(class, eveW) == 0 || wcscmp(class, triuiW) == 0)
++            return FALSE;
++        }
++#endif
++
++        /* for outlook 2003 completion window */
++        if (wcscmp(class,relistboxW) == 0 && (style & WS_POPUP) &&
++            (style & WS_SYSMENU))
++            return FALSE;
++
++        /* Outlook 2003 "Toast" window that appears when a new message is
++         * received. Should not be managed to prevent it grabbing keyboard
++         * focus */
++        if (wcscmp(class,nuidialogW) == 0 &&
++            (style & (WS_POPUP|WS_SYSMENU)) == (WS_POPUP|WS_SYSMENU))
++            return FALSE;
++    }
++
+     if (style & WS_POPUP)
+     {
+         HMONITOR hmon;
+         MONITORINFO mi;
+ 
+         /* popup with sysmenu == caption are managed */
+@@ -1081,12 +1207,16 @@
+     else
+     {
+         style = NtUserGetWindowLongW( data->hwnd, GWL_STYLE );
+         ex_style = NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE );
+     }
+ 
++    /* HACK for bug 13477. */
++    if (style & WS_MINIMIZE)
++        style |= WS_MINIMIZEBOX;
++
+     set_size_hints( data, style );
+     set_mwm_hints( data, style, ex_style );
+     set_style_hints( data, style, ex_style );
+ }
+ 
+ 
+--- a/dlls/winex11.drv/x11drv_main.c
++++ b/dlls/winex11.drv/x11drv_main.c
+@@ -278,19 +278,22 @@
+     if (ignore_error( display, error_evt ))
+     {
+         TRACE( "got ignored error %d req %d\n",
+                error_evt->error_code, error_evt->request_code );
+         return 0;
+     }
++    ERR("XERROR: code %d request %d minor %d xid %08lx\n",
++        error_evt->error_code,
++        error_evt->request_code,
++        error_evt->minor_code,
++        error_evt->resourceid);
+     if (TRACE_ON(synchronous))
+     {
+-        ERR( "X protocol error: serial=%ld, request_code=%d - breaking into debugger\n",
+-             error_evt->serial, error_evt->request_code );
++        old_error_handler( display, error_evt );
+         assert( 0 );
+     }
+-    old_error_handler( display, error_evt );
+     return 0;
+ }
+ 
+ /***********************************************************************
+  *		init_pixmap_formats
+  */

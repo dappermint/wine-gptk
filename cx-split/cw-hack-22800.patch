@@ -1,0 +1,273 @@
+--- a/dlls/localspl/cups.c
++++ b/dlls/localspl/cups.c
+@@ -103,12 +112,17 @@
+             } state;
+             BOOL restore_ps_header;
+             int num_options;
+             cups_option_t *options;
+             int buf_len;
+             char buf[257]; /* DSC max of 256 + '\0' */
++#ifdef __APPLE__
++            /* CW HACK 22800 */
++            char *filename;
++            int fd;
++#endif
+         } cups;
+ #endif
+     };
+ } doc_t;
+ 
+ static BOOL pipe_write_doc(doc_t *doc, const BYTE *buf, unsigned int size)
+@@ -227,15 +241,133 @@
+     cmd = malloc(printer_len * sizeof(WCHAR) + sizeof(lpr) + sizeof(quote));
+     memcpy(cmd, lpr, sizeof(lpr));
+     memcpy(cmd + ARRAY_SIZE(lpr), printer_name, printer_len * sizeof(WCHAR));
+     memcpy(cmd + ARRAY_SIZE(lpr) + printer_len, quote, sizeof(quote));
+     ret = pipe_start_doc(doc, cmd);
+     free(cmd);
++    return ret;
++}
++
++#ifdef __APPLE__
++
++/* CW HACK 22800 */
++
++/*****************************************************************************
++ *          is_postscript_supported
++ *
++ * Determines if CUPS supports PostScript input. macOS Sonoma removes support.
++ */
++static BOOL is_postscript_supported(void)
++{
++    BOOL ret = FALSE;
++    const char *const argv[] = {"/usr/sbin/cupsfilter", "--list-filters", "-i", "application/postscript", "-m", "application/pdf", NULL};
++    pid_t pid, wret;
++    int status;
++    static int postscript_supported = -1;
++
++    TRACE("()\n");
++
++    /* Check if we've already cached the value */
++    if (postscript_supported >= 0)
++    {
++        ret = postscript_supported;
++        goto end;
++    }
++
++    if (posix_spawn(&pid, argv[0], NULL, NULL, argv, *_NSGetEnviron()) != 0)
++    {
++        WARN("Failed to load %s\n", debugstr_a(argv[0]));
++        goto end;
++    }
++
++    do {
++        wret = waitpid(pid, &status, 0);
++    } while (wret < 0 && errno == EINTR);
++
++    if (wret < 0)
++    {
++        WARN("waitpid() failed!\n");
++        return FALSE;
++    }
++
++    if (!WIFEXITED(status))
++    {
++        WARN("cupsfilter did not exit cleanly (%d)\n", status);
++        goto end;
++    }
++
++    ret = WEXITSTATUS(status) == 0;
++
++end:
++    postscript_supported = ret;
++
++    TRACE("  -> %d\n", ret);
+     return ret;
+ }
+ 
++/*****************************************************************************
++ *          convert_postscript_to_pdf
++ */
++static BOOL convert_postscript_to_pdf(const char *filename, const char *pdf)
++{
++    BOOL ret = FALSE;
++    char ps2pdf[MAX_PATH];
++    const char *ps2pdf_argv[4];
++    pid_t pid, wret;
++    int status;
++    int exit_status;
++
++    TRACE("(%s, %s)\n", debugstr_a(filename), debugstr_a(pdf));
++
++    strcpy(ps2pdf, getenv("CX_ROOT"));
++    strcat(ps2pdf, "/bin/cxps2pdf");
++
++    ps2pdf_argv[0] = "cxps2pdf";
++    ps2pdf_argv[1] = filename;
++    ps2pdf_argv[2] = pdf;
++    ps2pdf_argv[3] = NULL;
++
++    if (posix_spawn(&pid, ps2pdf, NULL, NULL, ps2pdf_argv, *_NSGetEnviron()) != 0)
++    {
++        WARN("Failed to load %s with arguments %s %s\n", debugstr_a(ps2pdf), debugstr_a(ps2pdf_argv[1]), debugstr_a(ps2pdf_argv[2]));
++        goto end;
++    }
++
++    do {
++        wret = waitpid(pid, &status, 0);
++    } while (wret < 0 && errno == EINTR);
++
++    if (wret < 0)
++    {
++        WARN("waitpid() failed!\n");
++        return FALSE;
++    }
++
++    if (!WIFEXITED(status))
++    {
++        WARN("ps2pdf did not exit cleanly (%d)\n", status);
++        goto end;
++    }
++
++    exit_status = WEXITSTATUS(status);
++
++    if (exit_status != 0)
++    {
++        WARN("ps2pdf returned error %d\n", exit_status);
++        goto end;
++    }
++
++    ret = TRUE;
++
++end:
++    TRACE("  -> %d\n", ret);
++    return ret;
++}
++
++#endif
++
+ #ifdef SONAME_LIBCUPS
+ static int get_cups_default_options(const char *printer, int num_options, cups_option_t **options)
+ {
+     cups_dest_t *dest;
+     int i;
+ 
+@@ -269,14 +401,29 @@
+         if (b == '\n')
+             return TRUE;
+     }
+     return FALSE;
+ }
+ 
++#ifdef __APPLE__
++
++/* CW HACK 22800 */
++
++#define cups_write(a, b) mac_cups_write(doc, a, b)
++
++static BOOL mac_cups_write(doc_t *doc, const char *buf, unsigned int size)
++{
++    if (doc->cups.filename != NULL)
++    {
++        return (!size) || write(doc->cups.fd, buf, size) == size;
++    }
++
++#else
+ static BOOL cups_write(const char *buf, unsigned int size)
+ {
++#endif
+     if (!size)
+         return TRUE;
+ 
+     if (pcupsWriteRequestData(CUPS_HTTP_DEFAULT, buf, size) != HTTP_STATUS_CONTINUE)
+     {
+         if (pcupsLastErrorString)
+@@ -394,12 +550,50 @@
+ 
+     return cups_write((const char *)buf, size);
+ }
+ 
+ static BOOL cups_end_doc(doc_t *doc)
+ {
++#ifdef __APPLE__
++    /* CW HACK 22800 */
++    if (doc->cups.filename != NULL)
++    {
++        char tempfile[] = "/tmp/winspool.XXXXXXXX.pdf";
++        BOOL ret = FALSE;
++
++        close(doc->unixname.fd);
++
++        /* Compute a temporary file name for PDF file */
++        if (!mkstemps(tempfile, 4))
++        {
++            WARN("mkstemps failed: %d\n", errno);
++            goto cleanup;
++        }
++
++        if (!convert_postscript_to_pdf(doc->cups.filename, tempfile))
++            goto cleanup;
++
++        if (pcupsPrintFile(doc->cups.queue, tempfile, doc->cups.doc_title, doc->cups.num_options, doc->cups.options) == 0)
++        {
++            if (pcupsLastErrorString)
++                WARN("cupsPrintFile failed: %s\n", pcupsLastErrorString());
++            goto cleanup;
++        }
++
++        ret = TRUE;
++
++cleanup:
++        remove(doc->cups.filename);
++        free(doc->cups.filename);
++        free(doc->cups.queue);
++        free(doc->cups.doc_title);
++
++        return ret;
++    }
++#endif
++
+     if (doc->cups.buf_len)
+     {
+         if (doc->cups.state != doc_initialized)
+             doc->cups.state = doc_create_job;
+         cups_write_doc(doc, NULL, 0);
+     }
+@@ -418,12 +612,37 @@
+ {
+ #ifdef SONAME_LIBCUPS
+     if (pcupsWriteRequestData)
+     {
+         int len;
+ 
++#ifdef __APPLE__
++        /* CW HACK 22800 */
++        if (!is_postscript_supported())
++        {
++            char tempfile[] = "/tmp/winspool.XXXXXXXX";
++
++            /* Compute a temporary file name for PS file */
++            if (!mkstemp(tempfile))
++            {
++                WARN("mkstemp failed: %d\n", errno);
++                return FALSE;
++            }
++
++            doc->cups.fd = open(tempfile, O_CREAT | O_TRUNC | O_WRONLY, 0666);
++
++            if (doc->cups.fd == -1)
++            {
++                WARN("Unable to open temp file %s\n", debugstr_a(tempfile));
++                return FALSE;
++            }
++
++            doc->cups.filename = strdup(tempfile);
++        }
++#endif
++
+         doc->write_doc = cups_write_doc;
+         doc->end_doc = cups_end_doc;
+ 
+         len = wcslen(printer_name);
+         doc->cups.queue = malloc(len * 3 + 1);
+         ntdll_wcstoumbs(printer_name, len + 1, doc->cups.queue, len * 3 + 1, FALSE);

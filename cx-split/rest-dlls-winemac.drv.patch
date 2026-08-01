@@ -1,0 +1,1464 @@
+--- a/dlls/winemac.drv/Makefile.in
++++ b/dlls/winemac.drv/Makefile.in
+@@ -1,10 +1,10 @@
+ MODULE    = winemac.drv
+ UNIXLIB   = winemac.so
+ IMPORTS   = uuid rpcrt4 user32 gdi32 win32u
+-DELAYIMPORTS = ole32 shell32 imm32
++DELAYIMPORTS = advapi32 ole32 shell32 imm32
+ UNIX_LIBS    = \
+ 	-lwin32u \
+ 	-framework AppKit \
+ 	-framework Carbon \
+ 	-framework CoreVideo \
+ 	-framework Foundation \
+--- a/dlls/winemac.drv/cocoa_app.h
++++ b/dlls/winemac.drv/cocoa_app.h
+@@ -107,12 +107,14 @@
+     NSTimeInterval lastScrollTime;
+     double accumScrollX, accumScrollY;
+ 
+     NSMutableDictionary* originalDisplayModes;
+     NSMutableDictionary* latentDisplayModes;
+     BOOL displaysCapturedForFullscreen;
++    BOOL displaysTemporarilyUncapturedForDialog;
++    BOOL temporarilyIgnoreResignEventsForDialog;
+ 
+     NSArray*    cursorFrames;
+     int         cursorFrame;
+     NSTimer*    cursorTimer;
+     NSCursor*   cursor;
+     BOOL        cursorIsCurrent;
+@@ -165,12 +177,15 @@
+     - (void) adjustWindowLevels;
+     - (void) updateFullscreenWindows;
+ 
+     - (BOOL) handleEvent:(NSEvent*)anEvent;
+     - (void) didSendEvent:(NSEvent*)anEvent;
+ 
++    // CrossOver Hack 10912: Mac Edit menu
++    - (BOOL) isEditMenuAction:(SEL)selector;
++
+ @end
+ 
+ 
+ @interface WineApplication : NSApplication
+ {
+     WineApplicationController* wineController;
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -26,12 +26,14 @@
+ #import "cocoa_window.h"
+ 
+ #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+ 
+ 
+ static NSString* const WineAppWaitQueryResponseMode = @"WineAppWaitQueryResponseMode";
++static NSString* const WineWillShowPermissionDialogNotification = @"WineWillShowPermissionDialogNotification";
++static NSString* const WineDidShowPermissionDialogNotification = @"WineDidShowPermissionDialogNotification";
+ 
+ // Private notifications that are reliably dispatched when a window is moved by dragging its titlebar.
+ // The object of the notification is the window being dragged.
+ // Available in macOS 10.12+
+ static NSString* const NSWindowWillStartDraggingNotification = @"NSWindowWillStartDraggingNotification";
+ static NSString* const NSWindowDidEndDraggingNotification = @"NSWindowDidEndDraggingNotification";
+@@ -295,12 +389,29 @@
+             [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
+             item = [[[NSMenuItem alloc] init] autorelease];
+             [item setTitle:WineLocalizedString(STRING_MENU_WINE)];
+             [item setSubmenu:submenu];
+             [mainMenu addItem:item];
+ 
++            // CrossOver Hack 10912: Mac Edit menu
++            if (mac_edit_menu != MAC_EDIT_MENU_DISABLED)
++            {
++                submenu = [[[NSMenu alloc] initWithTitle:@"Edit"] autorelease];
++                [submenu addItemWithTitle:@"Undo" action:@selector(undo:) keyEquivalent:@"z"];
++                [submenu addItem:[NSMenuItem separatorItem]];
++                [submenu addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
++                [submenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
++                [submenu addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
++                [submenu addItemWithTitle:@"Delete" action:@selector(delete:) keyEquivalent:@""];
++                [submenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
++                item = [[[NSMenuItem alloc] init] autorelease];
++                [item setTitle:@"Edit"];
++                [item setSubmenu:submenu];
++                [mainMenu addItem:item];
++            }
++
+             // Window menu
+             submenu = [[[NSMenu alloc] initWithTitle:WineLocalizedString(STRING_MENU_WINDOW)] autorelease];
+             [submenu addItemWithTitle:WineLocalizedString(STRING_MENU_ITEM_MINIMIZE)
+                                action:@selector(performMiniaturize:)
+                         keyEquivalent:@""];
+             [submenu addItemWithTitle:WineLocalizedString(STRING_MENU_ITEM_ZOOM)
+@@ -321,12 +432,15 @@
+             [item setSubmenu:submenu];
+             [mainMenu addItem:item];
+ 
+             [NSApp setMainMenu:mainMenu];
+             [NSApp setWindowsMenu:submenu];
+ 
++            // CrossOver Hack 10912: Mac Edit menu
++            [self changeEditMenuKeyEquivalentsForWindow:[NSApp keyWindow]];
++
+             [NSApp setApplicationIconImage:self.applicationIcon];
+         }
+     }
+ 
+     - (BOOL) waitUntilQueryDone:(int*)done timeout:(NSDate*)timeout processEvents:(BOOL)processEvents
+     {
+@@ -1890,12 +2004,22 @@
+                         object:nil
+                          queue:nil
+                     usingBlock:^(NSNotification *note){
+             NSWindow* window = [note object];
+             [keyWindows removeObjectIdenticalTo:window];
+             [keyWindows insertObject:window atIndex:0];
++            // CrossOver Hack 10912: Mac Edit menu
++            [self changeEditMenuKeyEquivalentsForWindow:window];
++        }];
++
++        // CrossOver Hack 10912: Mac Edit menu
++        [nc addObserverForName:NSWindowDidResignKeyNotification
++                        object:nil
++                         queue:nil
++                    usingBlock:^(NSNotification *note){
++            [self changeEditMenuKeyEquivalentsForWindow:nil];
+         }];
+ 
+         [nc addObserverForName:NSWindowWillCloseNotification
+                         object:nil
+                          queue:[NSOperationQueue mainQueue]
+                     usingBlock:^(NSNotification *note){
+@@ -2242,21 +2515,24 @@
+     {
+         macdrv_event* event;
+         WineEventQueue* queue;
+ 
+         [self invalidateGotFocusEvents];
+ 
+-        event = macdrv_create_event(APP_DEACTIVATED, nil);
+-
+-        [eventQueuesLock lock];
+-        for (queue in eventQueues)
+-            [queue postEvent:event];
+-        [eventQueuesLock unlock];
++        if (!temporarilyIgnoreResignEventsForDialog)
++        {
++            event = macdrv_create_event(APP_DEACTIVATED, nil);
+ 
+-        macdrv_release_event(event);
++            [eventQueuesLock lock];
++            for (queue in eventQueues)
++                [queue postEvent:event];
++            [eventQueuesLock unlock];
+ 
++            macdrv_release_event(event);
++        }
++
+         [self releaseMouseCapture];
+     }
+ 
+     - (void) applicationDidUnhide:(NSNotification*)aNotification
+     {
+         [self adjustWindowLevels];
+--- a/dlls/winemac.drv/cocoa_display.m
++++ b/dlls/winemac.drv/cocoa_display.m
+@@ -25,12 +25,31 @@
+ #import <Metal/Metal.h>
+ #endif
+ #include "macdrv_cocoa.h"
+ 
+ #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+ 
++/* CrossOver Hack #20512 */
++@interface NSScreen (SafeAreaInsetsForOldSDKs)
++/* Defining this selector for compiling against older SDKs. */
++@property (readonly) NSEdgeInsets safeAreaInsets API_AVAILABLE(macos(12.0));
++@end
++
++static BOOL needs_skyrim_se_launcher_hack(void)
++{
++    static BOOL did_check = FALSE, needs_hack;
++    if (!did_check)
++    {
++        did_check = TRUE;
++        needs_hack = is_apple_silicon() && is_skyrim_se_launcher();
++    }
++
++    return needs_hack;
++}
++/* End hack. */
++
+ static uint64_t dedicated_gpu_id;
+ static uint64_t integrated_gpu_id;
+ 
+ /***********************************************************************
+  *              convert_display_rect
+  *
+@@ -80,12 +99,30 @@
+                 NSRect visible_frame = [screen visibleFrame];
+ 
+                 if (i == 0)
+                     primary_frame = frame;
+ 
+                 disps[i].displayID = [[screen deviceDescription][@"NSScreenNumber"] unsignedIntValue];
++
++                /* CrossOver Hack #20512: lie to the Skyrim SE launcher about
++                   the screen resolution on notched Apple Silicon laptops. */
++                if (needs_skyrim_se_launcher_hack() &&
++                    CGDisplayIsBuiltin(disps[i].displayID) &&
++                    [screen respondsToSelector:@selector(safeAreaInsets)])
++                {
++                    NSEdgeInsets insets = screen.safeAreaInsets;
++                    CGFloat adj_height = NSHeight(frame) - insets.top - insets.bottom;
++                    if (adj_height != NSHeight(frame))
++                    {
++                        CGFloat adj_ar = NSWidth(frame) / adj_height;
++                        /* Snap to 16:10 if the area under the notch is close. */
++                        if (fabs(adj_ar - 1.6) < 0.01)
++                            frame.size.height = NSWidth(frame) / 16 * 10;
++                    }
++                }
++
+                 convert_display_rect(&disps[i].frame, frame, primary_frame);
+                 convert_display_rect(&disps[i].work_frame, visible_frame,
+                                      primary_frame);
+                 disps[i].frame = cgrect_win_from_mac(disps[i].frame);
+                 disps[i].work_frame = cgrect_win_from_mac(disps[i].work_frame);
+             }
+--- a/dlls/winemac.drv/cocoa_main.m
++++ b/dlls/winemac.drv/cocoa_main.m
+@@ -71,12 +71,17 @@
+         if (!NSApp)
+         {
+             [WineApplication sharedApplication];
+             created_app = TRUE;
+         }
+ 
++        /* CrossOver hack 12205: Prevent call to NSVersionOfRunTimeLibrary() during app startup.
++                                 It can crash if a Wine thread unloads a dylib simultaneously. */
++        [[NSUserDefaults standardUserDefaults] registerDefaults:
++            [NSDictionary dictionaryWithObject:@"YES" forKey:@"NSUseActiveDisplayForMainScreen"]];
++
+         if ([NSApp respondsToSelector:@selector(setWineController:)])
+         {
+             WineApplicationController* controller = [WineApplicationController sharedController];
+             [NSApp setWineController:controller];
+             [controller computeEventTimeAdjustmentFromTicks:startup_info->tickcount uptime:startup_info->uptime_ns];
+             startup_info->success = TRUE;
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -2127,14 +2127,14 @@
+         }
+ 
+         causing_becomeKeyWindow = self;
+         [self makeKeyWindow];
+         causing_becomeKeyWindow = nil;
+ 
+-        [queue discardEventsMatchingMask:event_mask_for_type(WINDOW_GOT_FOCUS) |
+-                                         event_mask_for_type(WINDOW_LOST_FOCUS)
++        /* CrossOver Hack #18896: don't discard WINDOW_GOT_FOCUS events */
++        [queue discardEventsMatchingMask:event_mask_for_type(WINDOW_LOST_FOCUS)
+                                forWindow:self];
+     }
+ 
+     - (void) postKey:(uint16_t)keyCode
+              pressed:(BOOL)pressed
+            modifiers:(NSUInteger)modifiers
+@@ -2518,12 +2531,14 @@
+     - (BOOL) validateMenuItem:(NSMenuItem *)menuItem
+     {
+         BOOL ret = [super validateMenuItem:menuItem];
+ 
+         if ([menuItem action] == @selector(makeKeyAndOrderFront:))
+             ret = [self isKeyWindow] || (!self.disabled && !self.noForeground);
++        else if ([menuItem action] == @selector(undo:)) // CrossOver Hack 10912: Mac Edit menu
++            ret = TRUE;
+         if ([menuItem action] == @selector(toggleFullScreen:) && (self.disabled || maximized))
+             ret = NO;
+ 
+         return ret;
+     }
+ 
+@@ -2632,14 +2647,77 @@
+                 if (type == NSEventTypeLeftMouseUp)
+                     [self endWindowDragging];
+             }
+ 
+             [super sendEvent:event];
+         }
++    }
++
++    // CrossOver Hack 10912: Mac Edit menu
++    - (void) sendEditMenuCommand:(int)command
++    {
++        macdrv_event* event;
++        NSTimeInterval now = [[NSProcessInfo processInfo] systemUptime];
++
++        if (mac_edit_menu == MAC_EDIT_MENU_DISABLED) // Shouldn't get here
++        {
++            ERR(@"The Mac Edit menu is supposed to be disabled\n");
++            NSBeep();
++            return;
++        }
++
++        event = macdrv_create_event(EDIT_MENU_COMMAND, self);
++        event->edit_menu_command.command = command;
++        event->edit_menu_command.time_ms = [[WineApplicationController sharedController] ticksForEventTime:now];
++
++        [queue postEvent:event];
++
++        macdrv_release_event(event);
++
++        // This is an even grosser hack than the rest of the support for the Edit
++        // menu.  We are deliberately leaving ourselves with an incorrect notion
++        // of the current modifier key state (for the case where the user used a
++        // Command-key shortcut to invoke an Edit menu item).  Both Wine and this
++        // class pretend that Command/Alt are not pressed so that, when the user
++        // actually releases the key, it doesn't put focus on the menu bar.  If
++        // the user keeps Command pressed and types another key, we'll think that
++        // Command was newly pressed and generate the appropriate event to get
++        // everybody back in sync.
++        lastModifierFlags &= ~(NX_COMMANDMASK | NX_DEVICELCMDKEYMASK | NX_DEVICERCMDKEYMASK);
++    }
++
++    - (void) copy:(id)sender
++    {
++        [self sendEditMenuCommand:EDIT_COMMAND_COPY];
+     }
+ 
++    - (void) cut:(id)sender
++    {
++        [self sendEditMenuCommand:EDIT_COMMAND_CUT];
++    }
++
++    - (void) delete:(id)sender
++    {
++        [self sendEditMenuCommand:EDIT_COMMAND_DELETE];
++    }
++
++    - (void) paste:(id)sender
++    {
++        [self sendEditMenuCommand:EDIT_COMMAND_PASTE];
++    }
++
++    - (void) selectAll:(id)sender
++    {
++        [self sendEditMenuCommand:EDIT_COMMAND_SELECT_ALL];
++    }
++
++    - (void) undo:(id)sender
++    {
++        [self sendEditMenuCommand:EDIT_COMMAND_UNDO];
++    }
++
+     - (void) miniaturize:(id)sender
+     {
+         /* When Stage Manager is enabled, miniaturize: just moves the app/window to
+          * the background rather than minimizing the window.
+          * Don't start minimizing the window on the Win32 side.
+          */
+@@ -2872,12 +2950,25 @@
+     }
+ 
+     - (void) applicationDidUnhide
+     {
+         if ([self isVisible])
+             [self becameEligibleParentOrChild];
++    }
++
++
++    /*
++     * ---------- NSObject method overrides ----------
++     */
++    // CrossOver Hack 10912: Mac Edit menu
++    - (BOOL) respondsToSelector:(SEL)selector
++    {
++        if (mac_edit_menu == MAC_EDIT_MENU_DISABLED && [[WineApplicationController sharedController] isEditMenuAction:selector])
++             return FALSE;
++
++        return [super respondsToSelector:selector];
+     }
+ 
+ 
+     /*
+      * ---------- NSWindowDelegate methods ----------
+      */
+@@ -2904,13 +2995,13 @@
+     {
+         WineApplicationController* controller = [WineApplicationController sharedController];
+         NSEvent* event = [controller lastFlagsChanged];
+         if (event)
+             [self flagsChanged:event];
+ 
+-        if (causing_becomeKeyWindow == self) return;
++        /* CrossOver Hack #18896: don't return here based on causing_becomeKeyWindow */
+ 
+         [controller windowGotFocus:self];
+     }
+ 
+     - (void) windowDidChangeOcclusionState:(NSNotification*)notification
+     {
+@@ -3015,12 +3106,13 @@
+ 
+     - (void)windowDidResignKey:(NSNotification *)notification
+     {
+         macdrv_event* event;
+ 
+         if (causing_becomeKeyWindow) return;
++        if ([[WineApplicationController sharedController] temporarilyIgnoreResignEventsForDialog]) return;
+ 
+         event = macdrv_create_event(WINDOW_LOST_FOCUS, self);
+         [queue postEvent:event];
+         macdrv_release_event(event);
+     }
+ 
+@@ -3993,15 +4085,19 @@
+     });
+ 
+     return result;
+ }
+ 
+ /***********************************************************************
+- *              macdrv_send_text_input_event
++ *              macdrv_send_keydown_to_input_source
++ *
++ * Sends a key down event to the active window's inputContext so that it can be
++ * processed by input sources (AKA IMEs). This is only called when there is an
++ * active non-keyboard input source.
+  */
+-void macdrv_send_text_input_event(int pressed, unsigned int flags, int repeat, int keyc, void* himc, int* done)
++void macdrv_send_keydown_to_input_source(unsigned int flags, int repeat, int keyc, void* himc, int* done)
+ {
+     OnMainThreadAsync(^{
+         BOOL ret;
+         macdrv_event* event;
+         WineWindow* window = (WineWindow*)[NSApp keyWindow];
+         if (![window isKindOfClass:[WineWindow class]])
+@@ -4020,13 +4116,13 @@
+             window.himc = himc;
+             fix_device_modifiers_by_generic(&localFlags);
+ 
+             // An NSEvent created with +keyEventWithType:... is internally marked
+             // as synthetic and doesn't get sent through input methods.  But one
+             // created from a CGEvent doesn't have that problem.
+-            c = CGEventCreateKeyboardEvent(NULL, keyc, pressed);
++            c = CGEventCreateKeyboardEvent(NULL, keyc, true);
+             CGEventSetFlags(c, localFlags);
+             CGEventSetIntegerValueField(c, kCGKeyboardEventAutorepeat, repeat);
+             event = [NSEvent eventWithCGEvent:c];
+             CFRelease(c);
+ 
+             window.commandDone = FALSE;
+--- a/dlls/winemac.drv/display.c
++++ b/dlls/winemac.drv/display.c
+@@ -32,13 +32,49 @@
+ #define WIN32_NO_STATUS
+ #include "winternl.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(display);
+ 
+ #define NEXT_DEVMODEW(mode) ((DEVMODEW *)((char *)((mode) + 1) + (mode)->dmDriverExtra))
++
++/* CrossOver Hack #18576: don't check for kDisplayModeSafeFlag on Apple Silicon. */
++/* Also used by CrossOver Hack #20512. */
++#include <sys/types.h>
++#include <sys/sysctl.h>
++static int apple_silicon_status;
++static void init_is_apple_silicon(void)
++{
++    /* returns 0 for native process or on error, 1 for translated */
++    int ret = 0;
++    size_t size = sizeof(ret);
++    if (sysctlbyname("sysctl.proc_translated", &ret, &size, NULL, 0) == -1)
++        apple_silicon_status = 0;
++    else
++        apple_silicon_status = ret;
++}
++int is_apple_silicon(void)
++{
++    static pthread_once_t init_once = PTHREAD_ONCE_INIT;
++    pthread_once(&init_once, init_is_apple_silicon);
++    return apple_silicon_status;
++}
+ 
++/* CrossOver Hack #20512 */
++int is_skyrim_se_launcher(void)
++{
++    static const WCHAR skyrimselauncher_exeW[] = {'S','k','y','r','i','m','S','E','L','a','u','n','c','h','e','r','.','e','x','e',0};
++    WCHAR *name, *module_exe;
++
++    name = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
++    module_exe = wcsrchr(name, '\\');
++    module_exe = module_exe ? module_exe + 1 : name;
++
++    return !wcsicmp(module_exe, skyrimselauncher_exeW);
++}
++
++
+ struct display_mode_descriptor
+ {
+     DWORD width;
+     DWORD height;
+     DWORD pixel_width;
+     DWORD pixel_height;
+@@ -90,13 +126,15 @@
+ }
+ 
+ 
+ static BOOL display_mode_is_supported(CGDisplayModeRef display_mode)
+ {
+     uint32_t io_flags = CGDisplayModeGetIOFlags(display_mode);
+-    return (io_flags & kDisplayModeValidFlag) && (io_flags & kDisplayModeSafeFlag);
++    /* CrossOver Hack #18576: don't check for kDisplayModeSafeFlag on Apple Silicon. */
++    return (io_flags & kDisplayModeValidFlag) &&
++            ((io_flags & kDisplayModeSafeFlag) || is_apple_silicon());
+ }
+ 
+ 
+ static void display_mode_to_devmode_fields(CGDirectDisplayID display_id, CGDisplayModeRef display_mode, DEVMODEW *devmode)
+ {
+     uint32_t io_flags;
+--- a/dlls/winemac.drv/dllmain.c
++++ b/dlls/winemac.drv/dllmain.c
+@@ -20,12 +20,13 @@
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+ #include "macdrv_dll.h"
+ #include "macdrv_res.h"
+ #include "shellapi.h"
++#include "winreg.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(macdrv);
+ 
+ 
+ HMODULE macdrv_module = 0;
+@@ -364,14 +365,81 @@
+ 
+ cleanup:
+     FreeResource(res_data);
+ 
+     return NtCallbackReturn(entries, count * sizeof(entries[0]), 0);
+ }
++
++static NTSTATUS WINAPI macdrv_regcreateopenkeyexa(void *arg, ULONG size)
++{
++    struct regcreateopenkeyexa_params *params = arg;
++    LONG result;
+ 
++    TRACE("()\n");
+ 
++    if (params->create)
++    {
++        result = RegCreateKeyExA(UlongToHandle(params->hkey),
++                                 param_ptr(params->name),
++                                 params->reserved,
++                                 param_ptr(params->class),
++                                 params->options,
++                                 params->access,
++                                 param_ptr(params->security),
++                                 param_ptr(params->retkey),
++                                 param_ptr(params->disposition));
++    }
++    else
++    {
++        result = RegOpenKeyExA(UlongToHandle(params->hkey),
++                               param_ptr(params->name),
++                               params->options,
++                               params->access,
++                               param_ptr(params->retkey));
++    }
++    *(LONG *)param_ptr(params->result) = result;
++    return 0;
++}
++
++static NTSTATUS WINAPI macdrv_regqueryvalueexa(void *arg, ULONG size)
++{
++    struct regqueryvalueexa_params *params = arg;
++    LONG result;
++
++    TRACE("()\n");
++
++    result = RegQueryValueExA(UlongToHandle(params->hkey),
++                              param_ptr(params->name),
++                              param_ptr(params->reserved),
++                              param_ptr(params->type),
++                              param_ptr(params->data),
++                              param_ptr(params->count));
++
++    *(LONG *)param_ptr(params->result) = result;
++    return 0;
++}
++
++static NTSTATUS WINAPI macdrv_regsetvalueexa(void *arg, ULONG size)
++{
++    struct regsetvalueexa_params *params = arg;
++    LONG result;
++
++    TRACE("()\n");
++
++    result = RegSetValueExA(UlongToHandle(params->hkey),
++                            param_ptr(params->name),
++                            params->reserved,
++                            params->type,
++                            param_ptr(params->data),
++                            params->count);
++
++    *(LONG *)param_ptr(params->result) = result;
++    return 0;
++}
++
++
+ static BOOL process_attach(void)
+ {
+     struct init_params params;
+ 
+     struct localized_string *str;
+     struct localized_string strings[] = {
+@@ -396,12 +464,15 @@
+ 
+     for (str = strings; str->id; str++)
+         str->len = LoadStringW(macdrv_module, str->id, (WCHAR *)&str->str, 0);
+     params.strings = strings;
+     params.app_icon_callback = (UINT_PTR)macdrv_app_icon;
+     params.app_quit_request_callback = (UINT_PTR)macdrv_app_quit_request;
++    params.regcreateopenkeyexa_callback = (UINT_PTR)macdrv_regcreateopenkeyexa;
++    params.regsetvalueexa_callback = (UINT_PTR)macdrv_regsetvalueexa;
++    params.regqueryvalueexa_callback = (UINT_PTR)macdrv_regqueryvalueexa;
+ 
+     if (MACDRV_CALL(init, &params)) return FALSE;
+ 
+     return TRUE;
+ }
+ 
+--- a/dlls/winemac.drv/event.c
++++ b/dlls/winemac.drv/event.c
+@@ -42,12 +42,13 @@
+ {
+     static const char * const event_names[] = {
+         "APP_ACTIVATED",
+         "APP_DEACTIVATED",
+         "APP_QUIT_REQUESTED",
+         "DISPLAYS_CHANGED",
++        "EDIT_MENU_COMMAND", /* CrossOver Hack 10912: Mac Edit menu */
+         "HOTKEY_PRESS",
+         "IM_SET_TEXT",
+         "KEY_PRESS",
+         "KEY_RELEASE",
+         "KEYBOARD_CHANGED",
+         "LOST_PASTEBOARD_OWNERSHIP",
+@@ -94,12 +95,14 @@
+ 
+     if (mask & QS_HOTKEY)
+         event_mask |= event_mask_for_type(HOTKEY_PRESS);
+ 
+     if (mask & QS_KEY)
+     {
++        /* CrossOver Hack 10912: Mac Edit menu */
++        event_mask |= event_mask_for_type(EDIT_MENU_COMMAND);
+         event_mask |= event_mask_for_type(KEY_PRESS);
+         event_mask |= event_mask_for_type(KEY_RELEASE);
+         event_mask |= event_mask_for_type(KEYBOARD_CHANGED);
+     }
+ 
+     if (mask & QS_MOUSEBUTTON)
+@@ -428,12 +431,16 @@
+     case APP_QUIT_REQUESTED:
+         macdrv_app_quit_requested(event);
+         break;
+     case DISPLAYS_CHANGED:
+         macdrv_displays_changed(event);
+         break;
++    /* CrossOver Hack 10912: Mac Edit menu */
++    case EDIT_MENU_COMMAND:
++        macdrv_edit_menu_command(event);
++        break;
+     case HOTKEY_PRESS:
+         macdrv_hotkey_press(event);
+         break;
+     case IM_SET_TEXT:
+         macdrv_im_set_text(event);
+         break;
+--- a/dlls/winemac.drv/keyboard.c
++++ b/dlls/winemac.drv/keyboard.c
+@@ -1236,12 +1406,20 @@
+ 
+     TRACE("himc %p, scan %#x, vkey %#x, repeat %u, pressed %u\n",
+           himc, scan, vkey, repeat, pressed);
+ 
+     if (!macdrv_using_input_method()) return 0;
+ 
++    if (!pressed)
++    {
++        /* Only key down events should be sent to the Cocoa input context. We do
++           not handle key ups, and instead let those go through as a normal
++           WM_KEYUP. */
++        return 0;
++    }
++
+     switch (vkey)
+     {
+         case VK_SHIFT:
+         case VK_CONTROL:
+         case VK_CAPITAL:
+         case VK_MENU:
+@@ -1271,13 +1449,13 @@
+         if (thread_data->keyc2vkey[keyc] == vkey) break;
+ 
+     if (keyc >= ARRAY_SIZE(thread_data->keyc2vkey)) return 0;
+ 
+     TRACE("flags 0x%08x keyc 0x%04x\n", flags, keyc);
+ 
+-    macdrv_send_text_input_event(pressed, flags, repeat, keyc, himc, &done);
++    macdrv_send_keydown_to_input_source(flags, repeat, keyc, himc, &done);
+     while (!done) NtUserMsgWaitForMultipleObjectsEx(0, NULL, INFINITE, QS_POSTMESSAGE | QS_SENDMESSAGE, 0);
+ 
+     return done > 0;
+ }
+ 
+ 
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -41,14 +41,20 @@
+ 
+ extern BOOL skip_single_buffer_flushes;
+ extern BOOL allow_vsync;
+ extern BOOL allow_set_gamma;
+ extern BOOL allow_software_rendering;
+ 
++/* CrossOver Hack 14364 */
++extern BOOL force_backing_store;
++
+ extern UINT64 app_icon_callback;
+ extern UINT64 app_quit_request_callback;
++extern UINT64 regcreateopenkeyexa_callback;
++extern UINT64 regqueryvalueexa_callback;
++extern UINT64 regsetvalueexa_callback;
+ 
+ extern const char* debugstr_cf(CFTypeRef t);
+ 
+ static inline CGRect cgrect_from_rect(RECT rect)
+ {
+     if (rect.left >= rect.right || rect.top >= rect.bottom)
+@@ -227,12 +235,14 @@
+ extern void macdrv_mouse_moved(HWND hwnd, const macdrv_event *event);
+ extern void macdrv_mouse_scroll(HWND hwnd, const macdrv_event *event);
+ extern void macdrv_release_capture(HWND hwnd, const macdrv_event *event);
+ extern void macdrv_SetCapture(HWND hwnd, UINT flags);
+ 
+ extern void macdrv_compute_keyboard_layout(struct macdrv_thread_data *thread_data);
++/* CrossOver Hack 10912: Mac Edit menu */
++extern void macdrv_edit_menu_command(const macdrv_event *event);
+ extern void macdrv_keyboard_changed(const macdrv_event *event);
+ extern void macdrv_key_event(HWND hwnd, const macdrv_event *event);
+ extern void macdrv_hotkey_press(const macdrv_event *event);
+ extern HKL macdrv_get_hkl_from_source(TISInputSourceRef input_source);
+ 
+ extern void macdrv_displays_changed(const macdrv_event *event);
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -106,13 +106,29 @@
+ enum {
+     TOPMOST_FLOAT_INACTIVE_NONE,
+     TOPMOST_FLOAT_INACTIVE_NONFULLSCREEN,
+     TOPMOST_FLOAT_INACTIVE_ALL,
+ };
+ 
++/* CrossOver Hack 10912: Mac Edit menu */
+ enum {
++    MAC_EDIT_MENU_DISABLED,
++    MAC_EDIT_MENU_BY_MESSAGE,
++    MAC_EDIT_MENU_BY_KEY,
++};
++
++enum {
++    EDIT_COMMAND_COPY,
++    EDIT_COMMAND_CUT,
++    EDIT_COMMAND_DELETE,
++    EDIT_COMMAND_PASTE,
++    EDIT_COMMAND_SELECT_ALL,
++    EDIT_COMMAND_UNDO,
++};
++
++enum {
+     GL_SURFACE_IN_FRONT_OPAQUE,
+     GL_SURFACE_IN_FRONT_TRANSPARENT,
+     GL_SURFACE_BEHIND,
+ };
+ 
+ enum {
+@@ -142,12 +158,14 @@
+ 
+ 
+ /* main */
+ extern int macdrv_err_on;
+ extern int topmost_float_inactive;
+ extern int capture_displays_for_fullscreen;
++/* CrossOver Hack 10912: Mac Edit menu */
++extern int mac_edit_menu;
+ extern int left_option_is_alt;
+ extern int right_option_is_alt;
+ extern int left_command_is_ctrl;
+ extern int right_command_is_ctrl;
+ extern int allow_immovable_windows;
+ extern int use_confinement_cursor_clipping;
+@@ -229,18 +247,21 @@
+     return point;
+ }
+ 
+ extern int macdrv_start_cocoa_app(unsigned long long tickcount);
+ extern void macdrv_window_rejected_focus(const struct macdrv_event *event);
+ extern void macdrv_beep(void);
+-extern void macdrv_set_application_icon(CFArrayRef images);
++extern void macdrv_set_application_icon(CFArrayRef images, CFURLRef url /* CrossOver Hack 13440 */);
+ extern void macdrv_quit_reply(int reply);
+ extern int macdrv_using_input_method(void);
+ extern void macdrv_set_mouse_capture_window(macdrv_window window);
+ extern void macdrv_set_cocoa_retina_mode(int new_mode);
+ 
++/* application model user IDs */
++extern int macdrv_set_current_process_explicit_app_user_model_id(const UniChar *aumid, size_t length);
++extern int macdrv_get_current_process_explicit_app_user_model_id(UniChar *buffer, size_t size);
+ 
+ /* cursor */
+ extern void macdrv_set_cursor(CFStringRef name, CFArrayRef frames);
+ extern int macdrv_get_cursor_position(CGPoint *pos);
+ extern int macdrv_set_cursor_position(CGPoint pos);
+ extern int macdrv_clip_cursor(CGRect rect);
+@@ -299,12 +320,13 @@
+ /* event */
+ enum {
+     APP_ACTIVATED,
+     APP_DEACTIVATED,
+     APP_QUIT_REQUESTED,
+     DISPLAYS_CHANGED,
++    EDIT_MENU_COMMAND, /* CrossOver Hack 10912: Mac Edit menu */
+     HOTKEY_PRESS,
+     IM_SET_TEXT,
+     KEY_PRESS,
+     KEY_RELEASE,
+     KEYBOARD_CHANGED,
+     LOST_PASTEBOARD_OWNERSHIP,
+@@ -353,12 +375,17 @@
+         struct {
+             int reason;
+         }                                           app_quit_requested;
+         struct {
+             int activating;
+         }                                           displays_changed;
++        /* CrossOver Hack 10912: Mac Edit menu */
++        struct {
++            int             command;
++            unsigned long   time_ms;
++        }                                           edit_menu_command;
+         struct {
+             unsigned int    vkey;
+             unsigned int    mod_flags;
+             unsigned int    keycode;
+             unsigned long   time_ms;
+         }                                           hotkey_press;
+@@ -565,14 +592,14 @@
+ extern macdrv_metal_view macdrv_view_create_metal_view(macdrv_view v, macdrv_metal_device d);
+ extern macdrv_metal_layer macdrv_view_get_metal_layer(macdrv_metal_view v);
+ extern void macdrv_view_release_metal_view(macdrv_metal_view v);
+ extern int macdrv_get_view_backing_size(macdrv_view v, int backing_size[2]);
+ extern void macdrv_set_view_backing_size(macdrv_view v, const int backing_size[2]);
+ extern uint32_t macdrv_window_background_color(void);
+-extern void macdrv_send_text_input_event(int pressed, unsigned int flags, int repeat, int keyc,
+-                                         void* data, int* done);
++extern void macdrv_send_keydown_to_input_source(unsigned int flags, int repeat, int keyc,
++                                                void* data, int* done);
+ extern int macdrv_is_any_wine_window_visible(void);
+ 
+ 
+ /* keyboard */
+ extern void macdrv_get_input_source_info(CFDataRef* uchr,CGEventSourceKeyboardType* keyboard_type, int* is_iso,
+                                          TISInputSourceRef* input_source);
+@@ -606,7 +633,11 @@
+ extern void macdrv_destroy_status_item(macdrv_status_item s);
+ extern void macdrv_set_status_item_image(macdrv_status_item s, CGImageRef cgimage);
+ extern void macdrv_set_status_item_tooltip(macdrv_status_item s, CFStringRef cftip);
+ 
+ extern void macdrv_clear_ime_text(void);
+ 
++/* CrossOver Hack #20512 */
++extern int is_apple_silicon(void);
++extern int is_skyrim_se_launcher(void);
++
+ #endif  /* __WINE_MACDRV_COCOA_H */
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -44,12 +44,14 @@
+ 
+ int topmost_float_inactive = TOPMOST_FLOAT_INACTIVE_NONFULLSCREEN;
+ int capture_displays_for_fullscreen = 0;
+ BOOL skip_single_buffer_flushes = FALSE;
+ BOOL allow_vsync = TRUE;
+ BOOL allow_set_gamma = TRUE;
++/* CrossOver Hack 10912: Mac Edit menu */
++int mac_edit_menu = MAC_EDIT_MENU_BY_KEY;
+ int left_option_is_alt = 0;
+ int right_option_is_alt = 0;
+ int left_command_is_ctrl = 0;
+ int right_command_is_ctrl = 0;
+ BOOL allow_software_rendering = FALSE;
+ int allow_immovable_windows = TRUE;
+@@ -57,14 +59,20 @@
+ int cursor_clipping_locks_windows = TRUE;
+ int use_precise_scrolling = TRUE;
+ int gl_surface_mode = GL_SURFACE_IN_FRONT_OPAQUE;
+ int retina_enabled = FALSE;
+ int enable_app_nap = FALSE;
+ 
++/* CrossOver Hack 14364 */
++BOOL force_backing_store = FALSE;
++
+ UINT64 app_icon_callback = 0;
+ UINT64 app_quit_request_callback = 0;
++UINT64 regcreateopenkeyexa_callback = 0;
++UINT64 regqueryvalueexa_callback = 0;
++UINT64 regsetvalueexa_callback = 0;
+ 
+ CFDictionaryRef localized_strings;
+ 
+ 
+ /**************************************************************************
+  *              debugstr_cf
+@@ -328,12 +336,24 @@
+     if (!get_config_key(hkey, appkey, "AllowVerticalSync", buffer, sizeof(buffer)))
+         allow_vsync = IS_OPTION_TRUE(buffer[0]);
+ 
+     if (!get_config_key(hkey, appkey, "AllowSetGamma", buffer, sizeof(buffer)))
+         allow_set_gamma = IS_OPTION_TRUE(buffer[0]);
+ 
++    /* CrossOver Hack 10912: Mac Edit menu */
++    if (!get_config_key(hkey, appkey, "EditMenu", buffer, sizeof(buffer)))
++    {
++        static const WCHAR messageW[] = {'m','e','s','s','a','g','e',0};
++        static const WCHAR keyW[] = {'k','e','y',0};
++        if (!wcscmp(buffer, messageW))
++            mac_edit_menu = MAC_EDIT_MENU_BY_MESSAGE;
++        else if (!wcscmp(buffer, keyW))
++            mac_edit_menu = MAC_EDIT_MENU_BY_KEY;
++        else
++            mac_edit_menu = MAC_EDIT_MENU_DISABLED;
++    }
+     if (!get_config_key(hkey, appkey, "LeftOptionIsAlt", buffer, sizeof(buffer)))
+         left_option_is_alt = IS_OPTION_TRUE(buffer[0]);
+     if (!get_config_key(hkey, appkey, "RightOptionIsAlt", buffer, sizeof(buffer)))
+         right_option_is_alt = IS_OPTION_TRUE(buffer[0]);
+ 
+     if (!get_config_key(hkey, appkey, "LeftCommandIsCtrl", buffer, sizeof(buffer)))
+@@ -380,12 +400,16 @@
+        processes in the prefix. */
+     if (!get_config_key(hkey, NULL, "RetinaMode", buffer, sizeof(buffer)))
+         retina_enabled = IS_OPTION_TRUE(buffer[0]);
+ 
+     retina_on = retina_enabled;
+ 
++    /* CrossOver Hack 14364 */
++    if (!get_config_key(hkey, appkey, "ForceOpenGLBackingStore", buffer, sizeof(buffer)))
++        force_backing_store = IS_OPTION_TRUE(buffer[0]);
++
+     if (appkey) NtClose(appkey);
+     if (hkey) NtClose(hkey);
+ }
+ 
+ 
+ /***********************************************************************
+@@ -432,12 +456,15 @@
+     struct init_params *params = arg;
+     SessionAttributeBits attributes;
+     OSStatus status;
+ 
+     app_icon_callback = params->app_icon_callback;
+     app_quit_request_callback = params->app_quit_request_callback;
++    regcreateopenkeyexa_callback = params->regcreateopenkeyexa_callback;
++    regqueryvalueexa_callback = params->regqueryvalueexa_callback;
++    regsetvalueexa_callback = params->regsetvalueexa_callback;
+ 
+     status = SessionGetInfo(callerSecuritySession, NULL, &attributes);
+     if (status != noErr || !(attributes & sessionHasGraphicAccess))
+         return STATUS_UNSUCCESSFUL;
+ 
+     init_win_context();
+@@ -621,18 +667,24 @@
+ {
+     struct
+     {
+         ULONG strings;
+         UINT64 app_icon_callback;
+         UINT64 app_quit_request_callback;
++        UINT64 regcreateopenkeyexa_callback;
++        UINT64 regqueryvalueexa_callback;
++        UINT64 regsetvalueexa_callback;
+     } *params32 = arg;
+     struct init_params params;
+ 
+     params.strings = UlongToPtr(params32->strings);
+     params.app_icon_callback = params32->app_icon_callback;
+     params.app_quit_request_callback = params32->app_quit_request_callback;
++    params.regcreateopenkeyexa_callback = params32->regcreateopenkeyexa_callback;
++    params.regqueryvalueexa_callback = params32->regqueryvalueexa_callback;
++    params.regsetvalueexa_callback = params32->regsetvalueexa_callback;
+     return macdrv_init(&params);
+ }
+ 
+ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+ {
+     wow64_init,
+--- a/dlls/winemac.drv/opengl.c
++++ b/dlls/winemac.drv/opengl.c
+@@ -1448,13 +1448,13 @@
+         attribs[n++] = kCGLPFASampleBuffers;
+         attribs[n++] = pf->sample_buffers;
+         attribs[n++] = kCGLPFASamples;
+         attribs[n++] = pf->samples;
+     }
+ 
+-    if (pf->backing_store)
++    if (force_backing_store || pf->backing_store) /* CrossOver Hack 14364 */
+         attribs[n++] = kCGLPFABackingStore;
+ 
+     if (core)
+     {
+         attribs[n++] = kCGLPFAOpenGLProfile;
+ #if defined(MAC_OS_X_VERSION_10_9) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_9
+@@ -2700,13 +2700,32 @@
+ cant_match:
+     *nNumFormats = found;
+ 
+     return TRUE;
+ }
+ 
++/* CX HACK 23422, 23422, 24717, 24896 */
++static int needs_fwd_compat_context_hack(void)
++{
++    static const WCHAR tomb123_exeW[] = {'t','o','m','b','1','2','3','.','e','x','e',0};
++    static const WCHAR tomb456_exeW[] = {'t','o','m','b','4','5','6','.','e','x','e',0};
++    static const WCHAR srx_exeW[] = {'S','R','X','.','e','x','e',0};
++    static const WCHAR knightsprovince_exeW[] = {'K','n','i','g','h','t','s','P','r','o','v','i','n','c','e','.','e','x','e',0};
++    WCHAR *name, *module_exe;
+ 
++    name = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
++    module_exe = wcsrchr(name, '\\');
++    module_exe = module_exe ? module_exe + 1 : name;
++
++    return !wcsicmp(module_exe, tomb123_exeW) ||
++           !wcsicmp(module_exe, tomb456_exeW) ||
++           !wcsicmp(module_exe, srx_exeW) ||
++           !wcsicmp(module_exe, knightsprovince_exeW);
++}
++
++
+ /***********************************************************************
+  *              macdrv_wglCreateContextAttribsARB
+  *
+  * WGL_ARB_create_context: wglCreateContextAttribsARB
+  */
+ static struct wgl_context *macdrv_wglCreateContextAttribsARB(HDC hdc,
+@@ -2818,15 +2837,28 @@
+                 WARN("Unknown attribute %s.\n", debugstr_attrib(attr, value));
+                 RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
+                 return NULL;
+         }
+     }
+ 
++
+     if ((major == 3 && (minor == 2 || minor == 3)) ||
+         (major == 4 && (minor == 0 || minor == 1)))
+     {
++        /* CX HACK 23422:
++         * Tomb Raider 1-3 Remastered requests a non-forward-compatible 3.2 core context, but works
++         * with a forward-compatible context.
++         * CX HACK 24666:
++         * Same goes for Legacy of Kain Soul Reaver 1 & 2 Remastered.
++         */
++        if (needs_fwd_compat_context_hack())
++        {
++            if (!(flags & WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB))
++                flags |= WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB;
++        }
++
+         if (!(flags & WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB))
+         {
+             WARN("OS X only supports forward-compatible 3.2+ contexts\n");
+             RtlSetLastWin32Error(ERROR_INVALID_VERSION_ARB);
+             return NULL;
+         }
+@@ -4070,13 +4102,102 @@
+         pthread_mutex_unlock(&context_mutex);
+     }
+ 
+     return TRUE;
+ }
+ 
++/* CX HACK 23422 - START
++ * Tomb Raider 1-3 Remastered uses BC7 compressed textures in Remastered mode.
++ *
++ * Credit to nastys
++ */
+ 
++#define BCDEC_IMPLEMENTATION
++#define BCDEC_STATIC
++#include "opengl_bcdec.h"
++
++static void (*pglCompressedTexImage3D)(GLenum target, GLint level, GLenum internalformat,
++                                       GLsizei width, GLsizei height, GLsizei depth, GLint border,
++                                       GLsizei imageSize, const void *data);
++
++static void (*pglCompressedTexSubImage3D)(GLenum target, GLint level, GLint xoffset, GLint yoffset,
++                                          GLint zoffset, GLsizei width, GLsizei height, GLsizei depth,
++                                          GLenum format, GLsizei imageSize, const void *data);
++
++static void *decode_bptc_unorm_to_rgba(const void *data, GLsizei width, GLsizei height, GLsizei depth)
++{
++    GLsizei numBlocksX = (width + 3) / 4;
++    GLsizei numBlocksY = (height + 3) / 4;
++    GLsizei numBlocksZ = (depth + 3) / 4;
++    char *pixels;
++
++    if (!data)
++        return NULL;
++
++    pixels = malloc(width * height * depth * 4);
++
++    for (GLsizei z = 0; z < numBlocksZ; z++)
++    {
++        for (GLsizei y = 0; y < numBlocksY; y++)
++        {
++            for (GLsizei x = 0; x < numBlocksX; x++)
++            {
++                GLsizei blockOffsetX = x * 4;
++                GLsizei blockOffsetY = y * 4;
++                GLsizei blockOffsetZ = z;
++                GLsizei blockOffset = blockOffsetZ * numBlocksX * numBlocksY * 4 + blockOffsetY * numBlocksX * 4 + blockOffsetX * 4;
++
++                GLsizei pixelOffsetX = x * 4;
++                GLsizei pixelOffsetY = y * 4;
++                GLsizei pixelOffsetZ = z * width * height * 4;
++                GLsizei pixelOffset = pixelOffsetZ + pixelOffsetY * width * 4 + pixelOffsetX * 4;
++
++                bcdec_bc7((const void*)((const char*)data + blockOffset), (void *)(pixels + pixelOffset), width * 4);
++            }
++        }
++    }
++
++    return pixels;
++}
++
++static void macdrv_glCompressedTexImage3D(GLenum target, GLint level, GLenum internalformat,
++                                          GLsizei width, GLsizei height, GLsizei depth, GLint border,
++                                          GLsizei imageSize, const void *data)
++{
++    if ((internalformat == GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM_ARB ||
++         internalformat == GL_COMPRESSED_RGBA_BPTC_UNORM_ARB) &&
++        (target == GL_TEXTURE_2D_ARRAY || target == GL_PROXY_TEXTURE_2D_ARRAY))
++    {
++        char *rawdata = decode_bptc_unorm_to_rgba(data, width, height, depth);
++        opengl_funcs.ext.p_glTexImage3D(target, level, (internalformat == GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM_ARB ? GL_SRGB8_ALPHA8 : GL_RGBA8), width, height, depth, border, GL_RGBA, GL_UNSIGNED_BYTE, rawdata);
++        if (rawdata)
++            free(rawdata);
++    }
++    else
++        pglCompressedTexImage3D(target, level, internalformat, width, height, depth, border, imageSize, data);
++}
++
++static void macdrv_glCompressedTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
++                                             GLint zoffset, GLsizei width, GLsizei height, GLsizei depth,
++                                             GLenum format, GLsizei imageSize, const void *data)
++{
++    if ((format == GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM_ARB ||
++         format == GL_COMPRESSED_RGBA_BPTC_UNORM_ARB) &&
++        (target == GL_TEXTURE_2D_ARRAY || target == GL_PROXY_TEXTURE_2D_ARRAY))
++    {
++        char *pixels = decode_bptc_unorm_to_rgba(data, width, height, depth);
++        opengl_funcs.ext.p_glTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
++        if (pixels)
++            free(pixels);
++    }
++    else
++        pglCompressedTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, imageSize, data);
++}
++
++/* CX HACK 23422 - END */
++
+ static void register_extension(const char *ext)
+ {
+     if (gl_info.wglExtensions[0])
+         strcat(gl_info.wglExtensions, " ");
+     strcat(gl_info.wglExtensions, ext);
+ 
+@@ -4221,12 +4342,16 @@
+ #undef REDIRECT
+ 
+     /* redirect some OpenGL extension functions */
+ #define REDIRECT(func) \
+     do { if ((p##func = dlsym(opengl_handle, #func))) { opengl_funcs.ext.p_##func = macdrv_##func; } } while(0)
+     REDIRECT(glCopyColorTable);
++
++    /* CX HACK 23422 */
++    REDIRECT(glCompressedTexImage3D);
++    REDIRECT(glCompressedTexSubImage3D);
+ #undef REDIRECT
+ 
+     if (gluCheckExtension((GLubyte*)"GL_APPLE_flush_render", (GLubyte*)gl_info.glExtensions))
+         pglFlushRenderAPPLE = dlsym(opengl_handle, "glFlushRenderAPPLE");
+ 
+     load_extensions();
+--- a/dlls/winemac.drv/unixlib.h
++++ b/dlls/winemac.drv/unixlib.h
+@@ -38,12 +38,15 @@
+ 
+ struct init_params
+ {
+     struct localized_string *strings;
+     UINT64 app_icon_callback;
+     UINT64 app_quit_request_callback;
++    UINT64 regcreateopenkeyexa_callback;
++    UINT64 regqueryvalueexa_callback;
++    UINT64 regsetvalueexa_callback;
+ };
+ 
+ /* macdrv_quit_result params */
+ struct quit_result_params
+ {
+     int result;
+@@ -70,10 +73,53 @@
+ struct dnd_query_exited_params
+ {
+     struct dispatch_callback_params dispatch;
+     UINT32 hwnd;
+ };
+ 
++/* macdrv_regcreateopenkeyexa params */
++struct regcreateopenkeyexa_params
++{
++    struct dispatch_callback_params dispatch;
++    UINT32 create;
++    UINT32 hkey;
++    UINT64 name;
++    UINT32 reserved;
++    UINT64 class;
++    UINT32 options;
++    UINT32 access;
++    UINT64 security;
++    UINT64 retkey;
++    UINT64 disposition;
++    UINT32 result;
++};
++
++/* macdrv_regqueryvalueexa params */
++struct regqueryvalueexa_params
++{
++    struct dispatch_callback_params dispatch;
++    UINT32 hkey;
++    UINT64 name;
++    UINT64 reserved;
++    UINT64 type;
++    UINT64 data;
++    UINT64 count;
++    UINT32 result;
++};
++
++/* macdrv_regsetvalueexa params */
++struct regsetvalueexa_params
++{
++    struct dispatch_callback_params dispatch;
++    UINT32 hkey;
++    UINT64 name;
++    UINT32 reserved;
++    UINT32 type;
++    UINT64 data;
++    UINT32 count;
++    UINT32 result;
++};
++
+ static inline void *param_ptr(UINT64 param)
+ {
+     return (void *)(UINT_PTR)param;
+ }
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -43,12 +43,54 @@
+ static pthread_mutex_t win_data_mutex;
+ static CFMutableDictionaryRef win_datas;
+ 
+ static unsigned int activate_on_focus_time;
+ 
+ 
++/* CrossOver Hack #16933 */
++static BOOL is_main_quicken_window(HWND hwnd)
++{
++    static const WCHAR qw_exeW[] = {'q','w','.','e','x','e',0};
++    static const WCHAR qframeW[] = {'Q','F','R','A','M','E',0};
++    static int is_qw_exe = -1;
++    WCHAR class[32];
++    UNICODE_STRING name = { .Buffer = class, .MaximumLength = sizeof(class) };
++
++    if (is_qw_exe == -1)
++    {
++        WCHAR *name = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
++        WCHAR *module_exe = wcsrchr(name, '\\');
++        module_exe = module_exe ? module_exe + 1 : name;
++
++        is_qw_exe = !wcsicmp(module_exe, qw_exeW);
++    }
++
++    if (!is_qw_exe || !NtUserGetClassName(hwnd, FALSE, &name))
++        return FALSE;
++
++    return !wcscmp(class, qframeW);
++}
++
++/* CrossOver Hack #23971 */
++static BOOL is_hoyoplay(void)
++{
++    static const WCHAR hoyoplayW[] = {'H','Y','P','.','e','x','e',0};
++    static int is_hoyoplay_exe = -1;
++    WCHAR *name, *module_exe;
++
++    if (is_hoyoplay_exe == -1)
++    {
++        name = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
++        module_exe = wcsrchr(name, '\\');
++        module_exe = module_exe ? module_exe + 1 : name;
++
++        is_hoyoplay_exe = !wcsicmp(module_exe, hoyoplayW);
++    }
++    return is_hoyoplay_exe;
++}
++
+ /* per-monitor DPI aware NtUserSetWindowPos call */
+ static BOOL set_window_pos(HWND hwnd, HWND after, INT x, INT y, INT cx, INT cy, UINT flags)
+ {
+     UINT context = NtUserSetThreadDpiAwarenessContext(NTUSER_DPI_PER_MONITOR_AWARE_V2);
+     BOOL ret = NtUserSetWindowPos(hwnd, after, x, y, cx, cy, flags);
+     NtUserSetThreadDpiAwarenessContext(context);
+@@ -64,17 +106,23 @@
+ 
+     if ((style & WS_CAPTION) == WS_CAPTION && !(ex_style & WS_EX_LAYERED))
+     {
+         wf.shadow = TRUE;
+         if (!shaped)
+         {
+-            wf.title_bar = TRUE;
+-            if (style & WS_SYSMENU) wf.close_button = TRUE;
+-            if (style & WS_MINIMIZEBOX) wf.minimize_button = TRUE;
+-            if (style & WS_MAXIMIZEBOX) wf.maximize_button = TRUE;
+-            if (ex_style & WS_EX_TOOLWINDOW) wf.utility = TRUE;
++            /* CrossOver Hack #23971 */
++            if (is_hoyoplay())
++                wf.title_bar = FALSE;
++            else
++            {
++                wf.title_bar = TRUE;
++                if (style & WS_SYSMENU) wf.close_button = TRUE;
++                if (style & WS_MINIMIZEBOX) wf.minimize_button = TRUE;
++                if (style & WS_MAXIMIZEBOX) wf.maximize_button = TRUE;
++                if (ex_style & WS_EX_TOOLWINDOW) wf.utility = TRUE;
++            }
+         }
+     }
+     if (style & WS_THICKFRAME)
+     {
+         wf.shadow = TRUE;
+         if (!shaped) wf.resizable = TRUE;
+@@ -92,12 +140,19 @@
+ {
+     struct macdrv_window_features wf = {0};
+ 
+     if (ex_style & WS_EX_NOACTIVATE) wf.prevents_app_activation = TRUE;
+     if (EqualRect(&data->rects.window, &data->rects.visible)) return wf;
+ 
++    /* CrossOver Hack #16933 */
++    if (is_main_quicken_window(data->hwnd))
++    {
++        wf.resizable = TRUE;
++        return wf;
++    }
++
+     return get_window_features_for_style(style, ex_style, data->shaped);
+ }
+ 
+ 
+ /*******************************************************************
+  *              can_window_become_foreground
+@@ -1020,14 +1075,52 @@
+  */
+ static void set_app_icon(void)
+ {
+     CFArrayRef images = create_app_icon_images();
+     if (images)
+     {
+-        macdrv_set_application_icon(images);
++        macdrv_set_application_icon(images, NULL);
+         CFRelease(images);
++    }
++    else /* CrossOver Hack 13440: Find an icon from the CrossOver app bundle */
++    {
++        const char *cx_root;
++        if ((cx_root = getenv("CX_ROOT")) && cx_root[0])
++        {
++            CFURLRef url, temp;
++            url = CFURLCreateFromFileSystemRepresentation(NULL, (UInt8*)cx_root, strlen(cx_root), TRUE);
++            if (url)
++            {
++                temp = CFURLCreateCopyDeletingLastPathComponent(NULL, url);
++                CFRelease(url);
++                url = temp;
++            }
++            if (url)
++            {
++                temp = CFURLCreateCopyDeletingLastPathComponent(NULL, url);
++                CFRelease(url);
++                url = temp;
++            }
++            if (url)
++            {
++                temp = CFURLCreateCopyAppendingPathComponent(NULL, url, CFSTR("Resources"), TRUE);
++                CFRelease(url);
++                url = temp;
++            }
++            if (url)
++            {
++                temp = CFURLCreateCopyAppendingPathComponent(NULL, url, CFSTR("exeIcon.icns"), FALSE);
++                CFRelease(url);
++                url = temp;
++            }
++            if (url)
++            {
++                macdrv_set_application_icon(NULL, url);
++                CFRelease(url);
++            }
++        }
+     }
+ }
+ 
+ 
+ /**********************************************************************
+  *		        set_capture_window_for_move
+@@ -1896,18 +1992,13 @@
+     TRACE("win %p/%p serial %lu enabled %d visible %d style %08x focus %p active %p fg %p\n",
+           hwnd, event->window, event->window_got_focus.serial, NtUserIsWindowEnabled(hwnd),
+           NtUserIsWindowVisible(hwnd), style, get_focus(), get_active_window(), NtUserGetForegroundWindow());
+ 
+     if (can_window_become_foreground(hwnd) && !(style & WS_MINIMIZE))
+     {
+-        /* simulate a mouse click on the menu to find out
+-         * whether the window wants to be activated */
+-        LRESULT ma = send_message(hwnd, WM_MOUSEACTIVATE,
+-                                  (WPARAM)NtUserGetAncestor(hwnd, GA_ROOT),
+-                                  MAKELONG(HTMENU, WM_LBUTTONDOWN));
+-        if (ma != MA_NOACTIVATEANDEAT && ma != MA_NOACTIVATE)
++        /* CrossOver Hack #18896: don't send WM_MOUSEACTIVATE, it breaks Unity games */
+         {
+             TRACE("setting foreground window to %p\n", hwnd);
+             NtUserSetForegroundWindow(hwnd);
+             return;
+         }
+     }

@@ -1,0 +1,29 @@
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -2316,13 +2316,26 @@
+         return ([mask isEmptyShaped]);
+     }
+ 
+     - (BOOL) presentsVisibleContent
+     {
+         if (NSWidth(self.frame) > 0 && NSHeight(self.frame) > 0 && ![self isEmptyShaped])
++        {
++            /* CW HACK 24152 */
++            static dispatch_once_t once;
++            static BOOL isEpicGamesLauncher;
++            dispatch_once(&once, ^{
++                NSString *exeName = [NSRunningApplication currentApplication].executableURL.lastPathComponent;
++                isEpicGamesLauncher = [exeName isEqualToString:@"EpicGamesLauncher.exe"];
++            });
++
++            if (isEpicGamesLauncher && [self isExcludedFromWindowsMenu])
++                return NO;
++
+             return YES;
++        }
+ 
+         for (WineWindow *child in self.childWindows)
+         {
+             if ([child isKindOfClass:[WineWindow class]] && [child presentsVisibleContent])
+                 return YES;
+         }

@@ -1,0 +1,82 @@
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -444,21 +450,27 @@
+     struct syscall_frame *syscall_frame; /* 0328 syscall frame pointer */
+     SYSTEM_SERVICE_TABLE *syscall_table; /* 0330 syscall table */
+     DWORD                 fs;            /* 0338 WOW TEB selector */
+     DWORD                 xstate_features_size;  /* 033c */
+     UINT64                xstate_features_mask;  /* 0340 */
+     void                **instrumentation_callback; /* 0348 */
++#ifdef __APPLE__  /* CW Hack 24265 */
++    DWORD                 mxcsr;         /* 350 */
++#endif
+ };
+ 
+ C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, pthread_teb ) == 0x320 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, syscall_frame ) == 0x328 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, syscall_table ) == 0x330 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs ) == 0x338 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, xstate_features_size ) == 0x33c );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, xstate_features_mask ) == 0x340 );
++#ifdef __APPLE__  /* CW Hack 24265 */
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x350 );
++#endif
+ 
+ static inline struct amd64_thread_data *amd64_thread_data(void)
+ {
+     return (struct amd64_thread_data *)ntdll_get_thread_data()->cpu_data;
+ }
+ 
+@@ -2237,12 +2336,21 @@
+         restore_context( &context, ucontext );
+     }
+ }
+ 
+ 
+ #ifdef __APPLE__
++/* CW Hack 24265 */
++extern void __restore_mxcsr_thunk(void);
++__ASM_GLOBAL_FUNC( __restore_mxcsr_thunk,
++                   "pushq %rcx\n\t"
++                   "movq %gs:0x30,%rcx\n\t"
++                   "ldmxcsr 0x350(%rcx)\n\t"  /* amd64_thread_data()->mxcsr */
++                   "popq %rcx\n\t"
++                   "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_prolog_end") );
++
+ /**********************************************************************
+  *		sigsys_handler
+  *
+  * Handler for SIGSYS, signals that a non-existent system call was invoked.
+  * Only called on macOS 14 Sonoma and later.
+  */
+@@ -2260,12 +2368,29 @@
+     frame->restore_flags = 0;
+     if (instrumentation_callback) frame->restore_flags |= RESTORE_FLAGS_INSTRUMENTATION;
+     RCX_sig(ucontext) = (ULONG_PTR)frame;
+     R11_sig(ucontext) = frame->eflags;
+     EFL_sig(ucontext) &= ~0x100;  /* clear single-step flag */
+     RIP_sig(ucontext) = (ULONG64)__wine_syscall_dispatcher_prolog_end_ptr;
++
++    /* CW Hack 24265 */
++    if (is_rosetta2)
++    {
++        unsigned int direct_mxcsr;
++        __asm__ volatile( "stmxcsr %0" : "=m" (direct_mxcsr) );
++        if (direct_mxcsr != FPU_sig(ucontext)->MxCsr)
++        {
++            FPU_sig(ucontext)->MxCsr = direct_mxcsr;
++
++            /* On the M3, Rosetta will restore mxcsr to the initial, incorrect
++               value from the sigcontext, even if we change it. So we jump to a
++               thunk that restores the value from amd64_thread_data. */
++            amd64_thread_data()->mxcsr = direct_mxcsr;
++            RIP_sig(ucontext) = (ULONG64)__restore_mxcsr_thunk;
++        }
++    }
+ }
+ #endif
+ 
+ 
+ /***********************************************************************
+  *           LDT support

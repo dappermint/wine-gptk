@@ -1,0 +1,31 @@
+--- a/dlls/comctl32/combo.c
++++ b/dlls/comctl32/combo.c
+@@ -1651,12 +1651,28 @@
+         pcbi->stateButton |= STATE_SYSTEM_PRESSED;
+     if (IsRectEmpty(&lphc->buttonRect))
+         pcbi->stateButton |= STATE_SYSTEM_INVISIBLE;
+     pcbi->hwndCombo = lphc->self;
+     pcbi->hwndItem = lphc->hWndEdit;
+     pcbi->hwndList = lphc->hWndLBox;
++
++    /* Codeweavers Hack for Project 2010, see bug 9946 */
++    if(!pcbi->hwndItem) {
++        char process_name[MAX_PATH], *p;
++
++        GetModuleFileNameA(GetModuleHandleA(NULL), process_name, MAX_PATH);
++        p = strrchr(process_name, '\\');
++        if(p)
++            p++;
++        else
++            p = process_name;
++
++        if(!strcasecmp(p, "winproj.exe"))
++            pcbi->hwndItem = pcbi->hwndCombo;
++    }
++
+     return TRUE;
+ }
+ 
+ static LRESULT CALLBACK COMBO_WindowProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam )
+ {
+     HEADCOMBO *lphc = (HEADCOMBO *)GetWindowLongPtrW( hwnd, 0 );

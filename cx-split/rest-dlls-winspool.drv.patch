@@ -1,0 +1,146 @@
+--- a/dlls/winspool.drv/Makefile.in
++++ b/dlls/winspool.drv/Makefile.in
+@@ -1,10 +1,10 @@
+ MODULE    = winspool.drv
+ UNIXLIB   = winspool.so
+ IMPORTLIB = winspool
+-IMPORTS   = user32 gdi32 advapi32 compstui
++IMPORTS   = user32 gdi32 advapi32 compstui shell32
+ UNIX_CFLAGS  = $(CUPS_CFLAGS)
+ UNIX_LIBS    = $(APPLICATIONSERVICES_LIBS)
+ 
+ SOURCES = \
+ 	cups.c \
+ 	info.c \
+--- a/dlls/winspool.drv/generic.ppd
++++ b/dlls/winspool.drv/generic.ppd
+@@ -29,13 +29,13 @@
+ *UIConstraints: *PageSize A4 *InputSlot Envelope
+ *UIConstraints: *PageSize A5 *InputSlot Envelope
+ *UIConstraints: *PageSize B5 *InputSlot Envelope
+ 
+ *OpenUI *PageSize/Media Size: PickOne
+ *OrderDependency: 10 AnySetup *PageSize
+-*DefaultPageSize: A4
++*DefaultPageSize: Letter
+ *PageSize Letter/Letter:	"<</PageSize[612 792]/ImagingBBox null>>setpagedevice"
+ *PageSize Legal/Legal:		"<</PageSize[612 1008]/ImagingBBox null>>setpagedevice"
+ *PageSize Executive/Executive:	"<</PageSize[522 756]/ImagingBBox null>>setpagedevice"
+ *PageSize A0/A0:		"<</PageSize[2384 3370]/ImagingBBox null>>setpagedevice"
+ *PageSize A1/A1:		"<</PageSize[1684 2384]/ImagingBBox null>>setpagedevice"
+ *PageSize A2/A2:		"<</PageSize[1191 1684]/ImagingBBox null>>setpagedevice"
+--- a/dlls/winspool.drv/info.c
++++ b/dlls/winspool.drv/info.c
+@@ -145,12 +145,24 @@
+ #elif defined __aarch64__
+ #define env_arch env_arm64
+ #else
+ #error not defined for this cpu
+ #endif
+ 
++#ifdef __ANDROID__
++/* CX HACK 15766: Android: Support Google Cloud Print */
++static char *strdup_unixcp( const WCHAR *str )
++{
++    char *ret;
++    int len = WideCharToMultiByte( CP_UNIXCP, 0, str, -1, NULL, 0, NULL, NULL );
++    if ((ret = HeapAlloc( GetProcessHeap(), 0, len )))
++        WideCharToMultiByte( CP_UNIXCP, 0, str, -1, ret, len, NULL, NULL );
++    return ret;
++}
++#endif
++
+ /******************************************************************
+  *  validate the user-supplied printing-environment [internal]
+  *
+  * PARAMS
+  *  env  [I] PTR to Environment-String or NULL
+  *
+@@ -2035,12 +2047,21 @@
+         FIXME("flags %08lx ignored\n", options->dwFlags);
+ 
+     if(!printer)
+     {
+         /* NT: FALSE with ERROR_INVALID_PARAMETER, 9x: TRUE */
+         SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++
++    /* CrossOver hack for bug 21116 */
++    if (name && (!wcsncmp(name, L"progeCAD PDF Virtual Printer", 28) ||
++                !wcsncmp(name, L"progeCAD Image Virtual Printer", 30)))
++    {
++        TRACE("Crossover hack: Return error for %s printer\n", debugstr_w(name));
++        *printer = NULL;
+         return FALSE;
+     }
+ 
+     /* Get the unique handle of the printer or Printserver */
+     *printer = get_opened_printer_entry( name, defaults );
+ 
+@@ -6265,12 +6286,32 @@
+ 
+     if (!pDriverInfo) {
+         SetLastError(ERROR_INVALID_PARAMETER);
+         return FALSE;
+     }
+ 
++#ifdef __ANDROID__
++    {
++        /* CX HACK 15766: Android: Support Google Cloud Print */
++        WCHAR *ppd_dir = NULL, *ppd_fullpath;
++        char *printer_name;
++        DRIVER_INFO_3W *pd = (DRIVER_INFO_3W*)pDriverInfo;
++        TRACE( "Querying for fallback ppd on Android.\n" );
++        ppd_dir = get_ppd_dir();
++
++        if (!pName) pName = pd->pName;
++        ppd_fullpath = get_ppd_filename( ppd_dir, pName );
++        printer_name = strdup_unixcp( pName );
++
++        get_fallback_ppd( printer_name, ppd_fullpath );
++        pd->pDataFile = ppd_fullpath;
++        dwFileCopyFlags |= APD_COPY_NEW_FILES | APD_COPY_FROM_DIRECTORY;
++        HeapFree( GetProcessHeap(), 0, printer_name );
++    }
++#endif
++
+     return backend->fpAddPrinterDriverEx(pName, level, pDriverInfo, dwFileCopyFlags);
+ }
+ 
+ /******************************************************************************
+  *  AddPrinterDriverExA (WINSPOOL.@)
+  *
+--- a/dlls/winspool.drv/wspool.c
++++ b/dlls/winspool.drv/wspool.c
+@@ -106,25 +106,30 @@
+  *
+  * Winspool entry point.
+  *
+  */
+ BOOL WINAPI DllMain( HINSTANCE instance, DWORD reason, void *reserved )
+ {
++    static HMODULE hWineps;
++
+     switch (reason)
+     {
+     case DLL_PROCESS_ATTACH:
++        /* Hack to avoid loading/unloading wineps many times */
++        hWineps = LoadLibraryA("WINEPS.DRV");
+         WINSPOOL_hInstance = instance;
+         DisableThreadLibraryCalls( instance );
+         if (!__wine_init_unix_call())
+             UNIX_CALL( process_attach, NULL );
+         WINSPOOL_LoadSystemPrinters();
+         break;
+ 
+     case DLL_PROCESS_DETACH:
+         if (reserved) break;
+         DeleteCriticalSection(&backend_cs);
+         FreeLibrary(hlocalspl);
++        if(hWineps) FreeLibrary(hWineps);
+         break;
+     }
+ 
+     return TRUE;
+ }

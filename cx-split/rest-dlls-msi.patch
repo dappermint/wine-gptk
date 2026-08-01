@@ -1,0 +1,69 @@
+--- a/dlls/msi/action.c
++++ b/dlls/msi/action.c
+@@ -7816,12 +7816,40 @@
+ 
+ UINT ACTION_PerformAction(MSIPACKAGE *package, const WCHAR *action)
+ {
+     UINT rc;
+ 
+     TRACE("Performing action (%s)\n", debugstr_w(action));
++
++    /* CrossOver Hack #12413 for Quicken 2015 Premier. Don't install the PDF driver */
++    {
++        static const WCHAR pdf[] = {'I','n','s','t','a','l','l','P','D','F','D','r','i','v','e','r',0};
++        if (!wcsicmp(action, pdf))
++        {
++            FIXME("HACK: Skipping installation of pdf driver\n");
++            return ERROR_SUCCESS;
++        }
++    }
++    /* CrossOver Hack #16064 for Office 2010 installer. Sleep 5 seconds to avoid generating duplicate keys */
++    {
++        static const WCHAR arpwrite[] = {'A','r','p','W','r','i','t','e',0};
++        if (!wcscmp(action, arpwrite))
++        {
++            FIXME("HACK: Seeping 5 seconds\n");
++            Sleep(5000);
++        }
++    }
++    /* CrossOver Hack #18329 for Office 365. Always install osppc.dll. */
++    {
++        static const WCHAR setusespp[] = L"SetUSE_SPP_OVER_OSPP";
++        if (!wcsicmp(action, setusespp))
++        {
++            FIXME("HACK: Skipping SetUSE_SPP_OVER_OSPP action.\n");
++            return ERROR_SUCCESS;
++        }
++    }
+ 
+     package->action_progress_increment = 0;
+     rc = ACTION_HandleStandardAction(package, action);
+ 
+     if (rc == ERROR_FUNCTION_NOT_CALLED)
+         rc = ACTION_HandleCustomAction(package, action);
+--- a/dlls/msi/files.c
++++ b/dlls/msi/files.c
+@@ -329,12 +329,23 @@
+                 TRACE("overwriting %s (new version %s old version %u.%u.%u.%u)\n",
+                       debugstr_w(file->File), debugstr_w(file->Version),
+                       HIWORD(file_version->dwFileVersionMS), LOWORD(file_version->dwFileVersionMS),
+                       HIWORD(file_version->dwFileVersionLS), LOWORD(file_version->dwFileVersionLS));
+                 state = msifs_overwrite;
+             }
++            /* CrossOver Hack #19776 for Microsoft Visual C++ Redistributable (2015 and 2017).
++             * Always install ucrtbase.dll. */
++            else if ((!wcscmp(file->File, L"ucrtbase.dll") || !wcscmp(file->File, L"msvcp140.dll")) &&
++                    (!wcscmp(package->ProductCode, L"{A2563E55-3BEC-3828-8D67-E5E8B9E8B675}") ||
++                     !wcscmp(package->ProductCode, L"{029DA848-1A80-34D3-BFC1-A6447BFC8E7F}") ||
++                     !wcscmp(package->ProductCode, L"{0D3E9E15-DE7A-300B-96F1-B4AF12B96488}") ||
++                     !wcscmp(package->ProductCode, L"{B0037450-526D-3448-A370-CACBD87769A0}")))
++            {
++                    FIXME("hack: Force %s installation\n", wine_dbgstr_w(file->File));
++                    state = msifs_overwrite;
++            }
+             else
+             {
+                 TRACE("keeping %s (new version %s old version %u.%u.%u.%u)\n",
+                       debugstr_w(file->File), debugstr_w(file->Version),
+                       HIWORD(file_version->dwFileVersionMS), LOWORD(file_version->dwFileVersionMS),
+                       HIWORD(file_version->dwFileVersionLS), LOWORD(file_version->dwFileVersionLS));

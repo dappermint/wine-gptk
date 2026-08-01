@@ -1,0 +1,76 @@
+--- a/dlls/wined3d/adapter_vk.c
++++ b/dlls/wined3d/adapter_vk.c
+@@ -2549,18 +2555,38 @@
+ 
+     memset(&id_properties, 0, sizeof(id_properties));
+     id_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+     properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+     properties2.pNext = &id_properties;
+ 
++    memset(&adapter_vk->driver_properties, 0, sizeof(adapter_vk->driver_properties));
++    adapter_vk->driver_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
++    id_properties.pNext = &adapter_vk->driver_properties;
++
+     if (vk_info->vk_ops.vkGetPhysicalDeviceProperties2)
+         VK_CALL(vkGetPhysicalDeviceProperties2(adapter_vk->physical_device, &properties2));
+     else
+         VK_CALL(vkGetPhysicalDeviceProperties(adapter_vk->physical_device, &properties2.properties));
+     adapter_vk->device_limits = properties2.properties.limits;
++
++    /* CW HACK 18311: Use the Vulkan renderer on macOS for d3d10/11. */
++    if (wined3d_settings.renderer == WINED3D_RENDERER_AUTO)
++    {
++        bool d3d10 = !(wined3d_creation_flags & WINED3D_PIXEL_CENTER_INTEGER);
++        bool moltenvk = adapter_vk->driver_properties.driverID == VK_DRIVER_ID_MOLTENVK;
+ 
++        if (!moltenvk || !d3d10)
++        {
++            if (!moltenvk)
++                TRACE("Not running on MoltenVK, defaulting to the OpenGL backend.\n");
++            if (!d3d10)
++                TRACE("Application using < d3d10 API, defaulting to the OpenGL backend.\n");
++            goto fail_vulkan;
++        }
++    }
++
+     VK_CALL(vkGetPhysicalDeviceMemoryProperties(adapter_vk->physical_device, &adapter_vk->memory_properties));
+ 
+     if (id_properties.deviceLUIDValid)
+         luid = (LUID *)id_properties.deviceLUID;
+     else if (ordinal == 0 && wined3d_get_primary_adapter_luid(&primary_luid))
+         luid = &primary_luid;
+--- a/dlls/wined3d/directx.c
++++ b/dlls/wined3d/directx.c
+@@ -3481,19 +3517,31 @@
+     }
+     return ret;
+ }
+ 
+ static struct wined3d_adapter *wined3d_adapter_create(unsigned int ordinal, DWORD wined3d_creation_flags)
+ {
++    struct wined3d_adapter *adapter = NULL;
++
+     if (wined3d_creation_flags & WINED3D_NO3D)
+         return wined3d_adapter_no3d_create(ordinal, wined3d_creation_flags);
+ 
+     if (wined3d_settings.renderer == WINED3D_RENDERER_VULKAN)
+         return wined3d_adapter_vk_create(ordinal, wined3d_creation_flags);
+ 
+-    return wined3d_adapter_gl_create(ordinal, wined3d_creation_flags);
++    if (wined3d_settings.renderer == WINED3D_RENDERER_OPENGL)
++        return wined3d_adapter_gl_create(ordinal, wined3d_creation_flags);
++
++    /* CW HACK 18311: Use the Vulkan renderer on macOS. */
++    if ((adapter = wined3d_adapter_vk_create(ordinal, wined3d_creation_flags)))
++        ERR_(winediag)("Using the Vulkan renderer for d3d10/11 applications.\n");
++
++    if (!adapter)
++        adapter = wined3d_adapter_gl_create(ordinal, wined3d_creation_flags);
++
++    return adapter;
+ }
+ 
+ static void STDMETHODCALLTYPE wined3d_null_wined3d_object_destroyed(void *parent) {}
+ 
+ const struct wined3d_parent_ops wined3d_null_parent_ops =
+ {

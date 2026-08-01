@@ -1,0 +1,524 @@
+--- a/dlls/shell32/shell32.spec
++++ b/dlls/shell32/shell32.spec
+@@ -489,6 +489,8 @@
+ @ stub -private StrRStrW
+ @ stdcall -private StrStrA(str str) shlwapi.StrStrA
+ @ stdcall -private StrStrIA(str str) shlwapi.StrStrIA
+ @ stdcall -private StrStrIW(wstr wstr) shlwapi.StrStrIW
+ @ stdcall -private StrStrW(wstr wstr) shlwapi.StrStrW
+ @ stdcall WOWShellExecute(long str str str str long ptr)
++
++@ stdcall wine_update_symbolic_links(long long wstr long)
+--- a/dlls/shell32/shellpath.c
++++ b/dlls/shell32/shellpath.c
+@@ -2615,17 +2615,16 @@
+             hr = _SHGetProfilesValue(key, L"ProgramData", szProgramData, def_val);
+             PathAppendW(szDest, szProgramData);
+             PathAppendW(szDest, szTemp + lstrlenW(L"%ProgramData%"));
+         }
+         else if (!wcsnicmp(szTemp, L"%USERPROFILE%", lstrlenW(L"%USERPROFILE%")))
+         {
+-            WCHAR userName[MAX_PATH];
+-            DWORD userLen = MAX_PATH;
++            /* CrossOver Hack 12735 */
++            static const WCHAR userName[] = {'c','r','o','s','s','o','v','e','r',0};
+ 
+             lstrcpyW(szDest, szProfilesPrefix);
+-            GetUserNameW(userName, &userLen);
+             PathAppendW(szDest, userName);
+             PathAppendW(szDest, szTemp + lstrlenW(L"%USERPROFILE%"));
+         }
+         else if (!wcsnicmp(szTemp, L"%SystemDrive%", lstrlenW(L"%SystemDrive%")))
+         {
+             GetSystemDirectoryW(szDest, MAX_PATH);
+@@ -2785,12 +2784,86 @@
+     RtlFreeUnicodeString( &nt_name );
+     free( target );
+     CloseHandle( mgr );
+ }
+ 
+ /******************************************************************************
++ * _SHCreateDesktopSymbolicLink  [Internal]
++ *
++ * Sets up a symbolic link for the 'Desktop' shell folder to point into the
++ * users home directory.
++ */
++static void _SHCreateDesktopSymbolicLink( const WCHAR *path )
++{
++    extern void CDECL wine_get_host_version( const char **sysname, const char **release );
++#ifdef __ANDROID__
++    static const WCHAR DownloadW[] = {'D','o','w','n','l','o','a','d','\0'};
++    char target[FILENAME_MAX], link[FILENAME_MAX], *favorites;
++    char *pszDownloads;
++#endif
++
++    /* CrossOver Hack 12791:
++     * Create the Desktop folder and put a link to the native one inside.
++     */
++    CreateDirectoryW( path, NULL );
++    {
++#       define szLinuxDesktop   L"/My Linux Desktop"
++#       define szMacDesktop     L"/My Mac Desktop"
++#       define szNativeDesktop  L"/My Native Desktop"
++#       define szAndroidDesktop L"/My Android Downloads"
++        static const WCHAR* szDesktops[] = {szAndroidDesktop, szLinuxDesktop, szMacDesktop,
++                                               szNativeDesktop, NULL};
++        const WCHAR* pszNativeDesktop;
++        int i;
++        const char *sysname;
++
++        wine_get_host_version( &sysname, NULL );
++        if (!strcmp( sysname, "Darwin" ))
++            pszNativeDesktop = szMacDesktop;
++        else
++            pszNativeDesktop = szLinuxDesktop; /* FIXME */
++
++        for (i=0; szDesktops[i]; i++)
++        {
++            WCHAR * pszDesktopLink = HeapAlloc(GetProcessHeap(), 0, (wcslen(path) + wcslen(szDesktops[i])+1)*sizeof(WCHAR));
++            wcscpy(pszDesktopLink, path);
++            wcscat(pszDesktopLink, szDesktops[i]);
++            /* Delete the other platforms' links */
++            DeleteFileW(pszDesktopLink);
++            if (wcscmp(szDesktops[i], pszNativeDesktop) != 0)
++                continue;
++
++            /* And create one for the current platform */
++            create_link( pszDesktopLink, "XDG_DESKTOP_DIR", "$HOME/Desktop" );
++            HeapFree(GetProcessHeap(), 0, pszDesktopLink);
++        }
++    }
++
++#ifdef __ANDROID__
++    hr = SHGetFolderPathW(NULL, CSIDL_FAVORITES|CSIDL_FLAG_CREATE, NULL,
++                          SHGFP_TYPE_DEFAULT, wszTempPath);
++    if (SUCCEEDED(hr) && (favorites = wine_get_unix_file_name(wszTempPath)))
++    {
++#define CREATE_SYMLINK(name) \
++        build_path( target, pszHome, name ); \
++        build_path( link, favorites, name ); \
++        FIXME( "%s -> %s\n", debugstr_a(link), debugstr_a(target) ); \
++        symlink(target, link);
++
++        CREATE_SYMLINK(DocumentsW)
++        CREATE_SYMLINK(PicturesW)
++        CREATE_SYMLINK(MusicW)
++        CREATE_SYMLINK(MoviesW)
++        CREATE_SYMLINK(DownloadW)
++        CREATE_SYMLINK(DesktopW)
++#undef CREATE_SYMLINK
++    }
++#endif
++}
++
++/******************************************************************************
+  * _SHCreateSymbolicLink  [Internal]
+  *
+  * Sets up a symbolic link for one of the special shell folders to point into
+  * the users home directory.
+  *
+  * PARAMS
+@@ -2802,12 +2875,17 @@
+ 
+     switch (folder) {
+         case CSIDL_PERSONAL:
+             create_link( path, "XDG_DOCUMENTS_DIR", "$HOME/Documents" );
+             break;
+         case CSIDL_DESKTOPDIRECTORY:
++            if (!getenv("CX_DIRECT_DESKTOP"))
++            {
++                _SHCreateDesktopSymbolicLink( path );
++                break;
++            }
+             create_link( path, "XDG_DESKTOP_DIR", "$HOME/Desktop" );
+             break;
+         case CSIDL_MYPICTURES:
+             create_link( path, "XDG_PICTURES_DIR", "$HOME/Pictures" );
+             break;
+         case CSIDL_MYVIDEO:
+@@ -3245,12 +3323,51 @@
+                             L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders",
+                             folders, ARRAY_SIZE(folders));
+     TRACE("returning 0x%08lx\n", hr);
+     return hr;
+ }
+ 
++/* CROSSOVER HACK for bug 13237 - allows updating symlinks in stub bottles */
++void WINAPI wine_update_symbolic_links(HWND hwnd, HINSTANCE handle, LPCWSTR cmdline, INT show)
++{
++    static const int ids[] =
++    {
++        CSIDL_MYPICTURES, CSIDL_MYVIDEO, CSIDL_MYMUSIC, CSIDL_DOWNLOADS, CSIDL_TEMPLATES, CSIDL_PERSONAL
++    };
++    UINT i;
++    WCHAR path[MAX_PATH];
++    int ret;
++
++    TRACE("\n");
++
++    if (!getenv("CX_DIRECT_DESKTOP"))
++    {
++        SHGetFolderPathW( 0, CSIDL_DESKTOPDIRECTORY | CSIDL_FLAG_DONT_VERIFY, 0, 0, path );
++        _SHCreateDesktopSymbolicLink( path );
++    }
++    for (i = 0; i < ARRAY_SIZE(ids); i++) {
++        /* Calculate the Windows path for this folder */
++        SHGetFolderPathW( 0, ids[i], 0, 0, path );
++
++        if (!path[0]) {
++            /* SHGetFolderPathW encountered some error before calculating the path */
++            continue;
++        }
++
++        /* Replace the link. We have to do this manually because SHGetFolderPathW only updates broken links */
++        _SHCreateSymbolicLink( ids[i], path );
++
++        /* _SHCreateSymbolicLink may not have created a link. Fall back to creating a directory. */
++        ret = SHCreateDirectoryExW(0, path, NULL);
++        if (ret && ret != ERROR_ALREADY_EXISTS)
++        {
++            WARN("Failed to create directory %s.\n", debugstr_w(path));
++        }
++    }
++}
++
+ /******************************************************************************
+  * create_extra_folders  [Internal]
+  *
+  * Create some extra folders that don't have a standard CSIDL definition.
+  */
+ static HRESULT create_extra_folders(void)
+--- a/dlls/shell32/shfldr_desktop.c
++++ b/dlls/shell32/shfldr_desktop.c
+@@ -911,13 +911,13 @@
+         return CLASS_E_NOAGGREGATION;
+ 
+     if (!cached_sf)
+     {
+         IDesktopFolderImpl *sf;
+ 
+-        if (!SHGetSpecialFolderPathW( 0, szMyPath, CSIDL_DESKTOPDIRECTORY, FALSE ))
++        if (!SHGetSpecialFolderPathW( 0, szMyPath, CSIDL_DESKTOPDIRECTORY, TRUE ))
+             return E_UNEXPECTED;
+ 
+         sf = LocalAlloc( LMEM_ZEROINIT, sizeof (IDesktopFolderImpl) );
+         if (!sf)
+             return E_OUTOFMEMORY;
+ 
+--- a/dlls/shell32/shfldr_mycomp.c
++++ b/dlls/shell32/shfldr_mycomp.c
+@@ -20,12 +20,13 @@
+  */
+ 
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdarg.h>
+ #include <stdio.h>
++#include <limits.h>
+ 
+ #define COBJMACROS
+ #include "winerror.h"
+ #include "windef.h"
+ #include "winbase.h"
+ #include "winreg.h"
+--- a/dlls/shell32/shlexec.c
++++ b/dlls/shell32/shlexec.c
+@@ -377,12 +377,65 @@
+     psei_out->hInstApp = (HINSTANCE)retval;
+     if( gcdret )
+         if( !SetCurrentDirectoryW( curdir))
+             ERR("cannot return to directory %s\n", debugstr_w(curdir));
+ 
+     return retval;
++}
++
++/*
++ * Helper function for ShellExecuteExA
++ * In order to prevent opening of particular extension types
++ */
++static BOOL verify_extension_permission(const WCHAR* ext)
++{
++    WCHAR buffer[MAX_PATH];
++    WCHAR *filename;
++    HKEY hkey,appkey;
++    int RC;
++    DWORD type,count;
++
++    if(!GetModuleFileNameW(0,buffer,MAX_PATH))
++        return TRUE;
++
++    filename = PathFindFileNameW(buffer);
++    /* @@ Wine registry key: HKCU\Software\Wine\AppDefaults\app.exe */
++    if (RegOpenKeyW( HKEY_CURRENT_USER, L"Software\\Wine\\AppDefaults", &hkey ))
++        return TRUE;
++
++    if (RegOpenKeyW( hkey, filename, &appkey )) appkey = 0;
++    RegCloseKey( hkey );
++
++    if (!appkey)
++        return TRUE;
++
++    RC = TRUE;
++    count = sizeof(buffer);
++    if (!RegQueryValueExW(appkey,L"DenyShellExecute",NULL,&type,(LPBYTE)buffer,&count))
++    {
++        WCHAR *s,*e;
++        int lext;
++
++        buffer[count / sizeof(WCHAR)] = 0;
++        ext++; /* Skip the '.' */
++        lext = wcslen(ext);
++        s=buffer;
++        while (*s) {
++            e = wcschr(s,';');
++            if (!e)
++                e = s + wcslen(s);
++            if ((e-s==lext) && (wcsnicmp(ext,s,lext)==0))
++            {
++                RC=FALSE;
++                break;
++            }
++            s=(*e?e+1:e);
++        }
++    }
++    RegCloseKey(appkey);
++    return RC;
+ }
+ 
+ 
+ /***********************************************************************
+  *           SHELL_BuildEnvW	[Internal]
+  *
+@@ -702,12 +755,14 @@
+ 
+         if (extension == NULL || extension[1]==0)
+         {
+             WARN("Returning SE_ERR_NOASSOC\n");
+             return SE_ERR_NOASSOC;
+         }
++
++        if (!verify_extension_permission(extension)) return 31;  /* no association */
+ 
+         /* Three places to check: */
+         /* 1. win.ini, [windows], programs (NB no leading '.') */
+         /* 2. Registry, HKEY_CLASS_ROOT\<classname>\shell\open\command */
+         /* 3. win.ini, [extensions], extension (NB no leading '.' */
+         /* All I know of the order is that registry is checked before */
+@@ -1114,12 +1169,41 @@
+     SHFree( wDirectory );
+ 
+     TRACE("returning %s\n", lpResult);
+     return retval;
+ }
+ 
++static UINT_PTR SHELL_CrossOverFallback(const WCHAR* lpFile, const WCHAR* lpVerb, WCHAR* cmdFormat, int cmdFormatSize, UINT_PTR retval)
++{
++    /* See if there is a native association for this file.
++     * CrossOver Hack 2412.
++     *
++     * But before that, check that this is not the file we just opened
++     * in order to avoid native -> wine -> native association loops.
++     */
++    WCHAR* nofallback=NULL;
++    int size=GetEnvironmentVariableW(L"NOCROSSOVERFALLBACK", NULL, 0);
++    if (size)
++    {
++        nofallback=HeapAlloc(GetProcessHeap(), 0, size*sizeof(*nofallback));
++        GetEnvironmentVariableW(L"NOCROSSOVERFALLBACK", nofallback, size);
++        TRACE("NoCrossOverFallback=%s\n", debugstr_w(nofallback));
++    }
++    if (!nofallback || wcscmp(nofallback, lpFile) != 0)
++    {
++        WCHAR szFallback[MAX_PATH] = L"CrossOverFallback";
++
++        TRACE("Trying CrossOverFallback, verb=%s\n", debugstr_w(lpVerb));
++        retval=SHELL_FindExecutableByVerb(lpVerb, NULL, szFallback, cmdFormat, cmdFormatSize);
++    }
++    if (nofallback)
++        HeapFree(GetProcessHeap(), 0, nofallback);
++    TRACE("CrossOverFallback returning %Id\n", retval);
++    return retval;
++}
++
+ /*************************************************************************
+  * FindExecutableW			[SHELL32.@]
+  *
+  * This function returns the executable associated with the specified file
+  * for the default verb.
+  *
+@@ -1162,12 +1246,41 @@
+ 
+     retval = SHELL_FindExecutable(lpDirectory, lpFile, L"open", res, MAX_PATH, NULL, NULL, NULL, NULL);
+ 
+     if (retval > 32)
+         lstrcpyW(lpResult, res);
+ 
++    if (retval <= 32)
++    {
++        retval=SHELL_CrossOverFallback(lpFile, L"open", lpResult, MAX_PATH*sizeof(*lpResult), retval);
++        if (retval > 32)
++        {
++            /* Remove double quotation marks and command line arguments */
++            if (*lpResult == '"')
++            {
++                WCHAR *p = lpResult;
++                while (*(p + 1) != '"')
++                {
++                    *p = *(p + 1);
++                    p++;
++                }
++                *p = '\0';
++            }
++            else
++            {
++                /* Truncate on first space, like Windows:
++                 * http://support.microsoft.com/?scid=kb%3Ben-us%3B140724
++                 */
++                WCHAR *p = lpResult;
++                while (*p != ' ' && *p != '\0')
++                    p++;
++                *p='\0';
++            }
++        }
++    }
++
+     TRACE("returning %s\n", debugstr_w(lpResult));
+     if (lpDirectory)
+         SetCurrentDirectoryW(old_dir);
+     return (HINSTANCE)retval;
+ }
+ 
+@@ -1921,27 +2034,37 @@
+         /* if so, prefix lpFile with http:// and call ShellExecute */
+         WCHAR lpstrTmpFile[256];
+         lstrcpyW(lpstrTmpFile, L"http://");
+         lstrcatW(lpstrTmpFile, lpFile);
+         retval = (UINT_PTR)ShellExecuteW(sei_tmp.hwnd, sei_tmp.lpVerb, lpstrTmpFile, NULL, NULL, 0);
+     }
+-    else if (retval == SE_ERR_NOASSOC && SHGetFileInfoW(wcmd, 0, NULL, 0, SHGFI_EXETYPE) == 0)
++    else
+     {
+-        /* File found, but no association. And no other cases fit, this could be a
+-           unix programs, try running it. We have to do this in a "catch-all" fashion because
+-           unix program can have any extensions. However, things get more complicated because
+-           the file we find could be a Windows executable without the proper extensions, it could
+-           be seen as unexpected if we start it, so we special case it here. */
+-        UINT exec_retval;
+-        TRACE("No association found, trying as Unix binary %s\n", debugstr_w(wcmd));
+-        exec_retval = SHELL_quote_and_execute( wcmd, wszParameters, wszKeyname,
+-                                               wszApplicationName, env, &sei_tmp,
+-                                               sei, execfunc );
+-        TRACE("Unix binary returned %u\n", exec_retval);
+-        if (exec_retval > 32)
+-            retval = exec_retval;
++        WCHAR wCmdFormat[1024];
++        retval=SHELL_CrossOverFallback(lpFile, sei_tmp.lpVerb, wCmdFormat, sizeof(wCmdFormat), retval);
++        if (retval > 32)
++        {
++
++            WCHAR wCommandLine[1024];
++            DWORD len;
++            TRACE("wCmdFormat=%s\n", debugstr_w(wCmdFormat));
++            SHELL_ArgifyW(wCommandLine, 1024, wCmdFormat, lpFile, sei_tmp.lpIDList, NULL, &len);
++            TRACE("wCommandLine=%s\n", debugstr_w(wCommandLine));
++            sei_tmp.fMask|=SEE_MASK_NOCLOSEPROCESS;
++            retval = execfunc(wCommandLine, env, FALSE, &sei_tmp, sei);
++            if (retval > 32)
++            {
++                DWORD retcode;
++                WaitForSingleObject(sei->hProcess, INFINITE);
++                GetExitCodeProcess(sei->hProcess, &retcode);
++                CloseHandle(sei->hProcess);
++                sei->hProcess=NULL;
++                TRACE("CrossOverFallback returned %ld\n", retcode);
++                retval=(retcode == 0 ? 33 : 31);
++            }
++        }
+     }
+ 
+ end:
+     TRACE("retval %Iu\n", retval);
+ 
+     free(wszApplicationName);
+--- a/dlls/shell32/shlview_cmenu.c
++++ b/dlls/shell32/shlview_cmenu.c
+@@ -942,13 +942,62 @@
+ 
+ 	if (psh.nPages)
+ 	    PropertySheetW(&psh);
+ 	else
+ 	    FIXME("No property pages found.\n");
+ }
++
++/*
++ * CX HACK 14911
++ */
++static void DoCreateLink(ContextMenu *This)
++{
++    IShellLinkW* shelllink;
++    IPersistFile* persistfile;
++    WCHAR wszFilename[MAX_PATH];
++    WCHAR root[MAX_PATH];
++    WCHAR *lnkfile=NULL;
++    LPITEMIDLIST pidlFQ;
++
++    static const WCHAR backslashW[]={'\\','\0'};
++    static const WCHAR lnkW[]={'.','l','n','k','\0'};
+ 
++    if (!SUCCEEDED(CoCreateInstance( &CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
++                                     &IID_IShellLinkW, (LPVOID*)&shelllink)))
++    {
++        ERR("couldn't create ShellLink object\n");
++        return;
++    }
++    pidlFQ = ILCombine(This->pidl, This->apidl[0]);
++    IShellLinkW_SetIDList(shelllink, pidlFQ);
++    ILFree(pidlFQ);
++    _ILSimpleGetTextW(This->apidl[0], (LPVOID)wszFilename, MAX_PATH);
++
++    SHGetSpecialFolderPathW(NULL, root, CSIDL_STARTMENU, TRUE);
++    lnkfile=HeapAlloc(GetProcessHeap(), 0, (lstrlenW(root)+1+lstrlenW(wszFilename)+5) * sizeof(*lnkfile));
++    lstrcpyW(lnkfile, root);
++    lstrcatW(lnkfile, backslashW);
++    lstrcatW(lnkfile, wszFilename);
++    lstrcatW(lnkfile, lnkW);
++
++    if (!SUCCEEDED(IShellLinkW_QueryInterface(shelllink, &IID_IPersistFile, (LPVOID*)&persistfile)))
++    {
++        ERR("couldn't get IPersistFile interface\n");
++        IShellLinkW_Release(shelllink);
++        HeapFree(GetProcessHeap(), 0, lnkfile);
++        return;
++    }
++    TRACE("writing link to %s\n", wine_dbgstr_w(lnkfile));
++    if (!SUCCEEDED(IPersistFile_Save(persistfile, lnkfile, FALSE)))
++        ERR("couldn't write link to %s\n", wine_dbgstr_w(lnkfile));
++
++    IPersistFile_Release(persistfile);
++    IShellLinkW_Release(shelllink);
++    HeapFree(GetProcessHeap(), 0, lnkfile);
++}
++
+ static HRESULT WINAPI ItemMenu_InvokeCommand(
+ 	IContextMenu3 *iface,
+ 	LPCMINVOKECOMMANDINFO lpcmi)
+ {
+     ContextMenu *This = impl_from_IContextMenu3(iface);
+ 
+@@ -1011,12 +1060,16 @@
+             do_paste(This, lpcmi->hwnd);
+             break;
+         case FCIDM_SHVIEW_PROPERTIES:
+             TRACE("Verb FCIDM_SHVIEW_PROPERTIES\n");
+             DoOpenProperties(This, lpcmi->hwnd);
+             break;
++        case FCIDM_SHVIEW_CREATELINK: /* CX HACK 14911 */
++            TRACE("Verb FCIDM_SHVIEW_CREATELINK\n");
++            DoCreateLink(This);
++            break;
+         default:
+             FIXME("Unhandled verb %#x.\n", id);
+             return E_INVALIDARG;
+         }
+     }
+     else

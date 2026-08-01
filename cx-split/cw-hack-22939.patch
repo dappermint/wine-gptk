@@ -1,0 +1,18 @@
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -3092,13 +3134,14 @@
+                                                       &shared_fd, &shared_needs_close, NULL, NULL ))))
+     {
+         if (needs_close) close( unix_fd );
+         return status;
+     }
+ 
+-    if (!image_info->map_addr &&
++    if (peb->OSMajorVersion > 5 && /* CW HACK 22939: ASLR is supported only on Windows Vista and later */
++        !image_info->map_addr &&
+         (image_info->image_charact & IMAGE_FILE_DLL) &&
+         (image_info->image_flags & IMAGE_FLAGS_ImageDynamicallyRelocated))
+     {
+         SERVER_START_REQ( get_image_map_address )
+         {
+             req->handle = wine_server_obj_handle( mapping );

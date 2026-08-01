@@ -1,0 +1,340 @@
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1888,12 +1935,24 @@
+         NtCurrentTeb()->ExceptionCode = ret;
+         call_raise_user_exception_dispatcher();
+     }
+     return ret;
+ }
+ 
++/* CW Hack 23015 */
++#if defined(__APPLE__) && defined(__x86_64__)
++
++NTSTATUS __attribute__((ms_abi)) msthunk_NtClose( HANDLE handle )
++{
++    return sysv_NtClose( handle );
++}
++
++GPT_ABI_WRAPPER( NtClose );
++
++#endif
++
+ #ifdef _WIN64
+ 
+ struct __server_request_info32
+ {
+     union
+     {
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -325,23 +333,42 @@
+         *handle = wine_server_ptr_handle( reply->handle );
+     }
+     SERVER_END_REQ;
+ 
+     free( objattr );
+     return ret;
++}
++
++/* CW Hack 23015 */
++#if defined(__APPLE__) && defined(__x86_64__)
++
++NTSTATUS __attribute__((ms_abi)) msthunk_NtCreateSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
++                                                            LONG initial, LONG max )
++{
++    return sysv_NtCreateSemaphore( handle, access, attr, initial, max );
+ }
+ 
++GPT_ABI_WRAPPER( NtCreateSemaphore );
+ 
++#endif
++
+ /******************************************************************************
+  *              NtOpenSemaphore (NTDLL.@)
+  */
+ NTSTATUS WINAPI NtOpenSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr )
+ {
+     unsigned int ret;
+ 
+     *handle = 0;
++
++    if (do_msync())
++        return msync_open_semaphore( handle, access, attr );
++
++    if (do_esync())
++        return esync_open_semaphore( handle, access, attr );
++
+     if ((ret = validate_open_object_attributes( attr ))) return ret;
+ 
+     SERVER_START_REQ( open_semaphore )
+     {
+         req->access     = access;
+         req->attributes = attr->Attributes;
+@@ -407,25 +446,43 @@
+         }
+     }
+     SERVER_END_REQ;
+     return ret;
+ }
+ 
++/* CW Hack 23015 */
++#if defined(__APPLE__) && defined(__x86_64__)
+ 
++NTSTATUS __attribute__((ms_abi)) msthunk_NtReleaseSemaphore( HANDLE handle, ULONG count, ULONG *previous )
++{
++    return sysv_NtReleaseSemaphore( handle, count, previous );
++}
++
++GPT_ABI_WRAPPER( NtReleaseSemaphore );
++
++#endif
++
+ /**************************************************************************
+  *              NtCreateEvent (NTDLL.@)
+  */
+-NTSTATUS WINAPI NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
+-                               EVENT_TYPE type, BOOLEAN state )
++NTSTATUS WINAPI GPT_IMPORT(NtCreateEvent)( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
++                                           EVENT_TYPE type, BOOLEAN state )
+ {
+     unsigned int ret;
+     data_size_t len;
+     struct object_attributes *objattr;
+ 
+     *handle = 0;
+     if (type != NotificationEvent && type != SynchronizationEvent) return STATUS_INVALID_PARAMETER;
++
++    if (do_msync())
++        return msync_create_event( handle, access, attr, type, state );
++
++    if (do_esync())
++        return esync_create_event( handle, access, attr, type, state );
++
+     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
+ 
+     SERVER_START_REQ( create_event )
+     {
+         req->access = access;
+         req->manual_reset = (type == NotificationEvent);
+@@ -437,23 +494,41 @@
+     SERVER_END_REQ;
+ 
+     free( objattr );
+     return ret;
+ }
+ 
++/* CW Hack 23015 */
++#if defined(__APPLE__) && defined(__x86_64__)
+ 
++NTSTATUS __attribute__((ms_abi)) msthunk_NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
++                                                        EVENT_TYPE type, BOOLEAN state )
++{
++    return sysv_NtCreateEvent( handle, access, attr, type, state );
++}
++
++GPT_ABI_WRAPPER( NtCreateEvent );
++
++#endif
++
+ /******************************************************************************
+  *              NtOpenEvent (NTDLL.@)
+  */
+ NTSTATUS WINAPI NtOpenEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr )
+ {
+     unsigned int ret;
+ 
+     *handle = 0;
+     if ((ret = validate_open_object_attributes( attr ))) return ret;
+ 
++    if (do_msync())
++        return msync_open_event( handle, access, attr );
++
++    if (do_esync())
++        return esync_open_event( handle, access, attr );
++
+     SERVER_START_REQ( open_event )
+     {
+         req->access     = access;
+         req->attributes = attr->Attributes;
+         req->rootdir    = wine_server_obj_handle( attr->RootDirectory );
+         if (attr->ObjectName)
+@@ -466,76 +541,142 @@
+ }
+ 
+ 
+ /******************************************************************************
+  *              NtSetEvent (NTDLL.@)
+  */
+-NTSTATUS WINAPI NtSetEvent( HANDLE handle, LONG *prev_state )
++NTSTATUS WINAPI GPT_IMPORT(NtSetEvent)( HANDLE handle, LONG *prev_state )
+ {
++    /* This comment is a dummy to make sure this patch applies in the right place. */
+     unsigned int ret;
+ 
++    if (do_msync())
++        return msync_set_event( handle, prev_state );
++
++    if (do_esync())
++        return esync_set_event( handle );
++
+     SERVER_START_REQ( event_op )
+     {
+         req->handle = wine_server_obj_handle( handle );
+         req->op     = SET_EVENT;
+         ret = wine_server_call( req );
+         if (!ret && prev_state) *prev_state = reply->state;
+     }
+     SERVER_END_REQ;
+     return ret;
+ }
+ 
++/* CW Hack 23015 */
++#if defined(__APPLE__) && defined(__x86_64__)
+ 
++NTSTATUS __attribute__((ms_abi)) msthunk_NtSetEvent( HANDLE handle, LONG *prev_state )
++{
++    return sysv_NtSetEvent( handle, prev_state );
++}
++
++GPT_ABI_WRAPPER( NtSetEvent );
++
++#endif
++
+ /******************************************************************************
+  *              NtResetEvent (NTDLL.@)
+  */
+-NTSTATUS WINAPI NtResetEvent( HANDLE handle, LONG *prev_state )
++NTSTATUS WINAPI GPT_IMPORT(NtResetEvent)( HANDLE handle, LONG *prev_state )
+ {
++    /* This comment is a dummy to make sure this patch applies in the right place. */
+     unsigned int ret;
++
++    if (do_msync())
++        return msync_reset_event( handle, prev_state );
++
++    if (do_esync())
++        return esync_reset_event( handle );
+ 
++
+     SERVER_START_REQ( event_op )
+     {
+         req->handle = wine_server_obj_handle( handle );
+         req->op     = RESET_EVENT;
+         ret = wine_server_call( req );
+         if (!ret && prev_state) *prev_state = reply->state;
+     }
+     SERVER_END_REQ;
+     return ret;
+ }
+ 
++/* CW Hack 23015 */
++#if defined(__APPLE__) && defined(__x86_64__)
+ 
++NTSTATUS __attribute__((ms_abi)) msthunk_NtResetEvent( HANDLE handle, LONG *prev_state )
++{
++    return sysv_NtResetEvent( handle, prev_state );
++}
++
++GPT_ABI_WRAPPER( NtResetEvent );
++
++#endif
++
+ /******************************************************************************
+  *              NtClearEvent (NTDLL.@)
+  */
+-NTSTATUS WINAPI NtClearEvent( HANDLE handle )
++NTSTATUS WINAPI GPT_IMPORT(NtClearEvent)( HANDLE handle )
+ {
+     /* FIXME: same as NtResetEvent ??? */
+     return NtResetEvent( handle, NULL );
+ }
+ 
++/* CW Hack 23015 */
++#if defined(__APPLE__) && defined(__x86_64__)
+ 
++NTSTATUS __attribute__((ms_abi)) msthunk_NtClearEvent( HANDLE handle )
++{
++    return sysv_NtClearEvent( handle );
++}
++
++GPT_ABI_WRAPPER( NtClearEvent );
++
++#endif
++
++
+ /******************************************************************************
+  *              NtPulseEvent (NTDLL.@)
+  */
+-NTSTATUS WINAPI NtPulseEvent( HANDLE handle, LONG *prev_state )
++NTSTATUS WINAPI GPT_IMPORT(NtPulseEvent)( HANDLE handle, LONG *prev_state )
+ {
+     unsigned int ret;
+ 
++    if (do_msync())
++        return msync_pulse_event( handle, prev_state );
++
++    if (do_esync())
++        return esync_pulse_event( handle );
++
+     SERVER_START_REQ( event_op )
+     {
+         req->handle = wine_server_obj_handle( handle );
+         req->op     = PULSE_EVENT;
+         ret = wine_server_call( req );
+         if (!ret && prev_state) *prev_state = reply->state;
+     }
+     SERVER_END_REQ;
+     return ret;
+ }
+ 
++/* CW Hack 23015 */
++#if defined(__APPLE__) && defined(__x86_64__)
+ 
++NTSTATUS __attribute__((ms_abi)) msthunk_NtPulseEvent( HANDLE handle, LONG *prev_state )
++{
++    return sysv_NtPulseEvent( handle, prev_state );
++}
++
++GPT_ABI_WRAPPER( NtPulseEvent );
++
++#endif
++
+ /******************************************************************************
+  *              NtQueryEvent (NTDLL.@)
+  */
+ NTSTATUS WINAPI NtQueryEvent( HANDLE handle, EVENT_INFORMATION_CLASS class,
+                               void *info, ULONG len, ULONG *ret_len )
+ {
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1424,15 +1434,30 @@
+         NtClose( *handle );
+         close( request_pipe[1] );
+         return status;
+     }
+     if (attr_list) update_attr_list( attr_list, &teb->ClientId, teb );
+     return STATUS_SUCCESS;
++}
++
++/* CW Hack 23015 */
++#if defined(__APPLE__) && defined(__x86_64__)
++
++NTSTATUS __attribute__((ms_abi)) msthunk_NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
++                                                           HANDLE process, PRTL_THREAD_START_ROUTINE start, void *param,
++                                                           ULONG flags, ULONG_PTR zero_bits, SIZE_T stack_commit,
++                                                           SIZE_T stack_reserve, PS_ATTRIBUTE_LIST *attr_list )
++{
++    return sysv_NtCreateThreadEx( handle, access, attr, process, start, param, flags,
++                                  zero_bits, stack_commit, stack_reserve, attr_list );
+ }
+ 
++GPT_ABI_WRAPPER( NtCreateThreadEx );
+ 
++#endif
++
+ /***********************************************************************
+  *           abort_thread
+  */
+ void abort_thread( int status )
+ {
+     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );

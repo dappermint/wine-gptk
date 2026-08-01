@@ -1,0 +1,16 @@
+--- a/dlls/winemac.drv/Makefile.in
++++ b/dlls/winemac.drv/Makefile.in
+@@ -22,12 +22,13 @@
+ 	cocoa_display.m \
+ 	cocoa_event.m \
+ 	cocoa_main.m \
+ 	cocoa_opengl.m \
+ 	cocoa_status_item.m \
+ 	cocoa_window.m \
++	d3dmetal.c \
+ 	display.c \
+ 	dllmain.c \
+ 	event.c \
+ 	gdi.c \
+ 	image.c \
+ 	keyboard.c \

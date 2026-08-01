@@ -1,0 +1,27 @@
+--- a/dlls/wininet/http.c
++++ b/dlls/wininet/http.c
+@@ -3258,12 +3258,24 @@
+     TRACE("(%p %p %lu %lx)\n", req, buf, size, flags);
+ 
+     if (flags & ~(IRF_ASYNC|IRF_NO_WAIT))
+         FIXME("these dwFlags aren't implemented: 0x%lx\n", flags & ~(IRF_ASYNC|IRF_NO_WAIT));
+ 
+     allow_blocking = !(req->session->appInfo->hdr.dwFlags & INTERNET_FLAG_ASYNC);
++
++    /* CXHACK: bug 14423 */
++    if(!allow_blocking) {
++        char name[MAX_PATH], *p;
++        GetModuleFileNameA(GetModuleHandleA(NULL), name, sizeof(name));
++        p = strrchr(name, '\\');
++        p = p ? p+1 : name;
++        if (!strcasecmp(p,"qw.exe")) {
++            FIXME("Forcing sync read for Quicken\n");
++            allow_blocking = TRUE;
++        }
++    }
+ 
+     if(allow_blocking || TryEnterCriticalSection(&req->read_section)) {
+         if(allow_blocking)
+             EnterCriticalSection(&req->read_section);
+         if(hdr->dwError == ERROR_SUCCESS)
+             hdr->dwError = INTERNET_HANDLE_IN_USE;

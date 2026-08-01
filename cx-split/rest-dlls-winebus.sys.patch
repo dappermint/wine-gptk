@@ -1,0 +1,294 @@
+--- a/dlls/winebus.sys/Makefile.in
++++ b/dlls/winebus.sys/Makefile.in
+@@ -7,10 +7,11 @@
+ EXTRADLLFLAGS = -Wl,--subsystem,native
+ 
+ SOURCES = \
+ 	bus_iohid.c \
+ 	bus_sdl.c \
+ 	bus_udev.c \
++	bus_xbox360.c \
+ 	hid.c \
+ 	main.c \
+ 	unixlib.c \
+ 	winebus.rc
+--- a/dlls/winebus.sys/bus_sdl.c
++++ b/dlls/winebus.sys/bus_sdl.c
+@@ -112,12 +112,13 @@
+ MAKE_FUNCPTR(SDL_HapticUpdateEffect);
+ MAKE_FUNCPTR(SDL_JoystickIsHaptic);
+ MAKE_FUNCPTR(SDL_GameControllerAddMapping);
+ MAKE_FUNCPTR(SDL_RegisterEvents);
+ MAKE_FUNCPTR(SDL_PushEvent);
+ MAKE_FUNCPTR(SDL_GetTicks);
++MAKE_FUNCPTR(SDL_SetHint);
+ static int (*pSDL_JoystickRumble)(SDL_Joystick *joystick, Uint16 low_frequency_rumble, Uint16 high_frequency_rumble, Uint32 duration_ms);
+ static int (*pSDL_JoystickRumbleTriggers)(SDL_Joystick *joystick, Uint16 left_rumble, Uint16 right_rumble, Uint32 duration_ms);
+ static Uint16 (*pSDL_JoystickGetProduct)(SDL_Joystick * joystick);
+ static Uint16 (*pSDL_JoystickGetProductVersion)(SDL_Joystick * joystick);
+ static Uint16 (*pSDL_JoystickGetVendor)(SDL_Joystick * joystick);
+ static SDL_JoystickType (*pSDL_JoystickGetType)(SDL_Joystick * joystick);
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -1042,12 +1042,26 @@
+ 
+     if (check_bus_option(L"DisableHidraw", FALSE))
+     {
+         TRACE("IOHID hidraw devices disabled in registry\n");
+         return STATUS_SUCCESS;
+     }
++
++    return bus_main_thread_start(&bus);
++}
++
++static NTSTATUS xbox_driver_init(void)
++{
++    struct xbox_bus_options bus_options;
++    struct bus_main_params bus =
++    {
++        .name = L"XBOX",
++        .init_args = &bus_options,
++        .init_code = xbox_init,
++        .wait_code = xbox_wait,
++    };
+ 
+     return bus_main_thread_start(&bus);
+ }
+ 
+ static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
+ {
+@@ -1065,22 +1079,24 @@
+         keyboard_device_create();
+ 
+         if ((enable_sdl = check_bus_option(L"Enable SDL", 1)))
+             enable_sdl = !sdl_driver_init();
+         udev_driver_init(enable_sdl);
+         iohid_driver_init();
++        xbox_driver_init();
+ 
+         irp->IoStatus.Status = STATUS_SUCCESS;
+         break;
+     case IRP_MN_SURPRISE_REMOVAL:
+         irp->IoStatus.Status = STATUS_SUCCESS;
+         break;
+     case IRP_MN_REMOVE_DEVICE:
+         winebus_call(sdl_stop, NULL);
+         winebus_call(udev_stop, NULL);
+         winebus_call(iohid_stop, NULL);
++        winebus_call(xbox_stop, NULL);
+ 
+         WaitForMultipleObjects(bus_count, bus_thread, TRUE, INFINITE);
+         while (bus_count--) CloseHandle(bus_thread[bus_count]);
+ 
+         irp->IoStatus.Status = STATUS_SUCCESS;
+         IoSkipCurrentIrpStackLocation(irp);
+--- a/dlls/winebus.sys/unix_private.h
++++ b/dlls/winebus.sys/unix_private.h
+@@ -228,12 +228,16 @@
+ extern NTSTATUS udev_bus_wait(void *);
+ extern NTSTATUS udev_bus_stop(void *);
+ 
+ extern NTSTATUS iohid_bus_init(void *);
+ extern NTSTATUS iohid_bus_wait(void *);
+ extern NTSTATUS iohid_bus_stop(void *);
++
++extern NTSTATUS xbox_bus_init(void *);
++extern NTSTATUS xbox_bus_wait(void *);
++extern NTSTATUS xbox_bus_stop(void *);
+ 
+ extern void bus_event_cleanup(struct bus_event *event);
+ extern void bus_event_queue_destroy(struct list *queue);
+ extern BOOL bus_event_queue_device_removed(struct list *queue, struct unix_device *device);
+ extern BOOL bus_event_queue_device_created(struct list *queue, struct unix_device *device, struct device_desc *desc);
+ extern BOOL bus_event_queue_input_report(struct list *queue, struct unix_device *device,
+--- a/dlls/winebus.sys/unixlib.c
++++ b/dlls/winebus.sys/unixlib.c
+@@ -308,12 +308,15 @@
+     udev_bus_init,
+     udev_bus_wait,
+     udev_bus_stop,
+     iohid_bus_init,
+     iohid_bus_wait,
+     iohid_bus_stop,
++    xbox_bus_init,
++    xbox_bus_wait,
++    xbox_bus_stop,
+     mouse_device_create,
+     keyboard_device_create,
+     unix_device_remove,
+     unix_device_start,
+     unix_device_get_report_descriptor,
+     unix_device_set_output_report,
+@@ -423,7 +426,137 @@
+     else size = offsetof(struct bus_event, input_report.buffer[entry->event.input_report.length]);
+ 
+     memcpy(event, &entry->event, size);
+     free(entry);
+ 
+     return TRUE;
++}
++
++#ifdef _WIN64
++
++typedef ULONG PTR32;
++
++static NTSTATUS wow64_sdl_bus_init(void *args)
++{
++    struct
++    {
++        BOOL split_controllers;
++        BOOL map_controllers;
++        UINT mappings_count;
++        PTR32 mappings;
++    } const *params32 = args;
++    struct sdl_bus_options params =
++    {
++        params32->split_controllers,
++        params32->map_controllers,
++        params32->mappings_count,
++    };
++    PTR32 *mappings = UlongToPtr(params32->mappings);
++    NTSTATUS status;
++    int i;
++
++    params.mappings = malloc(params32->mappings_count * sizeof(char *));
++    for (i = 0; i < params32->mappings_count; ++i) params.mappings[i] = UlongToPtr(mappings[i]);
++
++    status = sdl_bus_init(args);
++
++    free(params.mappings);
++    return status;
+ }
++
++static NTSTATUS wow64_unix_device_get_report_descriptor(void *args)
++{
++    struct
++    {
++        UINT64 device;
++        PTR32 buffer;
++        UINT length;
++        PTR32 out_length;
++    } const *params32 = args;
++    struct device_descriptor_params params =
++    {
++        params32->device,
++        ULongToPtr(params32->buffer),
++        params32->length,
++        ULongToPtr(params32->out_length),
++    };
++    return unix_device_get_report_descriptor(&params);
++}
++
++static NTSTATUS wow64_unix_device_set_output_report(void *args)
++{
++    struct
++    {
++        UINT64 device;
++        PTR32 packet;
++        PTR32 io;
++    } const *params32 = args;
++    struct device_report_params params =
++    {
++        params32->device,
++        ULongToPtr(params32->packet),
++        ULongToPtr(params32->io),
++    };
++    return unix_device_set_output_report(&params);
++}
++
++static NTSTATUS wow64_unix_device_get_feature_report(void *args)
++{
++    struct
++    {
++        UINT64 device;
++        PTR32 packet;
++        PTR32 io;
++    } const *params32 = args;
++    struct device_report_params params =
++    {
++        params32->device,
++        ULongToPtr(params32->packet),
++        ULongToPtr(params32->io),
++    };
++    return unix_device_get_feature_report(&params);
++}
++
++static NTSTATUS wow64_unix_device_set_feature_report(void *args)
++{
++    struct
++    {
++        UINT64 device;
++        PTR32 packet;
++        PTR32 io;
++    } const *params32 = args;
++    struct device_report_params params =
++    {
++        params32->device,
++        ULongToPtr(params32->packet),
++        ULongToPtr(params32->io),
++    };
++    return unix_device_set_feature_report(&params);
++}
++
++const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
++{
++    wow64_sdl_bus_init,
++    sdl_bus_wait,
++    sdl_bus_stop,
++    udev_bus_init,
++    udev_bus_wait,
++    udev_bus_stop,
++    iohid_bus_init,
++    iohid_bus_wait,
++    iohid_bus_stop,
++    xbox_bus_init,
++    xbox_bus_wait,
++    xbox_bus_stop,
++    mouse_device_create,
++    keyboard_device_create,
++    unix_device_remove,
++    unix_device_start,
++    wow64_unix_device_get_report_descriptor,
++    wow64_unix_device_set_output_report,
++    wow64_unix_device_get_feature_report,
++    wow64_unix_device_set_feature_report,
++};
++
++C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count);
++
++#endif  /* _WIN64 */
+--- a/dlls/winebus.sys/unixlib.h
++++ b/dlls/winebus.sys/unixlib.h
+@@ -64,12 +64,16 @@
+ };
+ 
+ struct iohid_bus_options
+ {
+ };
+ 
++struct xbox_bus_options
++{
++};
++
+ enum bus_event_type
+ {
+     BUS_EVENT_TYPE_NONE,
+     BUS_EVENT_TYPE_DEVICE_REMOVED,
+     BUS_EVENT_TYPE_DEVICE_CREATED,
+     BUS_EVENT_TYPE_INPUT_REPORT,
+@@ -133,12 +137,15 @@
+     udev_init,
+     udev_wait,
+     udev_stop,
+     iohid_init,
+     iohid_wait,
+     iohid_stop,
++    xbox_init,
++    xbox_wait,
++    xbox_stop,
+     mouse_create,
+     keyboard_create,
+     device_remove,
+     device_start,
+     device_get_report_descriptor,
+     device_set_output_report,

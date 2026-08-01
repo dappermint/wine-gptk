@@ -1,0 +1,67 @@
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -77,12 +77,18 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(unwind);
+ WINE_DECLARE_DEBUG_CHANNEL(seh);
+ 
+ #include "dwarf.h"
+ 
++#ifdef __APPLE__
++/* CW Hack 24256 */
++#include <sys/sysctl.h>
++static BOOL is_rosetta2;
++#endif
++
+ /***********************************************************************
+  * signal context platform-specific definitions
+  */
+ #ifdef linux
+ 
+ #include <asm/prctl.h>
+@@ -916,12 +928,19 @@
+     if (FPU_sig(sigcontext))
+     {
+         XSAVE_AREA_HEADER *xs;
+ 
+         context->ContextFlags |= CONTEXT_FLOATING_POINT;
+         context->FltSave = *FPU_sig(sigcontext);
++#ifdef __APPLE__
++        /* CW Hack 24256: mxcsr in signal contexts is incorrect in Rosetta.
++           In Rosetta only, the actual value of the register from within the
++           handler is correct (on Intel it has some default value). */
++        if (is_rosetta2)
++            __asm__ volatile( "stmxcsr %0" : "=m" (context->FltSave.MxCsr) );
++#endif
+         context->MxCsr = context->FltSave.MxCsr;
+         if (xstate_extended_features() && (xs = XState_sig(FPU_sig(sigcontext))))
+         {
+             /* xcontext and sigcontext are both on the signal stack, so we can
+              * just reference sigcontext without overflowing 32 bit XState.Offset */
+             context_init_xstate( context, xs );
+@@ -2535,12 +2660,25 @@
+         {
+             if (__wine_ldt_copy.flags[idx]) continue;
+             amd64_thread_data()->fs = (idx << 3) | 7;
+             ldt_set_entry( amd64_thread_data()->fs, fs32_entry );
+             break;
+         }
++    }
++#endif
++
++#ifdef __APPLE__
++    /* CW Hack 24256: We need the value of sysctl.proc_translated in signal
++       handlers but sysctl[byname] is not signal-safe. */
++    {
++        int ret = 0;
++        size_t size = sizeof(ret);
++        if (sysctlbyname( "sysctl.proc_translated", &ret, &size, NULL, 0 ) == -1)
++            is_rosetta2 = 0;
++        else
++            is_rosetta2 = ret;
+     }
+ #endif
+ 
+     sig_act.sa_mask = server_block_set;
+     sig_act.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
+ 

@@ -1,0 +1,337 @@
+--- a/dlls/crypt32/chain.c
++++ b/dlls/crypt32/chain.c
+@@ -164,12 +164,15 @@
+     const CERT_CHAIN_ENGINE_CONFIG config = { sizeof(config) };
+ 
+     if(handle == HCCE_CURRENT_USER) {
+         if(!allow_default)
+             return NULL;
+ 
++        if (is_bnet())
++            return CRYPT_CreateChainEngine(NULL, CERT_SYSTEM_STORE_CURRENT_USER, &config);
++
+         if(!default_cu_engine) {
+             handle = CRYPT_CreateChainEngine(NULL, CERT_SYSTEM_STORE_CURRENT_USER, &config);
+             InterlockedCompareExchangePointer((void**)&default_cu_engine, handle, NULL);
+             if(default_cu_engine != handle)
+                 CertFreeCertificateChainEngine(handle);
+         }
+@@ -178,12 +181,15 @@
+     }
+ 
+     if(handle == HCCE_LOCAL_MACHINE) {
+         if(!allow_default)
+             return NULL;
+ 
++        if (is_bnet())
++            return CRYPT_CreateChainEngine(NULL, CERT_SYSTEM_STORE_LOCAL_MACHINE, &config);
++
+         if(!default_lm_engine) {
+             handle = CRYPT_CreateChainEngine(NULL, CERT_SYSTEM_STORE_LOCAL_MACHINE, &config);
+             InterlockedCompareExchangePointer((void**)&default_lm_engine, handle, NULL);
+             if(default_lm_engine != handle)
+                 CertFreeCertificateChainEngine(handle);
+         }
+@@ -364,12 +370,13 @@
+         if (CertCompareCertificateName(cert->dwCertEncodingType, &cert->pCertInfo->Subject, &cert->pCertInfo->Issuer))
+             status = CERT_TRUST_HAS_NAME_MATCH_ISSUER;
+ 
+     if (status)
+         status |= CERT_TRUST_IS_SELF_SIGNED;
+ 
++    TRACE("status %#lx.\n", status);
+     return status;
+ }
+ 
+ static void CRYPT_FreeChainElement(PCERT_CHAIN_ELEMENT element)
+ {
+     CertFreeCertificateContext(element->pCertContext);
+@@ -2890,17 +2897,23 @@
+         return FALSE;
+ 
+     if (ppChainContext)
+         *ppChainContext = NULL;
+     if (!pChainPara)
+     {
++        if (is_bnet() && (hChainEngine == HCCE_CURRENT_USER || hChainEngine == HCCE_LOCAL_MACHINE))
++            free_chain_engine(engine);
++
+         SetLastError(E_INVALIDARG);
+         return FALSE;
+     }
+     if (!pCertContext->pCertInfo->SignatureAlgorithm.pszObjId)
+     {
++        if (is_bnet() && (hChainEngine == HCCE_CURRENT_USER || hChainEngine == HCCE_LOCAL_MACHINE))
++            free_chain_engine(engine);
++
+         SetLastError(ERROR_INVALID_DATA);
+         return FALSE;
+     }
+ 
+     if (TRACE_ON(chain))
+         dump_chain_para(pChainPara);
+@@ -2934,12 +2947,14 @@
+          pChain->TrustStatus.dwErrorStatus);
+         if (ppChainContext)
+             *ppChainContext = pChain;
+         else
+             CertFreeCertificateChain(pChain);
+     }
++    if (is_bnet() && (hChainEngine == HCCE_CURRENT_USER || hChainEngine == HCCE_LOCAL_MACHINE))
++        free_chain_engine(engine);
+     TRACE("returning %d\n", ret);
+     return ret;
+ }
+ 
+ PCCERT_CHAIN_CONTEXT WINAPI CertDuplicateCertificateChain(
+  PCCERT_CHAIN_CONTEXT pChainContext)
+--- a/dlls/crypt32/collectionstore.c
++++ b/dlls/crypt32/collectionstore.c
+@@ -259,16 +259,16 @@
+ 
+ static BOOL Collection_deleteCert(WINECRYPT_CERTSTORE *store, context_t *context)
+ {
+     cert_t *cert = (cert_t*)context;
+     cert_t *linked;
+ 
+-    TRACE("(%p, %p)\n", store, cert);
++    TRACE("(%p, %p) linked %p\n", store, cert, context->linked);
+ 
+     linked = (cert_t*)context->linked;
+-    return CertDeleteCertificateFromStore(&linked->ctx);
++    return CRYPT_DeleteCertificateFromStore(&linked->ctx);
+ }
+ 
+ static BOOL Collection_addCRL(WINECRYPT_CERTSTORE *store, context_t *crl,
+  context_t *toReplace, context_t **ppStoreContext, BOOL use_link)
+ {
+     BOOL ret;
+--- a/dlls/crypt32/crypt32_private.h
++++ b/dlls/crypt32/crypt32_private.h
+@@ -411,12 +411,16 @@
+ /* Creates a new link context.  The context refers to linked
+  * rather than owning its own properties.  If addRef is TRUE (which ordinarily
+  * it should be) linked is addref'd.
+  * Free with Context_Release.
+  */
+ context_t *Context_CreateLinkContext(unsigned contextSize, context_t *linked, struct WINE_CRYPTCERTSTORE*);
++
++BOOL CRYPT_DeleteCertificateFromStore(PCCERT_CONTEXT pCertContext);
++
++BOOL is_bnet(void);
+ 
+ /* Copies properties from fromContext to toContext. */
+ void Context_CopyProperties(const void *to, const void *from);
+ 
+ void Context_AddRef(context_t*);
+ void Context_Release(context_t *context);
+--- a/dlls/crypt32/rootstore.c
++++ b/dlls/crypt32/rootstore.c
+@@ -610,24 +610,25 @@
+             WARN("adding root cert %ld failed: %08lx\n", i, GetLastError());
+             continue;
+         }
+         if ((existing = CertFindCertificateInStore(cached, X509_ASN_ENCODING, 0, CERT_FIND_EXISTING, cert, NULL)))
+         {
+             CertDeleteCertificateFromStore(existing);
+-            CertFreeCertificateContext(existing);
++            if (!is_bnet())
++                CertFreeCertificateContext(existing);
+         }
+         CertFreeCertificateContext(cert);
+     }
+ }
+ 
+ /* Reads certificates from the list of known locations into store.  Stops when
+  * any location contains any certificates, to prevent spending unnecessary time
+  * adding redundant certificates, e.g. when both a certificate bundle and
+  * individual certificates exist in the same directory.
+  */
+-static void read_trusted_roots_from_known_locations(HCERTSTORE store, HCERTSTORE cached, BOOL *delete)
++static void read_trusted_roots_from_known_locations(HCERTSTORE store, HCERTSTORE cached)
+ {
+     HCERTSTORE new;
+     DWORD needed, size;
+     struct enum_root_certs_params params = { NULL, 2048, &needed };
+     HCRYPTPROV prov;
+     HCRYPTHASH hash;
+@@ -684,67 +685,47 @@
+         CertFreeCertificateContext( cert );
+         ++new_count;
+     }
+     CryptMemFree( params.buffer );
+     CryptReleaseContext( prov, 0 );
+ 
+-    if (existing_count < cached_count)
+-    {
+-        /* Some certs were removed on host. Clean up the cache and add all the certificates so cert chains
+-         * get revalidated. The certs present on host are now in 'cached' store and are marked with
+-         * CERT_FIRST_USER_PROP_ID property. */
+-        TRACE( "Some keys were removed, reimporting, cached %u, existing %u, new %u.\n",
+-                cached_count, existing_count, new_count );
+-        *delete = TRUE;
+-        existing_count = 0;
+-        existing = NULL;
+-        while ((existing = CertEnumCertificatesInStore( cached, existing )))
+-        {
+-            if (!CertGetCertificateContextProperty( existing, CERT_FIRST_USER_PROP_ID, NULL, &size ))
+-                continue;
+-            CertAddCertificateContextToStore( new, existing, CERT_STORE_ADD_NEW, NULL );
+-            ++new_count;
+-        }
+-    }
+     if (new_count)
+     {
+         /* Clear custom property so it is not serialized and seen by apps. */
+         cert = NULL;
+         while ((cert = CertEnumCertificatesInStore( new, cert )))
+             CertSetCertificateContextProperty( cert, CERT_FIRST_USER_PROP_ID, 0, NULL );
+         check_and_store_certs( cached, new, store );
+     }
+ 
+     CertCloseStore( new, 0 );
+-    TRACE( "existing %u, new %u.\n", existing_count, new_count );
++    TRACE( "cached_count %u, existing on host %u, new %u.\n", cached_count, existing_count, new_count );
+ }
+ 
+-static HCERTSTORE create_root_store(HCERTSTORE cached, BOOL *delete)
++static HCERTSTORE create_root_store(HCERTSTORE cached)
+ {
+     HCERTSTORE memStore = CertOpenStore(CERT_STORE_PROV_MEMORY,
+      X509_ASN_ENCODING, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
+ 
+ 
+-    *delete = FALSE;
+     if (memStore)
+     {
+         add_ms_root_certs(memStore, cached);
+-        read_trusted_roots_from_known_locations(memStore, cached, delete);
++        read_trusted_roots_from_known_locations(memStore, cached);
+     }
+ 
+     TRACE("returning %p\n", memStore);
+     return memStore;
+ }
+ 
+ void CRYPT_ImportSystemRootCertsToReg(void)
+ {
+     HCERTSTORE store = NULL, reg = NULL;
+     HKEY key = NULL;
+     LONG rc;
+     HANDLE hsem;
+-    BOOL delete;
+ 
+     static BOOL root_certs_imported = FALSE;
+ 
+     if (root_certs_imported)
+         return;
+ 
+@@ -770,19 +751,17 @@
+     {
+         ERR("Failed to create memory store.\n");
+         goto done;
+     }
+     CRYPT_RegReadSerializedFromReg(key, CERT_STORE_CERTIFICATE_CONTEXT_FLAG, reg, CERT_STORE_ADD_ALWAYS);
+ 
+-    if (!(store = create_root_store(reg, &delete)))
++    if (!(store = create_root_store(reg)))
+     {
+         ERR("Failed to create root store\n");
+         goto done;
+     }
+-    if (delete && RegDeleteTreeW(key, NULL))
+-        ERR("Error deleting key.\n");
+     if (!CRYPT_SerializeContextsToReg(key, 0, pCertInterface, store))
+         ERR("Failed to import system certs into registry, %08lx\n", GetLastError());
+ 
+ done:
+     RegCloseKey(key);
+     CertCloseStore(store, 0);
+--- a/dlls/crypt32/store.c
++++ b/dlls/crypt32/store.c
+@@ -931,16 +931,15 @@
+         ret = NULL;
+     else
+         ret = (cert_t*)hcs->vtbl->certs.enumContext(hcs, prev ? &prev->base : NULL);
+     return ret ? &ret->ctx : NULL;
+ }
+ 
+-BOOL WINAPI CertDeleteCertificateFromStore(PCCERT_CONTEXT pCertContext)
++BOOL CRYPT_DeleteCertificateFromStore(PCCERT_CONTEXT pCertContext)
+ {
+     WINECRYPT_CERTSTORE *hcs;
+-
+     TRACE("(%p)\n", pCertContext);
+ 
+     if (!pCertContext)
+         return TRUE;
+ 
+     hcs = pCertContext->hCertStore;
+@@ -948,12 +947,36 @@
+     if (hcs->dwMagic != WINE_CRYPTCERTSTORE_MAGIC)
+         return FALSE;
+ 
+     return hcs->vtbl->certs.delete(hcs, &cert_from_ptr(pCertContext)->base);
+ }
+ 
++BOOL is_bnet(void)
++{
++    static volatile char cache = -1;
++    BOOL ret = cache;
++    if(ret == -1) {
++        const WCHAR *p, *name = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
++        ret = (p = wcsrchr(name, '\\')) && !wcsicmp(p + 1, L"Agent.exe");
++        cache = ret;
++    }
++    return ret;
++}
++
++BOOL WINAPI CertDeleteCertificateFromStore(PCCERT_CONTEXT pCertContext)
++{
++    BOOL ret;
++
++    TRACE("(%p)\n", pCertContext);
++
++    ret = CRYPT_DeleteCertificateFromStore(pCertContext);
++    if (is_bnet())
++        CertFreeCertificateContext(pCertContext);
++    return ret;
++}
++
+ BOOL WINAPI CertAddCRLContextToStore(HCERTSTORE hCertStore,
+  PCCRL_CONTEXT pCrlContext, DWORD dwAddDisposition,
+  PCCRL_CONTEXT* ppStoreContext)
+ {
+     WINECRYPT_CERTSTORE *store = hCertStore;
+     BOOL ret = TRUE;
+--- a/dlls/crypt32/unixlib.c
++++ b/dlls/crypt32/unixlib.c
+@@ -92,13 +92,27 @@
+     else
+     {
+         WARN("Setting GNUTLS_SYSTEM_PRIORITY_FILE to \"/dev/null\".\n");
+         setenv("GNUTLS_SYSTEM_PRIORITY_FILE", "/dev/null", 0);
+     }
+ 
+-    if (!(libgnutls_handle = dlopen( SONAME_LIBGNUTLS, RTLD_NOW )))
++if (1) { /* CROSSOVER HACK - bug 10151 */
++    const char *libgnutls_name_candidates[] = {SONAME_LIBGNUTLS,
++                                               "libgnutls.so.30",
++                                               "libgnutls.so.28",
++                                               "libgnutls-deb0.so.28",
++                                               "libgnutls.so.26",
++                                               NULL};
++    int i;
++    for (i=0; libgnutls_name_candidates[i] && !libgnutls_handle; i++)
++        libgnutls_handle = dlopen(libgnutls_name_candidates[i], RTLD_NOW);
++}
++else
++    libgnutls_handle = dlopen( SONAME_LIBGNUTLS, RTLD_NOW );
++
++    if (!libgnutls_handle)
+     {
+         ERR_(winediag)( "failed to load libgnutls, no support for pfx import/export\n" );
+         return STATUS_DLL_NOT_FOUND;
+     }
+ 
+ #define LOAD_FUNCPTR(f) \

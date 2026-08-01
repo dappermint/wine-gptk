@@ -1,0 +1,377 @@
+--- a/include/appmodel.h
++++ b/include/appmodel.h
+@@ -19,12 +19,15 @@
+ #define _APPMODEL_H_
+ 
+ #if defined(__cplusplus)
+ extern "C" {
+ #endif
+ 
++#define APPLICATION_USER_MODEL_ID_MAX_LENGTH 130
++#define APPLICATION_USER_MODEL_ID_MIN_LENGTH 21
++
+ typedef enum AppPolicyMediaFoundationCodecLoading
+ {
+     AppPolicyMediaFoundationCodecLoading_All       = 0,
+     AppPolicyMediaFoundationCodecLoading_InboxOnly = 1,
+ } AppPolicyMediaFoundationCodecLoading;
+ 
+--- a/include/config.h.in
++++ b/include/config.h.in
+@@ -18,12 +18,15 @@
+ /* Define to 1 if you have the <asm/types.h> header file. */
+ #undef HAVE_ASM_TYPES_H
+ 
+ /* Define to 1 if you have the <asm/user.h> header file. */
+ #undef HAVE_ASM_USER_H
+ 
++/* Define to 1 if you have the <AVFoundation/AVFoundation.h> header file. */
++#undef HAVE_AVFOUNDATION_AVFOUNDATION_H
++
+ /* Define to 1 if you have the <capi20.h> header file. */
+ #undef HAVE_CAPI20_H
+ 
+ /* Define to 1 if you have the 'clock_gettime' function. */
+ #undef HAVE_CLOCK_GETTIME
+ 
+@@ -107,12 +110,18 @@
+ 
+ /* Define to 1 if you have the <ifaddrs.h> header file. */
+ #undef HAVE_IFADDRS_H
+ 
+ /* Define to 1 if you have the <inttypes.h> header file. */
+ #undef HAVE_INTTYPES_H
++
++/* Define to 1 if you have the <IOKit/usb/IOUSBLib.h> header file. */
++#undef HAVE_IOKIT_USB_IOUSBLIB_H
++
++/* Define to 1 if you have the 'IOServiceMatching' function. */
++#undef HAVE_IOSERVICEMATCHING
+ 
+ /* Define to 1 if you have the 'kqueue' function. */
+ #undef HAVE_KQUEUE
+ 
+ /* Define to 1 if you have the <krb5/krb5.h> header file. */
+ #undef HAVE_KRB5_KRB5_H
+@@ -318,12 +327,15 @@
+ /* Define to 1 if you have the 'posix_fadvise' function. */
+ #undef HAVE_POSIX_FADVISE
+ 
+ /* Define to 1 if you have the 'posix_fallocate' function. */
+ #undef HAVE_POSIX_FALLOCATE
+ 
++/* Define to 1 if you have the 'ppoll' function. */
++#undef HAVE_PPOLL
++
+ /* Define to 1 if you have the 'prctl' function. */
+ #undef HAVE_PRCTL
+ 
+ /* Define to 1 if you have the 'pthread_getthreadid_np' function. */
+ #undef HAVE_PTHREAD_GETTHREADID_NP
+ 
+@@ -378,12 +390,15 @@
+ /* Define to 1 if you have the 'setprogname' function. */
+ #undef HAVE_SETPROGNAME
+ 
+ /* Define to 1 if 'interface_id' is a member of 'sg_io_hdr_t'. */
+ #undef HAVE_SG_IO_HDR_T_INTERFACE_ID
+ 
++/* Define to 1 if you have the `shm_open' function. */
++#undef HAVE_SHM_OPEN
++
+ /* Define to 1 if 'si_fd' is a member of 'siginfo_t'. */
+ #undef HAVE_SIGINFO_T_SI_FD
+ 
+ /* Define to 1 if you have the 'sigprocmask' function. */
+ #undef HAVE_SIGPROCMASK
+ 
+@@ -506,12 +521,15 @@
+ 
+ /* Define to 1 if you have the <sys/conf.h> header file. */
+ #undef HAVE_SYS_CONF_H
+ 
+ /* Define to 1 if you have the <sys/epoll.h> header file. */
+ #undef HAVE_SYS_EPOLL_H
++
++/* Define to 1 if you have the <sys/eventfd.h> header file. */
++#undef HAVE_SYS_EVENTFD_H
+ 
+ /* Define to 1 if you have the <sys/event.h> header file. */
+ #undef HAVE_SYS_EVENT_H
+ 
+ /* Define to 1 if you have the <sys/extattr.h> header file. */
+ #undef HAVE_SYS_EXTATTR_H
+--- a/include/docobjectservice.idl
++++ b/include/docobjectservice.idl
+@@ -14,29 +14,31 @@
+  * You should have received a copy of the GNU Lesser General Public
+  * License along with this library; if not, write to the Free Software
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
+ import "objidl.idl";
++#ifndef NO_MSHTML_IMPORT
+ import "mshtml.idl";
++#endif
+ 
+ [
+-    local,
++ /* local, CXHACK 15579 */
+     object,
+     uuid(3050f801-98b5-11cf-bb82-00aa00bdce0b)
+ ]
+ interface IDocObjectService : IUnknown
+ {
+     HRESULT FireBeforeNavigate2(
+-            [in] IDispatch *pDispatch,
+-            [in] LPCWSTR lpszUrl,
++            [in, optional] IDispatch *pDispatch,
++            [in, string, unique] LPCWSTR lpszUrl,
+             [in] DWORD dwFlags,
+-            [in] LPCWSTR lpszFrameName,
+-            [in] BYTE *pPostData,
++            [in, string, unique] LPCWSTR lpszFrameName,
++            [in, unique, size_is(cbPostData)] BYTE *pPostData,
+             [in] DWORD cbPostData,
+-            [in] LPCWSTR lpszHeaders,
++            [in, string, unique] LPCWSTR lpszHeaders,
+             [in] BOOL fPlayNavSound,
+             [out] BOOL *pfCancel);
+ 
+     HRESULT FireNavigateComplete2(
+             [in] IHTMLWindow2 *pHTMLWindow2,
+             [in] DWORD dwFlags);
+--- a/include/mshtmhst.idl
++++ b/include/mshtmhst.idl
+@@ -160,13 +160,13 @@
+ } DOCHOSTUIFLAG;
+ 
+ [
+     object,
+     uuid(BD3F23C0-D43E-11CF-893B-00AA00BDCE1A),
+     pointer_default(unique),
+-    local
++ /* local, CXHACK 15579 */
+ ]
+ interface IDocHostUIHandler : IUnknown
+ {
+     typedef struct _DOCHOSTUIINFO
+     {
+         ULONG cbSize;
+@@ -234,13 +234,13 @@
+ cpp_quote("DEFINE_GUID(CGID_DocHostCommandHandler,0xf38bc242,0xb950,0x11d1,0x89,0x18,0x00,0xc0,0x4f,0xc2,0xc8,0x36);")
+ 
+ [
+     object,
+     uuid(3050F6D0-98b5-11CF-BB82-00AA00BDCE0B),
+     pointer_default(unique),
+-    local
++ /* local, CXHACK 15579 */
+ ]
+ interface IDocHostUIHandler2 : IDocHostUIHandler
+ {
+     HRESULT GetOverrideKeyPath(
+         [out] LPOLESTR *pchKey,
+         [in] DWORD dw);
+@@ -250,13 +250,13 @@
+  *    ICustomDoc interface
+  */
+ [
+     object,
+     uuid(3050f3f0-98b5-11cf-bb82-00aa00bdce0b),
+     pointer_default(unique),
+-    local
++ /* local, CXHACK 15579 */
+ ]
+ interface ICustomDoc : IUnknown
+ {
+     HRESULT SetUIHandler([in] IDocHostUIHandler *pUIHandler);
+ }
+ 
+--- a/include/mshtml.idl
++++ b/include/mshtml.idl
+@@ -30350,39 +30350,43 @@
+         [in] IElementBehaviorSite *pSite,
+         [out] IElementBehavior **ppBehavior);
+ }
+ 
+ } /* library MSHTML */
+ 
++#ifdef MSHTML_MARSHALING_HACK
++#define IOleCommandTarget IUnknown
++#else
+ interface IOleCommandTarget;
++#endif
+ 
+ /*****************************************************************************
+  *    IHTMLPrivateWindow interface
+  */
+ [
+     object,
+     uuid(3050f6dc-98b5-11cf-bb82-00aa00bdce0b),
+-    local
++ /* local, CXHACK 15579 */
+ ]
+ interface IHTMLPrivateWindow : IUnknown
+ {
+     HRESULT SuperNavigate(BSTR url, BSTR arg2, BSTR arg3, BSTR arg4, VARIANT *post_data, VARIANT *headers, ULONG flags);
+     HRESULT GetPendingUrl(BSTR *url);
+     HRESULT SetPICSTarget(IOleCommandTarget *cmdtrg);
+     HRESULT PICSComplete(int arg);
+     HRESULT FindWindowByName(LPCWSTR name, IHTMLWindow2 **ret);
+-    HRESULT GetAddressBarUrl(BSTR *url);
++    HRESULT GetAddressBarUrl([out, retval] BSTR *url);
+ }
+ 
+ /*****************************************************************************
+  *    IWebBrowserPriv interface
+  */
+ [
+     object,
+     uuid(3050f804-98b5-11cf-bb82-00aa00bdce0b),
+-    local
++ /* local, CXHACK 15579 */
+ ]
+ interface IWebBrowserPriv : IUnknown
+ {
+     HRESULT NavigateWithBindCtx(VARIANT *uri, VARIANT *flags, VARIANT *target_frame, VARIANT *post_data,
+             VARIANT *headers, IBindCtx *bind_ctx, LPOLESTR url_fragment);
+     HRESULT OnClose();
+@@ -30391,13 +30395,13 @@
+ /*****************************************************************************
+  *    IWebBrowserPriv2IE8 interface
+  */
+ [
+     object,
+     uuid(3ed72303-6ffc-4214-ba90-faf1862dec8a),
+-    local
++ /* local, CXHACK 15579 */
+ ]
+ interface IWebBrowserPriv2IE8 : IUnknown
+ {
+   HRESULT NavigateWithBindCtx2(IUri *uri, VARIANT *flags, VARIANT *target_frame, VARIANT *post_data,
+           VARIANT *headers, IBindCtx *bind_ctx, LPOLESTR url_fragment);
+   HRESULT SetBrowserFrameOptions(DWORD opt1, DWORD opt2);
+@@ -30413,14 +30417,18 @@
+ /*****************************************************************************
+  *    IWebBrowserPriv2IE9 interface
+  */
+ [
+     object,
+     uuid(3ed72303-6ffc-4214-ba90-faf1862dec8a),
+-    local
++ /* local, CXHACK 15579 */
+ ]
+ interface IWebBrowserPriv2IE9 : IUnknown
+ {
+     HRESULT NavigateWithBindCtx2(IUri *uri, VARIANT *flags, VARIANT *target_frame, VARIANT *post_data,
+             VARIANT *headers, IBindCtx *bind_ctx, LPOLESTR url_fragment, DWORD unused);
+     /* Probably more */
+ }
++
++#ifdef MSHTML_MARSHALING_HACK
++#undef IOleCommandTarget
++#endif
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -594,12 +594,21 @@
+ /* NtUserAssociateInputContext result */
+ enum associate_input_context_result
+ {
+     AICR_OK,
+     AICR_FOCUS_CHANGED,
+     AICR_FAILED,
++};
++
++/* CX HACK 23950 */
++struct flush_shm_surface_params
++{
++    BITMAPINFO info;
++    RECT bounds;
++    ULONG section;
++    ULONG hwnd;
+ };
+ 
+ /* internal messages codes */
+ enum wine_internal_message
+ {
+     WM_WINE_DESTROYWINDOW = 0x80000000,
+@@ -611,12 +620,13 @@
+     WM_WINE_SETACTIVEWINDOW,
+     WM_WINE_KEYBOARD_LL_HOOK,
+     WM_WINE_MOUSE_LL_HOOK,
+     WM_WINE_IME_NOTIFY,
+     WM_WINE_WINDOW_STATE_CHANGED,
+     WM_WINE_UPDATEWINDOWSTATE,
++    WM_WINE_FLUSHSHMSURFACE, /* CX HACK 23950 */
+     WM_WINE_FIRST_DRIVER_MSG = 0x80001000,  /* range of messages reserved for the USER driver */
+     WM_WINE_CLIPCURSOR = 0x80001ff0, /* internal driver notification messages */
+     WM_WINE_SETCURSOR,
+     WM_WINE_DESKTOP_RESIZED,
+     WM_WINE_LAST_DRIVER_MSG = 0x80001fff
+ };
+--- a/include/shdeprecated.idl
++++ b/include/shdeprecated.idl
+@@ -183,13 +183,13 @@
+ cpp_quote("#define SHHLNF_WRITENOHISTORY            0x08000000")
+ cpp_quote("#define HLNF_EXTERNALNAVIGATE            0x10000000")
+ cpp_quote("#define HLNF_ALLOW_AUTONAVIGATE          0x20000000")
+ cpp_quote("#define HLNF_NEWWINDOWSMANAGED           0x80000000")
+ 
+ [
+-    local,
++ /* local, CXHACK 15579 */
+     object,
+     uuid(02ba3b52-0547-11d1-b833-00c04fc9b31f)
+ ]
+ interface IBrowserService : IUnknown
+ {
+     HRESULT GetParentSite(
+@@ -217,13 +217,13 @@
+     HRESULT IsControlWindowShown(
+         [in] UINT id,
+         [out] BOOL *pfShown);
+ 
+     HRESULT IEGetDisplayName(
+         [in] PCIDLIST_ABSOLUTE pidl,
+-        [out, size_is(INTERNET_MAX_URL_LENGTH)] LPWSTR pwszName,
++        [out, size_is(300)] LPWSTR pwszName,
+         [in] UINT uFlags);
+ 
+     HRESULT IEParseDisplayName(
+         [in] UINT uiCP,
+         [in] LPCWSTR pwszPath,
+         [out] PIDLIST_ABSOLUTE *ppidlOut);
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -5844,13 +5844,12 @@
+     obj_handle_t handle;
+ };
+ struct resume_process_reply
+ {
+     struct reply_header __header;
+ };
+-
+ 
+ 
+ struct get_next_thread_request
+ {
+     struct request_header __header;
+     obj_handle_t process;
+--- a/include/wine/wgl_driver.h
++++ b/include/wine/wgl_driver.h
+@@ -4,13 +4,13 @@
+ #define __WINE_WGL_DRIVER_H
+ 
+ #ifndef WINE_GLAPI
+ #define WINE_GLAPI
+ #endif
+ 
+-#define WINE_WGL_DRIVER_VERSION 28
++#define WINE_WGL_DRIVER_VERSION 27
+ 
+ struct wgl_context;
+ struct wgl_pbuffer;
+ 
+ struct wgl_pixel_format
+ {

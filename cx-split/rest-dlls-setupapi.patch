@@ -1,0 +1,27 @@
+--- a/dlls/setupapi/install.c
++++ b/dlls/setupapi/install.c
+@@ -1108,19 +1108,17 @@
+                                          PSP_FILE_CALLBACK_W callback, PVOID context,
+                                          HDEVINFO devinfo, PSP_DEVINFO_DATA devinfo_data )
+ {
+     BOOL ret;
+     int i;
+ 
+-    if (flags & SPINST_REGSVR)
+-    {
+-        if (iterate_section_fields( hinf, section, L"WineFakeDlls", fake_dlls_callback, NULL ))
+-            cleanup_fake_dlls();
+-        else
+-            return FALSE;
+-    }
++    if (iterate_section_fields( hinf, section, L"WineFakeDlls", fake_dlls_callback, NULL ))
++        cleanup_fake_dlls();
++    else
++        return FALSE;
++
+     if (flags & SPINST_FILES)
+     {
+         HSPFILEQ queue;
+ 
+         if (!(queue = SetupOpenFileQueue())) return FALSE;
+         ret = (SetupInstallFilesFromInfSectionW( hinf, NULL, queue, section, src_root, copy_flags ) &&

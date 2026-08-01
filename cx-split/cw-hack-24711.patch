@@ -1,0 +1,72 @@
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -1214,12 +1214,18 @@
+     if (sysctlbyname("hw.packages", &pkgs_no, &size, NULL, 0))
+         pkgs_no = 1;
+ 
+     size = sizeof(cores_no);
+     if (sysctlbyname("hw.physicalcpu", &cores_no, &size, NULL, 0))
+         cores_no = lcpu_no;
++
++    /* CW HACK 24711: allow restricting the number of processors through an environment variable.
++     * Don't report more packages or physical cores than logical cores.
++     */
++    pkgs_no = MIN(pkgs_no, lcpu_no);
++    cores_no = MIN(cores_no, lcpu_no);
+ 
+     TRACE("%u logical CPUs from %u physical cores across %u packages\n",
+             lcpu_no, cores_no, pkgs_no);
+ 
+     lcpu_per_core = lcpu_no / cores_no;
+     cores_per_package = cores_no / pkgs_no;
+@@ -1277,12 +1283,20 @@
+     else
+     {
+         /* in cache[], indexes 1 and 2 are l1 caches */
+         cache_sharing[4] = cache_sharing[3];
+         cache_sharing[3] = cache_sharing[2];
+         cache_sharing[2] = cache_sharing[1];
++
++        /* CW HACK 24711: allow restricting the number of processors through an environment variable
++         * The number of processors (logical cores) needs to be divisible by the number of logical
++         * cores sharing a cache.
++         */
++        if (cache_sharing[4] && (lcpu_no % cache_sharing[4])) cache_sharing[4] = 1;
++        if (cache_sharing[3] && (lcpu_no % cache_sharing[3])) cache_sharing[3] = 1;
++        if (cache_sharing[2] && (lcpu_no % cache_sharing[2])) cache_sharing[2] = 1;
+     }
+ 
+     for(p = 0; p < pkgs_no; ++p)
+     {
+         for(j = 0; j < cores_per_package && p * cores_per_package + j < cores_no; ++j)
+         {
+@@ -1398,12 +1412,29 @@
+         WARN("Failed to detect the number of processors.\n");
+     }
+ #else
+     num = 1;
+     FIXME("Detecting the number of processors is not supported.\n");
+ #endif
++
++#if defined(__APPLE__)
++    /* CW HACK 24711: allow restricting the number of processors through an environment variable */
++    {
++        const char *ncpu = getenv("WINENCPU");
++        if (ncpu)
++        {
++            long num_override = atoi(ncpu);
++            if (num_override > 0 && num_override < num)
++            {
++                num = num_override;
++                WARN("Restricting number of processors to %ld.\n", num);
++            }
++        }
++    }
++#endif
++
+     peb->NumberOfProcessors = cpu_info.MaximumProcessors = num;
+     get_cpuinfo( &cpu_info );
+     TRACE( "<- CPU arch %d, level %d, rev %d, features 0x%x\n",
+            (int)cpu_info.ProcessorArchitecture, (int)cpu_info.ProcessorLevel,
+            (int)cpu_info.ProcessorRevision, (int)cpu_info.ProcessorFeatureBits );
+ 

@@ -1,0 +1,3000 @@
+--- a/dlls/kernel32/tests/sync.c
++++ b/dlls/kernel32/tests/sync.c
+@@ -266,13 +282,14 @@
+         ok(wait_ret == WAIT_OBJECT_0, "WaitForSingleObject failed with error 0x%08lx\n", wait_ret);
+     }
+ 
+     SetLastError(0xdeadbeef);
+     hOpened = OpenMutexA(GENERIC_READ | GENERIC_WRITE, FALSE, "WineTestMutex");
+     ok(hOpened != NULL, "OpenMutex failed with error %ld\n", GetLastError());
+-    wait_ret = WaitForSingleObject(hOpened, INFINITE);
++    wait_ret = WaitForSingleObject(hOpened, 0);
++todo_wine_if(getenv("WINEESYNC"))   /* XFAIL: validation is not implemented */
+     ok(wait_ret == WAIT_FAILED, "WaitForSingleObject succeeded\n");
+     CloseHandle(hOpened);
+ 
+     for (i = 0; i < 32; i++)
+     {
+         SetLastError(0xdeadbeef);
+@@ -297,12 +314,13 @@
+ 
+     todo_wine
+     ok( failed == 0x0de0fffe, "open succeeded when it shouldn't: %lx\n", failed);
+ 
+     SetLastError(0xdeadbeef);
+     ret = ReleaseMutex(hCreated);
++todo_wine_if(getenv("WINEESYNC"))   /* XFAIL: due to the above */
+     ok(!ret && (GetLastError() == ERROR_NOT_OWNER),
+         "ReleaseMutex should have failed with ERROR_NOT_OWNER instead of %ld\n", GetLastError());
+ 
+     /* test case sensitivity */
+ 
+     SetLastError(0xdeadbeef);
+--- a/dlls/ntdll/Makefile.in
++++ b/dlls/ntdll/Makefile.in
+@@ -45,13 +45,15 @@
+ 	thread.c \
+ 	threadpool.c \
+ 	time.c \
+ 	unix/cdrom.c \
+ 	unix/debug.c \
+ 	unix/env.c \
++	unix/esync.c \
+ 	unix/file.c \
++	unix/msync.c \
+ 	unix/loader.c \
+ 	unix/loadorder.c \
+ 	unix/process.c \
+ 	unix/registry.c \
+ 	unix/security.c \
+ 	unix/serial.c \
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -87,12 +87,14 @@
+ #include "winnt.h"
+ #include "winbase.h"
+ #include "winnls.h"
+ #include "winioctl.h"
+ #include "winternl.h"
+ #include "unix_private.h"
++#include "esync.h"
++#include "msync.h"
+ #include "wine/list.h"
+ #include "ntsyscalls.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(module);
+ 
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -76,12 +76,14 @@
+ #include "windef.h"
+ #include "winnt.h"
+ #include "winioctl.h"
+ #include "wine/server.h"
+ #include "wine/debug.h"
+ #include "unix_private.h"
++#include "esync.h"
++#include "msync.h"
+ #include "ddk/wdm.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(server);
+ 
+ #ifndef MSG_CMSG_CLOEXEC
+ #define MSG_CMSG_CLOEXEC 0
+@@ -1867,12 +1908,18 @@
+     server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+ 
+     /* always remove the cached fd; if the server request fails we'll just
+      * retrieve it again */
+     fd = remove_fd_from_cache( handle );
+ 
++    if (do_msync())
++        msync_close( handle );
++
++    if (do_esync())
++        esync_close( handle );
++
+     SERVER_START_REQ( close_handle )
+     {
+         req->handle = wine_server_obj_handle( handle );
+         ret = wine_server_call( req );
+     }
+     SERVER_END_REQ;
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -63,12 +63,14 @@
+ #include "windef.h"
+ #include "winternl.h"
+ #include "ddk/wdm.h"
+ #include "wine/server.h"
+ #include "wine/debug.h"
+ #include "unix_private.h"
++#include "esync.h"
++#include "msync.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(sync);
+ 
+ HANDLE keyed_event = 0;
+ 
+ static const char *debugstr_timeout( const LARGE_INTEGER *timeout )
+@@ -301,23 +303,29 @@
+ }
+ 
+ 
+ /******************************************************************************
+  *              NtCreateSemaphore (NTDLL.@)
+  */
+-NTSTATUS WINAPI NtCreateSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
+-                                   LONG initial, LONG max )
++NTSTATUS WINAPI GPT_IMPORT(NtCreateSemaphore)( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
++                                               LONG initial, LONG max )
+ {
+     unsigned int ret;
+     data_size_t len;
+     struct object_attributes *objattr;
+ 
+     *handle = 0;
+     if (max <= 0 || initial < 0 || initial > max) return STATUS_INVALID_PARAMETER;
+     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
++
++    if (do_msync())
++        return msync_create_semaphore( handle, access, attr, initial, max );
+ 
++    if (do_esync())
++        return esync_create_semaphore( handle, access, attr, initial, max );
++
+     SERVER_START_REQ( create_semaphore )
+     {
+         req->access  = access;
+         req->initial = initial;
+         req->max     = max;
+         wine_server_add_data( req, objattr, len );
+@@ -372,12 +399,18 @@
+         FIXME("(%p,%d,%u) Unknown class\n", handle, class, (int)len);
+         return STATUS_INVALID_INFO_CLASS;
+     }
+ 
+     if (len != sizeof(SEMAPHORE_BASIC_INFORMATION)) return STATUS_INFO_LENGTH_MISMATCH;
+ 
++    if (do_msync())
++        return msync_query_semaphore( handle, info, ret_len );
++
++    if (do_esync())
++        return esync_query_semaphore( handle, info, ret_len );
++
+     SERVER_START_REQ( query_semaphore )
+     {
+         req->handle = wine_server_obj_handle( handle );
+         if (!(ret = wine_server_call( req )))
+         {
+             out->CurrentCount = reply->current;
+@@ -390,16 +423,22 @@
+ }
+ 
+ 
+ /******************************************************************************
+  *              NtReleaseSemaphore (NTDLL.@)
+  */
+-NTSTATUS WINAPI NtReleaseSemaphore( HANDLE handle, ULONG count, ULONG *previous )
++NTSTATUS WINAPI GPT_IMPORT(NtReleaseSemaphore)( HANDLE handle, ULONG count, ULONG *previous )
+ {
+     unsigned int ret;
+ 
++    if (do_msync())
++        return msync_release_semaphore( handle, count, previous );
++
++    if (do_esync())
++        return esync_release_semaphore( handle, count, previous );
++
+     SERVER_START_REQ( release_semaphore )
+     {
+         req->handle = wine_server_obj_handle( handle );
+         req->count  = count;
+         if (!(ret = wine_server_call( req )))
+         {
+@@ -549,12 +690,18 @@
+         FIXME("(%p, %d, %d) Unknown class\n", handle, class, (int)len);
+         return STATUS_INVALID_INFO_CLASS;
+     }
+ 
+     if (len != sizeof(EVENT_BASIC_INFORMATION)) return STATUS_INFO_LENGTH_MISMATCH;
+ 
++    if (do_msync())
++        return msync_query_event( handle, info, ret_len );
++
++    if (do_esync())
++        return esync_query_event( handle, info, ret_len );
++
+     SERVER_START_REQ( query_event )
+     {
+         req->handle = wine_server_obj_handle( handle );
+         if (!(ret = wine_server_call( req )))
+         {
+             out->EventType  = reply->manual_reset ? NotificationEvent : SynchronizationEvent;
+@@ -575,12 +722,19 @@
+ {
+     unsigned int ret;
+     data_size_t len;
+     struct object_attributes *objattr;
+ 
+     *handle = 0;
++
++    if (do_msync())
++        return msync_create_mutex( handle, access, attr, owned );
++
++    if (do_esync())
++        return esync_create_mutex( handle, access, attr, owned );
++
+     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
+ 
+     SERVER_START_REQ( create_mutex )
+     {
+         req->access  = access;
+         req->owned   = owned;
+@@ -602,12 +756,18 @@
+ {
+     unsigned int ret;
+ 
+     *handle = 0;
+     if ((ret = validate_open_object_attributes( attr ))) return ret;
+ 
++    if (do_msync())
++        return msync_open_mutex( handle, access, attr );
++
++    if (do_esync())
++        return esync_open_mutex( handle, access, attr );
++
+     SERVER_START_REQ( open_mutex )
+     {
+         req->access  = access;
+         req->attributes = attr->Attributes;
+         req->rootdir = wine_server_obj_handle( attr->RootDirectory );
+         if (attr->ObjectName)
+@@ -624,12 +784,18 @@
+  *              NtReleaseMutant (NTDLL.@)
+  */
+ NTSTATUS WINAPI NtReleaseMutant( HANDLE handle, LONG *prev_count )
+ {
+     unsigned int ret;
+ 
++    if (do_msync())
++        return msync_release_mutex( handle, prev_count );
++
++    if (do_esync())
++        return esync_release_mutex( handle, prev_count );
++
+     SERVER_START_REQ( release_mutex )
+     {
+         req->handle = wine_server_obj_handle( handle );
+         ret = wine_server_call( req );
+         if (prev_count) *prev_count = 1 - reply->prev_count;
+     }
+@@ -654,12 +820,18 @@
+         FIXME( "(%p, %d, %d) Unknown class\n", handle, class, (int)len );
+         return STATUS_INVALID_INFO_CLASS;
+     }
+ 
+     if (len != sizeof(MUTANT_BASIC_INFORMATION)) return STATUS_INFO_LENGTH_MISMATCH;
+ 
++    if (do_msync())
++        return msync_query_mutex( handle, info, ret_len );
++
++    if (do_esync())
++        return esync_query_mutex( handle, info, ret_len );
++
+     SERVER_START_REQ( query_mutex )
+     {
+         req->handle = wine_server_obj_handle( handle );
+         if (!(ret = wine_server_call( req )))
+         {
+             out->CurrentCount   = 1 - reply->count;
+@@ -1573,13 +1745,27 @@
+                                           BOOLEAN alertable, const LARGE_INTEGER *timeout )
+ {
+     union select_op select_op;
+     UINT i, flags = SELECT_INTERRUPTIBLE;
+ 
+     if (!count || count > MAXIMUM_WAIT_OBJECTS) return STATUS_INVALID_PARAMETER_1;
++
++    if (do_msync())
++    {
++        NTSTATUS ret = msync_wait_objects( count, handles, wait_any, alertable, timeout );
++        if (ret != STATUS_NOT_IMPLEMENTED)
++            return ret;
++    }
+ 
++    if (do_esync())
++    {
++        NTSTATUS ret = esync_wait_objects( count, handles, wait_any, alertable, timeout );
++        if (ret != STATUS_NOT_IMPLEMENTED)
++            return ret;
++    }
++
+     if (alertable) flags |= SELECT_ALERTABLE;
+     select_op.wait.op = wait_any ? SELECT_WAIT : SELECT_WAIT_ALL;
+     for (i = 0; i < count; i++) select_op.wait.handles[i] = wine_server_obj_handle( handles[i] );
+     return server_wait( &select_op, offsetof( union select_op, wait.handles[count] ), flags, timeout );
+ }
+ 
+@@ -1598,12 +1784,18 @@
+  */
+ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
+                                                 BOOLEAN alertable, const LARGE_INTEGER *timeout )
+ {
+     union select_op select_op;
+     UINT flags = SELECT_INTERRUPTIBLE;
++
++    if (do_msync())
++        return msync_signal_and_wait( signal, wait, alertable, timeout );
++
++    if (do_esync())
++        return esync_signal_and_wait( signal, wait, alertable, timeout );
+ 
+     if (!signal) return STATUS_INVALID_HANDLE;
+ 
+     if (alertable) flags |= SELECT_ALERTABLE;
+     select_op.signal_and_wait.op = SELECT_SIGNAL_AND_WAIT;
+     select_op.signal_and_wait.wait = wine_server_obj_handle( wait );
+@@ -1639,14 +1831,24 @@
+ /******************************************************************
+  *		NtDelayExecution (NTDLL.@)
+  */
+ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeout )
+ {
+     /* if alertable, we need to query the server */
+-    if (alertable) return server_wait( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, timeout );
++    if (alertable)
++    {
++        if (do_msync())
++        {
++            NTSTATUS ret = msync_wait_objects( 0, NULL, TRUE, TRUE, timeout );
++            if (ret != STATUS_NOT_IMPLEMENTED)
++                return ret;
++        }
+ 
++        return server_wait( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, timeout );
++    }
++
+     if (!timeout || timeout->QuadPart == TIMEOUT_INFINITE)  /* sleep forever */
+     {
+         for (;;) select( 0, NULL, NULL, NULL, NULL );
+     }
+     else
+     {
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -100,12 +100,15 @@
+ 
+ /* thread private data, stored in NtCurrentTeb()->GdiTebBatch */
+ struct ntdll_thread_data
+ {
+     void              *cpu_data[16];  /* reserved for CPU-specific data */
+     void              *kernel_stack;  /* stack for thread startup and kernel syscalls */
++    int                esync_apc_fd;  /* fd to wait on for user APCs */
++    int               *msync_apc_addr;
++    unsigned int       msync_apc_idx;
+     int                request_fd;    /* fd for sending server requests */
+     int                reply_fd;      /* fd for receiving server replies */
+     int                wait_fd[2];    /* fd for sleeping server requests */
+     BOOL               allow_writes;  /* ThreadAllowWrites flags */
+     pthread_t          pthread_id;    /* pthread thread id */
+     struct list        entry;         /* entry in TEB list */
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -3682,12 +3725,15 @@
+     teb->Tib.StackBase = (void *)~0ul;
+     teb->ActivationContextStackPointer = &teb->ActivationContextStack;
+     InitializeListHead( &teb->ActivationContextStack.FrameListCache );
+     teb->StaticUnicodeString.Buffer = teb->StaticUnicodeBuffer;
+     teb->StaticUnicodeString.MaximumLength = sizeof(teb->StaticUnicodeBuffer);
+     thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
++    thread_data->esync_apc_fd = -1;
++    thread_data->msync_apc_addr = NULL;
++    thread_data->msync_apc_idx = 0;
+     thread_data->request_fd = -1;
+     thread_data->reply_fd   = -1;
+     thread_data->wait_fd[0] = -1;
+     thread_data->wait_fd[1] = -1;
+     list_add_head( &teb_list, &thread_data->entry );
+     return teb;
+--- a/dlls/opengl32/make_opengl
++++ b/dlls/opengl32/make_opengl
+@@ -194,12 +194,13 @@
+     (
+      "glClientWaitSync" => 1,
+      "glDeleteSync" => 1,
+      "glFenceSync" => 1,
+      "glGetBufferPointerv" => 1,
+      "glGetBufferPointervARB" => 1,
++     "glGetError" => 1,
+      "glGetNamedBufferPointerv" => 1,
+      "glGetNamedBufferPointervEXT" => 1,
+      "glGetString" => 1,
+      "glGetStringi" => 1,
+      "glGetSynciv" => 1,
+      "glIsSync" => 1,
+--- a/dlls/opengl32/unix_thunks.c
++++ b/dlls/opengl32/unix_thunks.c
+@@ -92258,12 +92220,14 @@
+ }
+ 
+ extern NTSTATUS wow64_wgl_wglCreateContext( void *args );
+ extern NTSTATUS wow64_wgl_wglDeleteContext( void *args );
+ extern NTSTATUS wow64_wgl_wglGetProcAddress( void *args );
+ extern NTSTATUS wow64_wgl_wglMakeCurrent( void *args );
++extern NTSTATUS wow64_wgl_wglShareLists( void *args );
++extern NTSTATUS wow64_gl_glGetError( void *args );
+ extern NTSTATUS wow64_gl_glGetString( void *args );
+ extern NTSTATUS wow64_ext_glClientWaitSync( void *args );
+ extern NTSTATUS wow64_ext_glDeleteSync( void *args );
+ extern NTSTATUS wow64_ext_glFenceSync( void *args );
+ extern NTSTATUS wow64_ext_glGetBufferPointerv( void *args );
+ extern NTSTATUS wow64_ext_glGetBufferPointervARB( void *args );
+--- a/dlls/winemac.drv/keyboard.c
++++ b/dlls/winemac.drv/keyboard.c
+@@ -1162,12 +1162,182 @@
+ 
+     macdrv_compute_keyboard_layout(thread_data);
+ 
+     NtUserActivateKeyboardLayout(thread_data->active_keyboard_layout, 0);
+ 
+     send_message(get_active_window(), WM_CANCELMODE, 0, 0);
++}
++
++
++/* CrossOver Hack 10912: Mac Edit menu */
++static WORD vkey_to_scan(WORD vkey)
++{
++    struct macdrv_thread_data *thread_data = macdrv_init_thread_data();
++    int keyc;
++
++    for (keyc = 0; keyc < sizeof(thread_data->keyc2vkey)/sizeof(thread_data->keyc2vkey[0]); keyc++)
++    {
++        if (thread_data->keyc2vkey[keyc] == vkey)
++            return thread_data->keyc2scan[keyc];
++    }
++
++    return 0;
++}
++
++/***********************************************************************
++ *              macdrv_edit_menu_command
++ */
++void macdrv_edit_menu_command(const macdrv_event *event)
++{
++    HWND hwnd = macdrv_get_window_hwnd(event->window);
++
++    TRACE("hwnd %p command %d\n", hwnd, event->edit_menu_command.command);
++
++    if (mac_edit_menu == MAC_EDIT_MENU_DISABLED)
++    {
++        WARN("edit menu disabled, shouldn't be here\n");
++        return;
++    }
++
++    if (mac_edit_menu == MAC_EDIT_MENU_BY_KEY)
++    {
++        WORD key_vkey, key_scan;
++        BOOL left_alt_down, right_alt_down, control_down, need_control = TRUE;
++        WORD left_alt_scan, right_alt_scan, control_scan;
++        DWORD flags;
++
++        switch (event->edit_menu_command.command)
++        {
++            case EDIT_COMMAND_COPY:         key_vkey = 'C'; break;
++            case EDIT_COMMAND_CUT:          key_vkey = 'X'; break;
++            case EDIT_COMMAND_DELETE:       key_vkey = VK_BACK; need_control = FALSE; break;
++            case EDIT_COMMAND_PASTE:        key_vkey = 'V'; break;
++            case EDIT_COMMAND_SELECT_ALL:   key_vkey = 'A'; break;
++            case EDIT_COMMAND_UNDO:         key_vkey = 'Z'; break;
++            default:
++                WARN("unrecognized edit command %d\n", event->edit_menu_command.command);
++                return;
++        }
++        key_scan = vkey_to_scan(key_vkey);
++
++        left_alt_down = (NtUserGetAsyncKeyState(VK_LMENU) & 0x8000) != 0;
++        right_alt_down = (NtUserGetAsyncKeyState(VK_RMENU) & 0x8000) != 0;
++        if (need_control)
++            control_down = (NtUserGetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
++
++        if (left_alt_down)
++            left_alt_scan = vkey_to_scan(VK_LMENU);
++        if (right_alt_down)
++            right_alt_scan = vkey_to_scan(VK_RMENU);
++        if (need_control && !control_down)
++            control_scan = vkey_to_scan(VK_LCONTROL);
++
++        if ((left_alt_down && !left_alt_scan) || (right_alt_down && !right_alt_scan) ||
++            (need_control && !control_down && !control_scan) || !key_scan)
++        {
++            WARN("failed to find scan codes\n");
++            return;
++        }
++
++        /* Alt key may be down but we don't want it down for the Control-C/V/X/...
++           sequence that follows.  So simulate releasing it.  Unfortunately,
++           that will often put focus on the menu bar.  To counteract that,
++           we simulate pressing and releasing it again.  [An earlier attempt
++           to use WM_CANCELMODE for this purpose worked for some cases (e.g.
++           Notepad) but not others (e.g. Outlook 2010 and its ribbon).] */
++        if (left_alt_down)
++        {
++            flags = KEYEVENTF_KEYUP;
++            if (left_alt_scan & 0x100) flags |= KEYEVENTF_EXTENDEDKEY;
++            macdrv_send_keyboard_input(hwnd, VK_LMENU, left_alt_scan & 0xff, flags,
++                                       event->edit_menu_command.time_ms);
++        }
++        if (right_alt_down)
++        {
++            flags = KEYEVENTF_KEYUP;
++            if (right_alt_scan & 0x100) flags |= KEYEVENTF_EXTENDEDKEY;
++            macdrv_send_keyboard_input(hwnd, VK_RMENU, right_alt_scan & 0xff, flags,
++                                       event->edit_menu_command.time_ms);
++        }
++        if (left_alt_down ^ right_alt_down)
++        {
++            WORD vkey = left_alt_down ? VK_LMENU : VK_RMENU;
++            WORD scan = left_alt_down ? left_alt_scan : right_alt_scan;
++
++            flags = 0;
++            if (scan & 0x100) flags |= KEYEVENTF_EXTENDEDKEY;
++            macdrv_send_keyboard_input(hwnd, vkey, scan & 0xff, flags,
++                                       event->edit_menu_command.time_ms);
++            flags ^= KEYEVENTF_KEYUP;
++            macdrv_send_keyboard_input(hwnd, vkey, scan & 0xff, flags,
++                                       event->edit_menu_command.time_ms);
++        }
++
++        /* Simulate Control key press, if necessary. */
++        if (need_control && !control_down)
++        {
++            flags = 0;
++            if (control_scan & 0x100) flags |= KEYEVENTF_EXTENDEDKEY;
++            macdrv_send_keyboard_input(hwnd, VK_LCONTROL, control_scan & 0xff, flags,
++                                       event->edit_menu_command.time_ms);
++        }
++
++        /* Simulate press and release of the edit menu item accelerator key. */
++        flags = 0;
++        if (key_scan & 0x100) flags |= KEYEVENTF_EXTENDEDKEY;
++        macdrv_send_keyboard_input(hwnd, key_vkey, key_scan & 0xff, flags,
++                                   event->edit_menu_command.time_ms);
++
++        flags |= KEYEVENTF_KEYUP;
++        macdrv_send_keyboard_input(hwnd, key_vkey, key_scan & 0xff, flags,
++                                   event->edit_menu_command.time_ms);
++
++        /* Simulate Control key release to restore previous state, if necessary. */
++        if (need_control && !control_down)
++        {
++            flags = KEYEVENTF_KEYUP;
++            if (control_scan & 0x100) flags |= KEYEVENTF_EXTENDEDKEY;
++            macdrv_send_keyboard_input(hwnd, VK_LCONTROL, control_scan & 0xff, flags,
++                                       event->edit_menu_command.time_ms);
++        }
++
++        /* In theory, we should simulate an Alt key press here if it was down
++           when we started.  However, that would mean that focus would be put on
++           the menu bar when the user lets go, which we don't want.  Instead, we
++           leave Wine with an incorrect sense of the state of the Alt key.  The
++           Cocoa thread has also cleared its internal record that the Command
++           key is down.  That has two effects: 1) when the user releases the
++           Command key, the Cocoa code thinks nothing has changed and doesn't
++           generate an event; and 2) if the user keeps Command down and issues
++           another key event, the Cocoa code will think the Command key is newly
++           pressed and will generate an event.  In other words, it will resync
++           with the actual key state and generate only the events necessary. */
++    }
++    else // mac_edit_menu == MAC_EDIT_MENU_BY_MESSAGE
++    {
++        UINT msg;
++        LPARAM lparam = 0;
++        HWND focus;
++
++        switch (event->edit_menu_command.command)
++        {
++            case EDIT_COMMAND_COPY:         msg = WM_COPY; break;
++            case EDIT_COMMAND_CUT:          msg = WM_CUT; break;
++            case EDIT_COMMAND_DELETE:       msg = WM_CLEAR; break;
++            case EDIT_COMMAND_PASTE:        msg = WM_PASTE; break;
++            case EDIT_COMMAND_SELECT_ALL:   msg = EM_SETSEL; lparam = -1; break;
++            case EDIT_COMMAND_UNDO:         msg = EM_UNDO; break;
++            default:
++                WARN("unrecognized edit command %d\n", event->edit_menu_command.command);
++                return;
++        }
++
++        focus = get_focus();
++        if (focus == hwnd || NtUserIsChild(hwnd, focus))
++            NtUserPostMessage(focus, msg, 0, lparam);
++    }
+ }
+ 
+ 
+ /***********************************************************************
+  *              macdrv_hotkey_press
+  *
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -5864,28 +5863,209 @@
+     struct reply_header __header;
+     obj_handle_t handle;
+     char __pad_12[4];
+ };
+ 
+ 
+-
+ struct set_keyboard_repeat_request
+ {
+     struct request_header __header;
+     int enable;
+     int delay;
+     int period;
+ };
+ struct set_keyboard_repeat_reply
+ {
+     struct reply_header __header;
+     int enable;
+     char __pad_12[4];
++};
++
++enum esync_type
++{
++    ESYNC_SEMAPHORE = 1,
++    ESYNC_AUTO_EVENT,
++    ESYNC_MANUAL_EVENT,
++    ESYNC_MUTEX,
++    ESYNC_AUTO_SERVER,
++    ESYNC_MANUAL_SERVER,
++    ESYNC_QUEUE,
++};
++
++
++struct create_esync_request
++{
++    struct request_header __header;
++    unsigned int access;
++    int          initval;
++    int          type;
++    int          max;
++    /* VARARG(objattr,object_attributes); */
++    char __pad_28[4];
++};
++struct create_esync_reply
++{
++    struct reply_header __header;
++    obj_handle_t handle;
++    int          type;
++    unsigned int shm_idx;
++    char __pad_20[4];
+ };
+ 
++struct open_esync_request
++{
++    struct request_header __header;
++    unsigned int access;
++    unsigned int attributes;
++    obj_handle_t rootdir;
++    int          type;
++    /* VARARG(name,unicode_str); */
++    char __pad_28[4];
++};
++struct open_esync_reply
++{
++    struct reply_header __header;
++    obj_handle_t handle;
++    int          type;
++    unsigned int shm_idx;
++    char __pad_20[4];
++};
+ 
++
++struct get_esync_read_fd_request
++{
++    struct request_header __header;
++    obj_handle_t handle;
++};
++struct get_esync_read_fd_reply
++{
++    struct reply_header __header;
++    int          type;
++    unsigned int shm_idx;
++};
++
++
++struct get_esync_write_fd_request
++{
++    struct request_header __header;
++    obj_handle_t handle;
++};
++struct get_esync_write_fd_reply
++{
++    struct reply_header __header;
++};
++
++
++struct esync_msgwait_request
++{
++    struct request_header __header;
++    int          in_msgwait;
++};
++struct esync_msgwait_reply
++{
++    struct reply_header __header;
++};
++
++
++struct get_esync_apc_fd_request
++{
++    struct request_header __header;
++    char __pad_12[4];
++};
++struct get_esync_apc_fd_reply
++{
++    struct reply_header __header;
++};
++
++enum msync_type
++{
++    MSYNC_SEMAPHORE = 1,
++    MSYNC_AUTO_EVENT,
++    MSYNC_MANUAL_EVENT,
++    MSYNC_MUTEX,
++    MSYNC_AUTO_SERVER,
++    MSYNC_MANUAL_SERVER,
++    MSYNC_QUEUE,
++};
++
++
++struct create_msync_request
++{
++    struct request_header __header;
++    unsigned int access;
++    int low;
++    int high;
++    int type;
++    /* VARARG(objattr,object_attributes); */
++    char __pad_28[4];
++};
++struct create_msync_reply
++{
++    struct reply_header __header;
++    obj_handle_t handle;
++    int type;
++    unsigned int shm_idx;
++    char __pad_20[4];
++};
++
++
++struct open_msync_request
++{
++    struct request_header __header;
++    unsigned int access;
++    unsigned int attributes;
++    obj_handle_t rootdir;
++    int          type;
++    /* VARARG(name,unicode_str); */
++    char __pad_28[4];
++};
++struct open_msync_reply
++{
++    struct reply_header __header;
++    obj_handle_t handle;
++    int          type;
++    unsigned int shm_idx;
++    char __pad_20[4];
++};
++
++
++struct get_msync_idx_request
++{
++    struct request_header __header;
++    obj_handle_t handle;
++};
++struct get_msync_idx_reply
++{
++    struct reply_header __header;
++    int          type;
++    unsigned int shm_idx;
++};
++
++struct msync_msgwait_request
++{
++    struct request_header __header;
++    int          in_msgwait;
++};
++struct msync_msgwait_reply
++{
++    struct reply_header __header;
++};
++
++struct get_msync_apc_idx_request
++{
++    struct request_header __header;
++    char __pad_12[4];
++};
++struct get_msync_apc_idx_reply
++{
++    struct reply_header __header;
++    unsigned int shm_idx;
++    char __pad_12[4];
++};
++
++
+ enum request
+ {
+     REQ_new_process,
+     REQ_get_new_process_info,
+     REQ_new_thread,
+     REQ_get_startup_info,
+@@ -6174,12 +6354,23 @@
+     REQ_get_job_info,
+     REQ_terminate_job,
+     REQ_suspend_process,
+     REQ_resume_process,
+     REQ_get_next_thread,
+     REQ_set_keyboard_repeat,
++    REQ_create_esync,
++    REQ_open_esync,
++    REQ_get_esync_read_fd,
++    REQ_get_esync_write_fd,
++    REQ_esync_msgwait,
++    REQ_get_esync_apc_fd,
++    REQ_create_msync,
++    REQ_open_msync,
++    REQ_get_msync_idx,
++    REQ_msync_msgwait,
++    REQ_get_msync_apc_idx,
+     REQ_NB_REQUESTS
+ };
+ 
+ union generic_request
+ {
+     struct request_max_size max_size;
+@@ -6473,12 +6664,23 @@
+     struct get_job_info_request get_job_info_request;
+     struct terminate_job_request terminate_job_request;
+     struct suspend_process_request suspend_process_request;
+     struct resume_process_request resume_process_request;
+     struct get_next_thread_request get_next_thread_request;
+     struct set_keyboard_repeat_request set_keyboard_repeat_request;
++    struct create_esync_request create_esync_request;
++    struct open_esync_request open_esync_request;
++    struct get_esync_read_fd_request get_esync_read_fd_request;
++    struct get_esync_write_fd_request get_esync_write_fd_request;
++    struct esync_msgwait_request esync_msgwait_request;
++    struct get_esync_apc_fd_request get_esync_apc_fd_request;
++    struct create_msync_request create_msync_request;
++    struct open_msync_request open_msync_request;
++    struct get_msync_idx_request get_msync_idx_request;
++    struct msync_msgwait_request msync_msgwait_request;
++    struct get_msync_apc_idx_request get_msync_apc_idx_request;
+ };
+ union generic_reply
+ {
+     struct request_max_size max_size;
+     struct reply_header reply_header;
+     struct new_process_reply new_process_reply;
+@@ -6770,11 +6972,22 @@
+     struct get_job_info_reply get_job_info_reply;
+     struct terminate_job_reply terminate_job_reply;
+     struct suspend_process_reply suspend_process_reply;
+     struct resume_process_reply resume_process_reply;
+     struct get_next_thread_reply get_next_thread_reply;
+     struct set_keyboard_repeat_reply set_keyboard_repeat_reply;
++    struct create_esync_reply create_esync_reply;
++    struct open_esync_reply open_esync_reply;
++    struct get_esync_read_fd_reply get_esync_read_fd_reply;
++    struct get_esync_write_fd_reply get_esync_write_fd_reply;
++    struct esync_msgwait_reply esync_msgwait_reply;
++    struct get_esync_apc_fd_reply get_esync_apc_fd_reply;
++    struct create_msync_reply create_msync_reply;
++    struct open_msync_reply open_msync_reply;
++    struct get_msync_idx_reply get_msync_idx_reply;
++    struct msync_msgwait_reply msync_msgwait_reply;
++    struct get_msync_apc_idx_reply get_msync_apc_idx_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 855
++#define SERVER_PROTOCOL_VERSION 1797
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/Makefile.in
++++ b/server/Makefile.in
+@@ -8,15 +8,17 @@
+ 	clipboard.c \
+ 	completion.c \
+ 	console.c \
+ 	debugger.c \
+ 	device.c \
+ 	directory.c \
++	esync.c \
+ 	event.c \
+ 	fd.c \
+ 	file.c \
++	msync.c \
+ 	handle.c \
+ 	hook.c \
+ 	mach.c \
+ 	mailslot.c \
+ 	main.c \
+ 	mapping.c \
+--- a/server/change.c
++++ b/server/change.c
+@@ -122,13 +122,15 @@
+     no_lookup_name,           /* lookup_name */
+     no_link_name,             /* link_name */
+     NULL,                     /* unlink_name */
+     no_open_file,             /* open_file */
+     no_kernel_obj_list,       /* get_kernel_obj_list */
+     dir_close_handle,         /* close_handle */
+-    dir_destroy               /* destroy */
++    dir_destroy,              /* destroy */
++    default_fd_get_esync_fd,  /* get_esync_fd */
++    default_fd_get_msync_idx, /* get_msync_idx */
+ };
+ 
+ static int dir_get_poll_events( struct fd *fd );
+ static enum server_fd_type dir_get_fd_type( struct fd *fd );
+ 
+ static const struct fd_ops dir_fd_ops =
+--- a/server/console.c
++++ b/server/console.c
+@@ -38,12 +38,14 @@
+ #include "request.h"
+ #include "file.h"
+ #include "unicode.h"
+ #include "wincon.h"
+ #include "winternl.h"
+ #include "wine/condrv.h"
++#include "esync.h"
++#include "msync.h"
+ 
+ struct screen_buffer;
+ 
+ struct history_line
+ {
+     data_size_t len;
+@@ -127,26 +129,30 @@
+     struct async         *async;       /* ioctl async */
+     struct list           entry;       /* list entry */
+ };
+ 
+ struct console_server
+ {
+-    struct object         obj;            /* object header */
+-    struct fd            *fd;             /* pseudo-fd for ioctls */
+-    struct console       *console;        /* attached console */
+-    struct list           queue;          /* ioctl queue */
+-    struct list           read_queue;     /* blocking read queue */
++    struct object         obj;         /* object header */
++    struct fd            *fd;          /* pseudo-fd for ioctls */
++    struct console       *console;     /* attached console */
++    struct list           queue;       /* ioctl queue */
++    struct list           read_queue;  /* blocking read queue */
+     unsigned int          busy : 1;       /* flag if server processing an ioctl */
+     unsigned int          once_input : 1; /* flag if input thread has already been requested */
+-    int                   term_fd;        /* UNIX terminal fd */
+-    struct termios        termios;        /* original termios */
++    int                   term_fd;     /* UNIX terminal fd */
++    struct termios        termios;     /* original termios */
++    struct esync_fd      *esync_fd;
++    unsigned int          msync_idx;
+ };
+ 
+ static void console_server_dump( struct object *obj, int verbose );
+ static void console_server_destroy( struct object *obj );
+ static int console_server_signaled( struct object *obj, struct wait_queue_entry *entry );
++static struct esync_fd *console_server_get_esync_fd( struct object *obj, enum esync_type *type );
++static unsigned int console_server_get_msync_idx( struct object *obj, enum msync_type *type );
+ static struct fd *console_server_get_fd( struct object *obj );
+ static struct object *console_server_lookup_name( struct object *obj, struct unicode_str *name,
+                                                 unsigned int attr, struct object *root );
+ static struct object *console_server_open_file( struct object *obj, unsigned int access,
+                                                 unsigned int sharing, unsigned int options );
+ 
+@@ -168,13 +174,15 @@
+     console_server_lookup_name,       /* lookup_name */
+     no_link_name,                     /* link_name */
+     NULL,                             /* unlink_name */
+     console_server_open_file,         /* open_file */
+     no_kernel_obj_list,               /* get_kernel_obj_list */
+     no_close_handle,                  /* close_handle */
+-    console_server_destroy            /* destroy */
++    console_server_destroy,           /* destroy */
++    console_server_get_esync_fd,      /* get_esync_fd */
++    console_server_get_msync_idx,     /* get_msync_idx */
+ };
+ 
+ static void console_server_ioctl( struct fd *fd, ioctl_code_t code, struct async *async );
+ 
+ static const struct fd_ops console_server_fd_ops =
+ {
+@@ -587,12 +595,19 @@
+     while (!list_empty( &server->queue ))
+     {
+         struct console_host_ioctl *call = LIST_ENTRY( list_head( &server->queue ), struct console_host_ioctl, entry );
+         list_remove( &call->entry );
+         console_host_ioctl_terminate( call, STATUS_CANCELLED );
+     }
++
++    if (do_msync())
++        msync_clear_shm( server->msync_idx );
++
++    if (do_esync())
++        esync_clear( server->esync_fd );
++
+     while (!list_empty( &server->read_queue ))
+     {
+         struct console_host_ioctl *call = LIST_ENTRY( list_head( &server->read_queue ), struct console_host_ioctl, entry );
+         list_remove( &call->entry );
+         console_host_ioctl_terminate( call, STATUS_CANCELLED );
+     }
+@@ -875,12 +890,14 @@
+ static void console_server_destroy( struct object *obj )
+ {
+     struct console_server *server = (struct console_server *)obj;
+     assert( obj->ops == &console_server_ops );
+     disconnect_console_server( server );
+     if (server->fd) release_object( server->fd );
++    if (do_esync()) esync_close_fd( server->esync_fd );
++    if (do_msync()) msync_destroy_semaphore( server->msync_idx );
+ }
+ 
+ static struct object *console_server_lookup_name( struct object *obj, struct unicode_str *name,
+                                                   unsigned int attr, struct object *root )
+ {
+     struct console_server *server = (struct console_server*)obj;
+@@ -922,12 +939,26 @@
+ {
+     struct console_server *server = (struct console_server*)obj;
+     assert( obj->ops == &console_server_ops );
+     return !server->console || !list_empty( &server->queue );
+ }
+ 
++static struct esync_fd *console_server_get_esync_fd( struct object *obj, enum esync_type *type )
++{
++    struct console_server *server = (struct console_server*)obj;
++    *type = ESYNC_MANUAL_SERVER;
++    return server->esync_fd;
++}
++
++static unsigned int console_server_get_msync_idx( struct object *obj, enum msync_type *type )
++{
++    struct console_server *server = (struct console_server*)obj;
++    *type = MSYNC_MANUAL_SERVER;
++    return server->msync_idx;
++}
++
+ static struct fd *console_server_get_fd( struct object* obj )
+ {
+     struct console_server *server = (struct console_server*)obj;
+     assert( obj->ops == &console_server_ops );
+     return (struct fd *)grab_object( server->fd );
+ }
+@@ -953,13 +984,20 @@
+     if (!server->fd)
+     {
+         release_object( server );
+         return NULL;
+     }
+     allow_fd_caching(server->fd);
++    server->esync_fd = NULL;
+ 
++    if (do_msync())
++        server->msync_idx = msync_alloc_shm( 0, 0 );
++
++    if (do_esync())
++        server->esync_fd = esync_create_fd( 0, 0 );
++
+     return &server->obj;
+ }
+ 
+ static int is_blocking_read_ioctl( unsigned int code )
+ {
+     switch (code)
+@@ -1566,12 +1604,18 @@
+     }
+     else if (server->busy)
+     {
+         /* set result of previous ioctl */
+         ioctl = LIST_ENTRY( list_head( &server->queue ), struct console_host_ioctl, entry );
+         list_remove( &ioctl->entry );
++
++        if (do_msync() && list_empty( &server->queue ))
++            msync_clear_shm( server->msync_idx );
++
++        if (do_esync() && list_empty( &server->queue ))
++            esync_clear( server->esync_fd );
+     }
+ 
+     if (ioctl)
+     {
+         struct async *async = ioctl->async;
+         unsigned int status = req->status;
+@@ -1652,8 +1696,14 @@
+     }
+     else
+     {
+         set_error( STATUS_PENDING );
+     }
+ 
++    if (do_msync() && list_empty( &server->queue ))
++        msync_clear_shm( server->msync_idx );
++
++    if (do_esync() && list_empty( &server->queue ))
++        esync_clear( server->esync_fd );
++
+     release_object( server );
+ }
+--- a/server/device.c
++++ b/server/device.c
+@@ -35,12 +35,14 @@
+ 
+ #include "object.h"
+ #include "file.h"
+ #include "handle.h"
+ #include "request.h"
+ #include "process.h"
++#include "esync.h"
++#include "msync.h"
+ 
+ /* IRP object */
+ 
+ struct irp_call
+ {
+     struct object          obj;           /* object header */
+@@ -89,16 +91,20 @@
+ {
+     struct object          obj;            /* object header */
+     struct list            devices;        /* list of devices */
+     struct list            requests;       /* list of pending irps across all devices */
+     struct irp_call       *current_call;   /* call currently executed on client side */
+     struct wine_rb_tree    kernel_objects; /* map of objects that have client side pointer associated */
++    struct esync_fd       *esync_fd;       /* esync file descriptor */
++    unsigned int           msync_idx;
+ };
+ 
+ static void device_manager_dump( struct object *obj, int verbose );
+ static int device_manager_signaled( struct object *obj, struct wait_queue_entry *entry );
++static struct esync_fd *device_manager_get_esync_fd( struct object *obj, enum esync_type *type );
++static unsigned int device_manager_get_msync_idx( struct object *obj, enum msync_type *type );
+ static void device_manager_destroy( struct object *obj );
+ 
+ static const struct object_ops device_manager_ops =
+ {
+     sizeof(struct device_manager),    /* size */
+     &no_type,                         /* type */
+@@ -116,13 +122,15 @@
+     no_lookup_name,                   /* lookup_name */
+     no_link_name,                     /* link_name */
+     NULL,                             /* unlink_name */
+     no_open_file,                     /* open_file */
+     no_kernel_obj_list,               /* get_kernel_obj_list */
+     no_close_handle,                  /* close_handle */
+-    device_manager_destroy            /* destroy */
++    device_manager_destroy,           /* destroy */
++    device_manager_get_esync_fd,      /* get_esync_fd */
++    device_manager_get_msync_idx,     /* get_msync_idx */
+ };
+ 
+ 
+ /* device (a single device object) */
+ 
+ static const WCHAR device_name[] = {'D','e','v','i','c','e'};
+@@ -745,12 +753,18 @@
+     /* the pending requests may be the only thing holding a reference to the file */
+     grab_object( file );
+ 
+     /* terminate all pending requests */
+     LIST_FOR_EACH_ENTRY_SAFE( irp, next, &file->requests, struct irp_call, dev_entry )
+     {
++        if (do_msync() && file->device->manager && list_empty( &file->device->manager->requests ))
++            msync_clear( &file->device->manager->obj );
++
++        if (do_esync() && file->device->manager && list_empty( &file->device->manager->requests ))
++            esync_clear( file->device->manager->esync_fd );
++
+         list_remove( &irp->mgr_entry );
+         set_irp_result( irp, STATUS_FILE_DELETED, NULL, 0, 0 );
+     }
+ 
+     release_object( file );
+ }
+@@ -778,12 +792,26 @@
+ 
+ static int device_manager_signaled( struct object *obj, struct wait_queue_entry *entry )
+ {
+     struct device_manager *manager = (struct device_manager *)obj;
+ 
+     return !list_empty( &manager->requests );
++}
++
++static struct esync_fd *device_manager_get_esync_fd( struct object *obj, enum esync_type *type )
++{
++    struct device_manager *manager = (struct device_manager *)obj;
++    *type = ESYNC_MANUAL_SERVER;
++    return manager->esync_fd;
++}
++
++static unsigned int device_manager_get_msync_idx( struct object *obj, enum msync_type *type )
++{
++    struct device_manager *manager = (struct device_manager *)obj;
++    *type = MSYNC_MANUAL_SERVER;
++    return manager->msync_idx;
+ }
+ 
+ static void device_manager_destroy( struct object *obj )
+ {
+     struct device_manager *manager = (struct device_manager *)obj;
+     struct kernel_object *kernel_object;
+@@ -814,24 +842,36 @@
+     {
+         struct irp_call *irp = LIST_ENTRY( ptr, struct irp_call, mgr_entry );
+         list_remove( &irp->mgr_entry );
+         assert( !irp->file && !irp->async );
+         release_object( irp );
+     }
++
++    if (do_msync())
++        msync_destroy_semaphore( manager->msync_idx );
++
++    if (do_esync())
++        esync_close_fd( manager->esync_fd );
+ }
+ 
+ static struct device_manager *create_device_manager(void)
+ {
+     struct device_manager *manager;
+ 
+     if ((manager = alloc_object( &device_manager_ops )))
+     {
+         manager->current_call = NULL;
+         list_init( &manager->devices );
+         list_init( &manager->requests );
+         wine_rb_init( &manager->kernel_objects, compare_kernel_object );
++
++        if (do_msync())
++            manager->msync_idx = msync_alloc_shm( 0, 0 );
++
++        if (do_esync())
++            manager->esync_fd = esync_create_fd( 0, 0 );
+     }
+     return manager;
+ }
+ 
+ void free_kernel_objects( struct object *obj )
+ {
+@@ -1015,12 +1055,18 @@
+                 }
+                 list_remove( &irp->mgr_entry );
+                 list_init( &irp->mgr_entry );
+                 /* we already own the object if it's only on manager queue */
+                 if (irp->file) grab_object( irp );
+                 manager->current_call = irp;
++
++                if (do_msync() && list_empty( &manager->requests ))
++                    msync_clear( &manager->obj );
++
++                if (do_esync() && list_empty( &manager->requests ))
++                    esync_clear( manager->esync_fd );
+             }
+             else close_handle( current->process, reply->next );
+         }
+     }
+     else set_error( STATUS_PENDING );
+ 
+--- a/server/event.c
++++ b/server/event.c
+@@ -32,12 +32,14 @@
+ #include "winternl.h"
+ 
+ #include "handle.h"
+ #include "thread.h"
+ #include "request.h"
+ #include "security.h"
++#include "esync.h"
++#include "msync.h"
+ 
+ static const WCHAR event_name[] = {'E','v','e','n','t'};
+ 
+ struct type_descr event_type =
+ {
+     { event_name, sizeof(event_name) },   /* name */
+@@ -53,19 +55,24 @@
+ struct event
+ {
+     struct object  obj;             /* object header */
+     struct list    kernel_object;   /* list of kernel object pointers */
+     int            manual_reset;    /* is it a manual reset event? */
+     int            signaled;        /* event has been signaled */
++    struct esync_fd *esync_fd;        /* esync file descriptor */
++    unsigned int   msync_idx;
+ };
+ 
+ static void event_dump( struct object *obj, int verbose );
+ static int event_signaled( struct object *obj, struct wait_queue_entry *entry );
+ static void event_satisfied( struct object *obj, struct wait_queue_entry *entry );
++static struct esync_fd *event_get_esync_fd( struct object *obj, enum esync_type *type );
++static unsigned int event_get_msync_idx( struct object *obj, enum msync_type *type );
+ static int event_signal( struct object *obj, unsigned int access);
+ static struct list *event_get_kernel_obj_list( struct object *obj );
++static void event_destroy( struct object *obj );
+ 
+ static const struct object_ops event_ops =
+ {
+     sizeof(struct event),      /* size */
+     &event_type,               /* type */
+     event_dump,                /* dump */
+@@ -82,13 +89,15 @@
+     no_lookup_name,            /* lookup_name */
+     directory_link_name,       /* link_name */
+     default_unlink_name,       /* unlink_name */
+     no_open_file,              /* open_file */
+     event_get_kernel_obj_list, /* get_kernel_obj_list */
+     no_close_handle,           /* close_handle */
+-    no_destroy                 /* destroy */
++    event_destroy,             /* destroy */
++    event_get_esync_fd,        /* get_esync_fd */
++    event_get_msync_idx,       /* get_msync_idx */
+ };
+ 
+ 
+ static const WCHAR keyed_event_name[] = {'K','e','y','e','d','E','v','e','n','t'};
+ 
+ struct type_descr keyed_event_type =
+@@ -147,40 +156,86 @@
+         if (get_error() != STATUS_OBJECT_NAME_EXISTS)
+         {
+             /* initialize it if it didn't already exist */
+             list_init( &event->kernel_object );
+             event->manual_reset = manual_reset;
+             event->signaled     = initial_state;
++
++            if (do_msync())
++                event->msync_idx = msync_alloc_shm( initial_state, 0 );
++
++            if (do_esync())
++                event->esync_fd = esync_create_fd( initial_state, 0 );
+         }
+     }
+     return event;
+ }
+ 
+ struct event *get_event_obj( struct process *process, obj_handle_t handle, unsigned int access )
+ {
++    struct object *obj;
++
++    if (do_msync() && (obj = get_handle_obj( process, handle, access, &msync_ops)))
++        return (struct event *)obj; /* even though it's not an event */
++
++    if (do_esync() && (obj = get_handle_obj( process, handle, access, &esync_ops)))
++        return (struct event *)obj; /* even though it's not an event */
++
+     return (struct event *)get_handle_obj( process, handle, access, &event_ops );
+ }
+ 
+ static void pulse_event( struct event *event )
+ {
+     event->signaled = 1;
+     /* wake up all waiters if manual reset, a single one otherwise */
+     wake_up( &event->obj, !event->manual_reset );
+     event->signaled = 0;
++
++    if (do_msync())
++        msync_clear( &event->obj );
+ }
+ 
+ void set_event( struct event *event )
+ {
++    if (do_msync() && event->obj.ops == &msync_ops)
++    {
++        msync_set_event( (struct msync *)event );
++        return;
++    }
++
++    if (do_esync() && event->obj.ops == &esync_ops)
++    {
++        esync_set_event( (struct esync *)event );
++        return;
++    }
++
+     event->signaled = 1;
+     /* wake up all waiters if manual reset, a single one otherwise */
+     wake_up( &event->obj, !event->manual_reset );
+ }
+ 
+ void reset_event( struct event *event )
+ {
++    if (do_msync() && event->obj.ops == &msync_ops)
++    {
++        msync_reset_event( (struct msync *)event );
++        return;
++    }
++
++    if (do_esync() && event->obj.ops == &esync_ops)
++    {
++        esync_reset_event( (struct esync *)event );
++        return;
++    }
+     event->signaled = 0;
++
++    if (do_msync())
++        msync_clear( &event->obj );
++
++    if (do_esync())
++        esync_clear( event->esync_fd );
+ }
+ 
+ static void event_dump( struct object *obj, int verbose )
+ {
+     struct event *event = (struct event *)obj;
+     assert( obj->ops == &event_ops );
+@@ -192,12 +247,26 @@
+ {
+     struct event *event = (struct event *)obj;
+     assert( obj->ops == &event_ops );
+     return event->signaled;
+ }
+ 
++static struct esync_fd *event_get_esync_fd( struct object *obj, enum esync_type *type )
++{
++    struct event *event = (struct event *)obj;
++    *type = event->manual_reset ? ESYNC_MANUAL_SERVER : ESYNC_AUTO_SERVER;
++    return event->esync_fd;
++}
++
++static unsigned int event_get_msync_idx( struct object *obj, enum msync_type *type )
++{
++    struct event *event = (struct event *)obj;
++    *type = MSYNC_MANUAL_SERVER;
++    return event->msync_idx;
++}
++
+ static void event_satisfied( struct object *obj, struct wait_queue_entry *entry )
+ {
+     struct event *event = (struct event *)obj;
+     assert( obj->ops == &event_ops );
+     /* Reset if it's an auto-reset event */
+     if (!event->manual_reset) event->signaled = 0;
+@@ -220,12 +289,23 @@
+ static struct list *event_get_kernel_obj_list( struct object *obj )
+ {
+     struct event *event = (struct event *)obj;
+     return &event->kernel_object;
+ }
+ 
++static void event_destroy( struct object *obj )
++{
++    struct event *event = (struct event *)obj;
++
++    if (do_msync())
++        msync_destroy_semaphore( event->msync_idx );
++
++    if (do_esync())
++        esync_close_fd( event->esync_fd );
++}
++
+ struct keyed_event *create_keyed_event( struct object *root, const struct unicode_str *name,
+                                         unsigned int attr, const struct security_descriptor *sd )
+ {
+     struct keyed_event *event;
+ 
+     if ((event = create_named_object( root, &keyed_event_ops, name, attr, sd )))
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -91,12 +91,14 @@
+ #define WIN32_NO_STATUS
+ #include "object.h"
+ #include "file.h"
+ #include "handle.h"
+ #include "process.h"
+ #include "request.h"
++#include "esync.h"
++#include "msync.h"
+ 
+ #include "winternl.h"
+ #include "winioctl.h"
+ #include "ddk/wdm.h"
+ 
+ #if defined(HAVE_SYS_EPOLL_H) && defined(HAVE_EPOLL_CREATE)
+@@ -151,12 +153,14 @@
+     struct async_queue   read_q;      /* async readers of this fd */
+     struct async_queue   write_q;     /* async writers of this fd */
+     struct async_queue   wait_q;      /* other async waiters of this fd */
+     struct completion   *completion;  /* completion object attached to this fd */
+     apc_param_t          comp_key;    /* completion key to set in completion events */
+     unsigned int         comp_flags;  /* completion flags */
++    struct esync_fd     *esync_fd;    /* esync file descriptor */
++    unsigned int         msync_idx;   /* msync shm index */
+ };
+ 
+ static void fd_dump( struct object *obj, int verbose );
+ static void fd_destroy( struct object *obj );
+ 
+ static const struct object_ops fd_ops =
+@@ -1569,12 +1573,18 @@
+     }
+     else  /* no inode, close it right away */
+     {
+         if (fd->unix_fd != -1) close( fd->unix_fd );
+         free( fd->unix_name );
+     }
++
++    if (do_msync())
++        msync_destroy_semaphore( fd->msync_idx );
++
++    if (do_esync())
++        esync_close_fd( fd->esync_fd );
+ }
+ 
+ /* check if the desired access is possible without violating */
+ /* the sharing mode of other opens of the same file */
+ static unsigned int check_sharing( struct fd *fd, unsigned int access, unsigned int sharing,
+                                    unsigned int open_flags, unsigned int options )
+@@ -1687,18 +1697,26 @@
+     fd->cacheable  = 0;
+     fd->signaled   = 1;
+     fd->fs_locks   = 1;
+     fd->poll_index = -1;
+     fd->completion = NULL;
+     fd->comp_flags = 0;
++    fd->esync_fd   = NULL;
++    fd->msync_idx  = 0;
+     init_async_queue( &fd->read_q );
+     init_async_queue( &fd->write_q );
+     init_async_queue( &fd->wait_q );
+     list_init( &fd->inode_entry );
+     list_init( &fd->locks );
+ 
++    if (do_esync())
++        fd->esync_fd = esync_create_fd( 1, 0 );
++
++    if (do_msync())
++        fd->msync_idx = msync_alloc_shm( 1, 0 );
++
+     if ((fd->poll_index = add_poll_user( fd )) == -1)
+     {
+         release_object( fd );
+         return NULL;
+     }
+     return fd;
+@@ -1728,17 +1746,26 @@
+     fd->signaled   = 1;
+     fd->fs_locks   = 0;
+     fd->poll_index = -1;
+     fd->completion = NULL;
+     fd->comp_flags = 0;
+     fd->no_fd_status = STATUS_BAD_DEVICE_TYPE;
++    fd->esync_fd   = NULL;
++    fd->msync_idx  = 0;
+     init_async_queue( &fd->read_q );
+     init_async_queue( &fd->write_q );
+     init_async_queue( &fd->wait_q );
+     list_init( &fd->inode_entry );
+     list_init( &fd->locks );
++
++    if (do_msync())
++        fd->msync_idx = msync_alloc_shm( 0, 0 );
++
++    if (do_esync())
++        fd->esync_fd = esync_create_fd( 0, 0 );
++
+     return fd;
+ }
+ 
+ /* duplicate an fd object for a different user */
+ struct fd *dup_fd_object( struct fd *orig, unsigned int access, unsigned int sharing, unsigned int options )
+ {
+@@ -2138,12 +2165,18 @@
+ /* set or clear the fd signaled state */
+ void set_fd_signaled( struct fd *fd, int signaled )
+ {
+     if (fd->comp_flags & FILE_SKIP_SET_EVENT_ON_HANDLE) return;
+     fd->signaled = signaled;
+     if (signaled) wake_up( fd->user, 0 );
++
++    if (do_msync() && !signaled)
++        msync_clear( fd->user );
++
++    if (do_esync() && !signaled)
++        esync_clear( fd->esync_fd );
+ }
+ 
+ /* check if events are pending and if yes return which one(s) */
+ int check_fd_events( struct fd *fd, int events )
+ {
+     struct pollfd pfd;
+@@ -2163,12 +2196,30 @@
+     struct fd *fd = get_obj_fd( obj );
+     int ret = fd->signaled;
+     release_object( fd );
+     return ret;
+ }
+ 
++struct esync_fd *default_fd_get_esync_fd( struct object *obj, enum esync_type *type )
++{
++    struct fd *fd = get_obj_fd( obj );
++    struct esync_fd *ret = fd->esync_fd;
++    *type = ESYNC_MANUAL_SERVER;
++    release_object( fd );
++    return ret;
++}
++
++unsigned int default_fd_get_msync_idx( struct object *obj, enum msync_type *type )
++{
++    struct fd *fd = get_obj_fd( obj );
++    unsigned int ret = fd->msync_idx;
++    *type = MSYNC_MANUAL_SERVER;
++    release_object( fd );
++    return ret;
++}
++
+ int default_fd_get_poll_events( struct fd *fd )
+ {
+     int events = 0;
+ 
+     if (async_waiting( &fd->read_q )) events |= POLLIN;
+     if (async_waiting( &fd->write_q )) events |= POLLOUT;
+--- a/server/file.h
++++ b/server/file.h
+@@ -106,12 +106,14 @@
+ extern void allow_fd_caching( struct fd *fd );
+ extern void set_fd_signaled( struct fd *fd, int signaled );
+ extern char *dup_fd_name( struct fd *root, const char *name ) __WINE_DEALLOC(free) __WINE_MALLOC;
+ extern void get_nt_name( struct fd *fd, struct unicode_str *name );
+ 
+ extern int default_fd_signaled( struct object *obj, struct wait_queue_entry *entry );
++extern struct esync_fd *default_fd_get_esync_fd( struct object *obj, enum esync_type *type );
++extern unsigned int default_fd_get_msync_idx( struct object *obj, enum msync_type *type );
+ extern int default_fd_get_poll_events( struct fd *fd );
+ extern void default_poll_event( struct fd *fd, int event );
+ extern void fd_cancel_async( struct fd *fd, struct async *async );
+ extern void fd_queue_async( struct fd *fd, struct async *async, int type );
+ extern void fd_async_wake_up( struct fd *fd, int type, unsigned int status );
+ extern void fd_reselect_async( struct fd *fd, struct async_queue *queue );
+--- a/server/main.c
++++ b/server/main.c
+@@ -31,12 +31,14 @@
+ 
+ #include "object.h"
+ #include "file.h"
+ #include "thread.h"
+ #include "request.h"
+ #include "unicode.h"
++#include "esync.h"
++#include "msync.h"
+ 
+ /* command-line options */
+ int debug_level = 0;
+ int foreground = 0;
+ timeout_t master_socket_timeout = 3 * -TICKS_PER_SEC;  /* master socket timeout, default is 3 seconds */
+ const char *server_argv0;
+@@ -226,12 +228,21 @@
+     signal( SIGTERM, sigterm_handler );
+     signal( SIGABRT, sigterm_handler );
+ 
+     sock_init();
+     open_master_socket();
+ 
++    if (do_msync())
++        msync_init();
++
++    if (do_esync())
++        esync_init();
++
++    if (!do_msync() && !do_esync() && debug_level)
++        fprintf( stderr, "wineserver: using server-side synchronization.\n" );
++
+     if (debug_level) fprintf( stderr, "wineserver: starting (pid=%ld)\n", (long) getpid() );
+     set_current_time();
+     init_signals();
+     init_memory();
+     init_directories( load_intl_file() );
+     init_registry();
+--- a/server/named_pipe.c
++++ b/server/named_pipe.c
+@@ -177,13 +177,15 @@
+     pipe_server_lookup_name,      /* lookup_name */
+     no_link_name,                 /* link_name */
+     NULL,                         /* unlink_name */
+     pipe_server_open_file,        /* open_file */
+     no_kernel_obj_list,           /* get_kernel_obj_list */
+     async_close_obj_handle,       /* close_handle */
+-    pipe_server_destroy           /* destroy */
++    pipe_server_destroy,          /* destroy */
++    default_fd_get_esync_fd,      /* get_esync_fd */
++    default_fd_get_msync_idx,     /* get_msync_idx */
+ };
+ 
+ static const struct fd_ops pipe_server_fd_ops =
+ {
+     default_fd_get_poll_events,   /* get_poll_events */
+     default_poll_event,           /* poll_event */
+@@ -221,13 +223,15 @@
+     no_lookup_name,               /* lookup_name */
+     no_link_name,                 /* link_name */
+     NULL,                         /* unlink_name */
+     no_open_file,                 /* open_file */
+     no_kernel_obj_list,           /* get_kernel_obj_list */
+     async_close_obj_handle,       /* close_handle */
+-    pipe_end_destroy              /* destroy */
++    pipe_end_destroy,             /* destroy */
++    default_fd_get_esync_fd,      /* get_esync_fd */
++    default_fd_get_msync_idx,     /* get_msync_idx */
+ };
+ 
+ static const struct fd_ops pipe_client_fd_ops =
+ {
+     default_fd_get_poll_events,   /* get_poll_events */
+     default_poll_event,           /* poll_event */
+--- a/server/object.h
++++ b/server/object.h
+@@ -104,12 +104,16 @@
+     /* return list of kernel objects */
+     struct list *(*get_kernel_obj_list)(struct object *);
+     /* close a handle to this object */
+     int (*close_handle)(struct object *,struct process *,obj_handle_t);
+     /* destroy on refcount == 0 */
+     void (*destroy)(struct object *);
++    /* return the esync fd for this object */
++    struct esync_fd *(*get_esync_fd)(struct object *, enum esync_type *type);
++    /* return the msync shm idx for this object */
++    unsigned int (*get_msync_idx)(struct object *, enum msync_type *type);
+ };
+ 
+ struct object
+ {
+     unsigned int              refcount;    /* reference count */
+     unsigned int              handle_count;/* handle count */
+--- a/server/process.c
++++ b/server/process.c
+@@ -60,12 +60,14 @@
+ #include "handle.h"
+ #include "process.h"
+ #include "thread.h"
+ #include "request.h"
+ #include "user.h"
+ #include "security.h"
++#include "esync.h"
++#include "msync.h"
+ 
+ /* process object */
+ 
+ static struct list process_list = LIST_INIT(process_list);
+ static int running_processes, user_processes;
+ static struct event *shutdown_event;           /* signaled when shutdown starts */
+@@ -92,12 +94,14 @@
+ static int process_signaled( struct object *obj, struct wait_queue_entry *entry );
+ static unsigned int process_map_access( struct object *obj, unsigned int access );
+ static struct security_descriptor *process_get_sd( struct object *obj );
+ static void process_poll_event( struct fd *fd, int event );
+ static struct list *process_get_kernel_obj_list( struct object *obj );
+ static void process_destroy( struct object *obj );
++static struct esync_fd *process_get_esync_fd( struct object *obj, enum esync_type *type );
++static unsigned int process_get_msync_idx( struct object *obj, enum msync_type *type );
+ static void terminate_process( struct process *process, struct thread *skip, int exit_code );
+ 
+ static const struct object_ops process_ops =
+ {
+     sizeof(struct process),      /* size */
+     &process_type,               /* type */
+@@ -115,13 +119,15 @@
+     no_lookup_name,              /* lookup_name */
+     no_link_name,                /* link_name */
+     NULL,                        /* unlink_name */
+     no_open_file,                /* open_file */
+     process_get_kernel_obj_list, /* get_kernel_obj_list */
+     no_close_handle,             /* close_handle */
+-    process_destroy              /* destroy */
++    process_destroy,             /* destroy */
++    process_get_esync_fd,        /* get_esync_fd */
++    process_get_msync_idx,       /* get_msync_idx */
+ };
+ 
+ static const struct fd_ops process_fd_ops =
+ {
+     NULL,                        /* get_poll_events */
+     process_poll_event,          /* poll_event */
+@@ -682,12 +843,14 @@
+     process->trace_data      = 0;
+     process->rawinput_devices = NULL;
+     process->rawinput_device_count = 0;
+     process->rawinput_mouse  = NULL;
+     process->rawinput_kbd    = NULL;
+     memset( &process->image_info, 0, sizeof(process->image_info) );
++    process->esync_fd        = NULL;
++    process->msync_idx       = 0;
+     list_init( &process->rawinput_entry );
+     list_init( &process->kernel_object );
+     list_init( &process->thread_list );
+     list_init( &process->locks );
+     list_init( &process->asyncs );
+     list_init( &process->classes );
+@@ -732,13 +895,19 @@
+          * to use the current impersonation token for the new process */
+         process->token = token_duplicate( token ? token : parent->token, TRUE, 0, NULL, NULL, 0, NULL, 0 );
+         process->affinity = parent->affinity;
+     }
+     if (!process->handles || !process->token) goto error;
+     process->session_id = token_get_session_id( process->token );
++
++    if (do_msync())
++        process->msync_idx = msync_alloc_shm( 0, 0 );
+ 
++    if (do_esync())
++        process->esync_fd = esync_create_fd( 0, 0 );
++
+     set_fd_events( process->msg_fd, POLLIN );  /* start listening to events */
+     return process;
+ 
+  error:
+     if (process) release_object( process );
+     /* if we failed to start our first process, close everything down */
+@@ -781,12 +950,14 @@
+     if (process->id) free_ptid( process->id );
+     if (process->token) release_object( process->token );
+     list_remove( &process->rawinput_entry );
+     free( process->rawinput_devices );
+     free( process->dir_cache );
+     free( process->image );
++    if (do_esync()) esync_close_fd( process->esync_fd );
++    if (do_msync()) msync_destroy_semaphore( process->msync_idx );
+ }
+ 
+ /* dump a process on stdout for debugging purposes */
+ static void process_dump( struct object *obj, int verbose )
+ {
+     struct process *process = (struct process *)obj;
+@@ -796,12 +967,26 @@
+ }
+ 
+ static int process_signaled( struct object *obj, struct wait_queue_entry *entry )
+ {
+     struct process *process = (struct process *)obj;
+     return !process->running_threads;
++}
++
++static struct esync_fd *process_get_esync_fd( struct object *obj, enum esync_type *type )
++{
++    struct process *process = (struct process *)obj;
++    *type = ESYNC_MANUAL_SERVER;
++    return process->esync_fd;
++}
++
++static unsigned int process_get_msync_idx( struct object *obj, enum msync_type *type )
++{
++    struct process *process = (struct process *)obj;
++    *type = MSYNC_MANUAL_SERVER;
++    return process->msync_idx;
+ }
+ 
+ static unsigned int process_map_access( struct object *obj, unsigned int access )
+ {
+     access = default_map_access( obj, access );
+     if (access & PROCESS_QUERY_INFORMATION) access |= PROCESS_QUERY_LIMITED_INFORMATION;
+--- a/server/process.h
++++ b/server/process.h
+@@ -83,12 +83,14 @@
+     unsigned int         rawinput_device_count;   /* number of registered rawinput devices */
+     const struct rawinput_device *rawinput_mouse; /* rawinput mouse device, if any */
+     const struct rawinput_device *rawinput_kbd;   /* rawinput keyboard device, if any */
+     struct list          rawinput_entry;  /* entry in the rawinput process list */
+     struct list          kernel_object;   /* list of kernel object pointers */
+     struct pe_image_info image_info;      /* main exe image info */
++    struct esync_fd     *esync_fd;        /* esync file descriptor (signaled on exit) */
++    unsigned int         msync_idx;
+ };
+ 
+ /* process functions */
+ 
+ extern unsigned int alloc_ptid( void *ptr );
+ extern void free_ptid( unsigned int id );
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4054,28 +4054,139 @@
+ 
+ 
+ /* Resume a process */
+ @REQ(resume_process)
+     obj_handle_t handle;       /* process handle */
+ @END
+-
+ 
+ /* Iterate thread list for process */
+ @REQ(get_next_thread)
+     obj_handle_t process;      /* process handle */
+     obj_handle_t last;         /* thread handle to start with */
+     unsigned int access;       /* desired access for returned handle */
+     unsigned int attributes;   /* returned handle attributes */
+     unsigned int flags;        /* controls iteration direction */
+ @REPLY
+     obj_handle_t handle;       /* next thread handle */
+ @END
+ 
+-
+ /* Setup keyboard auto-repeat */
+ @REQ(set_keyboard_repeat)
+     int enable;                /* whether to enable auto-repeat */
+     int delay;                 /* auto-repeat delay in ms */
+     int period;                /* auto-repeat period in ms */
+ @REPLY
+     int enable;                /* previous state of auto-repeat enable */
++@END
++
++enum esync_type
++{
++    ESYNC_SEMAPHORE = 1,
++    ESYNC_AUTO_EVENT,
++    ESYNC_MANUAL_EVENT,
++    ESYNC_MUTEX,
++    ESYNC_AUTO_SERVER,
++    ESYNC_MANUAL_SERVER,
++    ESYNC_QUEUE,
++};
++
++/* Create a new eventfd-based synchronization object */
++@REQ(create_esync)
++    unsigned int access;        /* wanted access rights */
++    int          initval;       /* initial value */
++    int          type;          /* type of esync object */
++    int          max;           /* maximum count on a semaphore */
++    VARARG(objattr,object_attributes); /* object attributes */
++@REPLY
++    obj_handle_t handle;        /* handle to the object */
++    int          type;          /* actual type (may be different for events) */
++    unsigned int shm_idx;
+ @END
++
++@REQ(open_esync)
++    unsigned int access;        /* wanted access rights */
++    unsigned int attributes;    /* object attributes */
++    obj_handle_t rootdir;       /* root directory */
++    int          type;          /* type of esync object (above) */
++    VARARG(name,unicode_str);   /* object name */
++@REPLY
++    obj_handle_t handle;        /* handle to the event */
++    int          type;          /* type of esync object (above) */
++    unsigned int shm_idx;       /* this object's index into the shm section */
++@END
++
++/* Retrieve the esync read fd for an object. */
++@REQ(get_esync_read_fd)
++    obj_handle_t handle;        /* handle to the object */
++@REPLY
++    int          type;
++    unsigned int shm_idx;
++@END
++
++/* Retrieve the esync write fd for an object. */
++@REQ(get_esync_write_fd)
++    obj_handle_t handle;        /* handle to the object */
++@REPLY
++@END
++
++/* Notify the server that we are doing a message wait or done with one. */
++@REQ(esync_msgwait)
++    int          in_msgwait;    /* are we in a message wait? */
++@END
++
++/* Retrieve the fd to wait on for user APCs. */
++@REQ(get_esync_apc_fd)
++@END
++
++enum msync_type
++{
++    MSYNC_SEMAPHORE = 1,
++    MSYNC_AUTO_EVENT,
++    MSYNC_MANUAL_EVENT,
++    MSYNC_MUTEX,
++    MSYNC_AUTO_SERVER,
++    MSYNC_MANUAL_SERVER,
++    MSYNC_QUEUE,
++};
++
++/* Create a new mach-based synchronization object */
++@REQ(create_msync)
++    unsigned int access;        /* wanted access rights */
++    int low;                    /* initial value of low word */
++    int high;                   /* initial value of high word */
++    int type;                   /* type of msync object */
++    VARARG(objattr,object_attributes); /* object attributes */
++@REPLY
++    obj_handle_t handle;        /* handle to the object */
++    int type;                   /* type of msync object */
++    unsigned int shm_idx;       /* this object's index into the shm section */
++@END
++
++/* Open an msync object */
++@REQ(open_msync)
++    unsigned int access;        /* wanted access rights */
++    unsigned int attributes;    /* object attributes */
++    obj_handle_t rootdir;       /* root directory */
++    int          type;          /* type of msync object */
++    VARARG(name,unicode_str);   /* object name */
++@REPLY
++    obj_handle_t handle;        /* handle to the event */
++    int          type;          /* type of msync object */
++    unsigned int shm_idx;       /* this object's index into the shm section */
++@END
++
++/* Retrieve the shm index for an object. */
++@REQ(get_msync_idx)
++    obj_handle_t handle;        /* handle to the object */
++@REPLY
++    int          type;
++    unsigned int shm_idx;
++@END
++
++@REQ(msync_msgwait)
++    int          in_msgwait;    /* are we in a message wait? */
++@END
++
++@REQ(get_msync_apc_idx)
++@REPLY
++    unsigned int shm_idx;
++@END
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -41,12 +41,14 @@
+ #include "handle.h"
+ #include "file.h"
+ #include "thread.h"
+ #include "process.h"
+ #include "request.h"
+ #include "user.h"
++#include "esync.h"
++#include "msync.h"
+ 
+ #define WM_NCMOUSEFIRST WM_NCMOUSEMOVE
+ #define WM_NCMOUSELAST  (WM_NCMOUSEFIRST+(WM_MOUSELAST-WM_MOUSEFIRST))
+ 
+ enum message_kind { SEND_MESSAGE, POST_MESSAGE };
+ #define NB_MSG_KINDS (POST_MESSAGE+1)
+@@ -130,12 +134,16 @@
+     struct timeout_user   *timeout;         /* timeout for next timer to expire */
+     struct thread_input   *input;           /* thread input descriptor */
+     struct hook_table     *hooks;           /* hook table */
+     timeout_t              last_get_msg;    /* time of last get message call */
+     int                    keystate_lock;   /* owns an input keystate lock */
+     const queue_shm_t     *shared;          /* queue in session shared memory */
++    struct esync_fd       *esync_fd;        /* esync file descriptor (signalled on message) */
++    int                    esync_in_msgwait; /* our thread is currently waiting on us */
++    unsigned int           msync_idx;
++    int                    msync_in_msgwait; /* our thread is currently waiting on us */
+ };
+ 
+ struct hotkey
+ {
+     struct list         entry;        /* entry in desktop hotkey list */
+     struct msg_queue   *queue;        /* queue owning this hotkey */
+@@ -146,12 +154,14 @@
+ };
+ 
+ static void msg_queue_dump( struct object *obj, int verbose );
+ static int msg_queue_add_queue( struct object *obj, struct wait_queue_entry *entry );
+ static void msg_queue_remove_queue( struct object *obj, struct wait_queue_entry *entry );
+ static int msg_queue_signaled( struct object *obj, struct wait_queue_entry *entry );
++static struct esync_fd *msg_queue_get_esync_fd( struct object *obj, enum esync_type *type );
++static unsigned int msg_queue_get_msync_idx( struct object *obj, enum msync_type *type );
+ static void msg_queue_satisfied( struct object *obj, struct wait_queue_entry *entry );
+ static void msg_queue_destroy( struct object *obj );
+ static void msg_queue_poll_event( struct fd *fd, int event );
+ static void thread_input_dump( struct object *obj, int verbose );
+ static void thread_input_destroy( struct object *obj );
+ static void timer_callback( void *private );
+@@ -174,13 +184,15 @@
+     no_lookup_name,            /* lookup_name */
+     no_link_name,              /* link_name */
+     NULL,                      /* unlink_name */
+     no_open_file,              /* open_file */
+     no_kernel_obj_list,        /* get_kernel_obj_list */
+     no_close_handle,           /* close_handle */
+-    msg_queue_destroy          /* destroy */
++    msg_queue_destroy,         /* destroy */
++    msg_queue_get_esync_fd,    /* get_esync_fd */
++    msg_queue_get_msync_idx,   /* get_msync_idx */
+ };
+ 
+ static const struct fd_ops msg_queue_fd_ops =
+ {
+     NULL,                        /* get_poll_events */
+     msg_queue_poll_event,        /* poll_event */
+@@ -309,17 +321,27 @@
+         queue->next_timer_id   = 0x7fff;
+         queue->timeout         = NULL;
+         queue->input           = (struct thread_input *)grab_object( input );
+         queue->hooks           = NULL;
+         queue->last_get_msg    = current_time;
+         queue->keystate_lock   = 0;
++        queue->esync_fd        = NULL;
++        queue->esync_in_msgwait = 0;
++        queue->msync_idx       = 0;
++        queue->msync_in_msgwait = 0;
+         list_init( &queue->send_result );
+         list_init( &queue->callback_result );
+         list_init( &queue->pending_timers );
+         list_init( &queue->expired_timers );
+         for (i = 0; i < NB_MSG_KINDS; i++) list_init( &queue->msg_list[i] );
++
++        if (do_msync())
++            queue->msync_idx = msync_alloc_shm( 0, 0 );
++
++        if (do_esync())
++            queue->esync_fd = esync_create_fd( 0, 0 );
+ 
+         if (!(queue->shared = alloc_shared_object()))
+         {
+             release_object( queue );
+             return NULL;
+         }
+@@ -739,12 +761,18 @@
+     SHARED_WRITE_BEGIN( queue_shm, queue_shm_t )
+     {
+         shared->wake_bits &= ~bits;
+         shared->changed_bits &= ~bits;
+     }
+     SHARED_WRITE_END;
++
++    if (do_msync() && !is_signaled( queue ))
++        msync_clear( &queue->obj );
++
++    if (do_esync() && !is_signaled( queue ))
++        esync_clear( queue->esync_fd );
+ 
+     if (!(queue_shm->wake_bits & (QS_KEY | QS_MOUSEBUTTON)))
+     {
+         if (queue->keystate_lock) unlock_input_keystate( queue->input );
+         queue->keystate_lock = 0;
+     }
+@@ -1225,12 +1263,19 @@
+ 
+     LIST_FOR_EACH_ENTRY( entry, &queue->obj.wait_queue, struct wait_queue_entry, entry )
+     {
+         if (get_wait_queue_thread(entry)->queue == queue)
+             return 0;  /* thread is waiting on queue -> not hung */
+     }
++
++    if (do_msync() && queue->msync_in_msgwait)
++        return 0;   /* thread is waiting on queue in absentia -> not hung */
++
++    if (do_esync() && queue->esync_in_msgwait)
++        return 0;   /* thread is waiting on queue in absentia -> not hung */
++
+     return 1;
+ }
+ 
+ static int msg_queue_add_queue( struct object *obj, struct wait_queue_entry *entry )
+ {
+     struct msg_queue *queue = (struct msg_queue *)obj;
+@@ -1277,12 +1322,26 @@
+             set_fd_events( queue->fd, 0 );
+         else if (!list_empty( &obj->wait_queue ))
+             /* restart waiting on poll() if we are no longer signaled */
+             set_fd_events( queue->fd, POLLIN );
+     }
+     return ret || is_signaled( queue );
++}
++
++static struct esync_fd *msg_queue_get_esync_fd( struct object *obj, enum esync_type *type )
++{
++    struct msg_queue *queue = (struct msg_queue *)obj;
++    *type = ESYNC_QUEUE;
++    return queue->esync_fd;
++}
++
++static unsigned int msg_queue_get_msync_idx( struct object *obj, enum msync_type *type )
++{
++    struct msg_queue *queue = (struct msg_queue *)obj;
++    *type = MSYNC_QUEUE;
++    return queue->msync_idx;
+ }
+ 
+ static void msg_queue_satisfied( struct object *obj, struct wait_queue_entry *entry )
+ {
+     struct msg_queue *queue = (struct msg_queue *)obj;
+     const queue_shm_t *queue_shm = queue->shared;
+@@ -1335,12 +1394,14 @@
+     SHARED_WRITE_END;
+     if (queue->keystate_lock) unlock_input_keystate( queue->input );
+     release_object( queue->input );
+     if (queue->hooks) release_object( queue->hooks );
+     if (queue->fd) release_object( queue->fd );
+     if (queue->shared) free_shared_object( queue->shared );
++    if (do_esync()) esync_close_fd( queue->esync_fd );
++    if (do_msync()) msync_destroy_semaphore( queue->msync_idx );
+ }
+ 
+ static void msg_queue_poll_event( struct fd *fd, int event )
+ {
+     struct msg_queue *queue = get_fd_user( fd );
+     assert( queue->obj.ops == &msg_queue_ops );
+@@ -3114,24 +3177,35 @@
+                     shared->changed_mask = 0;
+                 }
+                 SHARED_WRITE_END;
+             }
+             else wake_up( &queue->obj, 0 );
+         }
++        if (do_msync() && !is_signaled( queue ))
++            msync_clear( &queue->obj );
++
++        if (do_esync() && !is_signaled( queue ))
++            esync_clear( queue->esync_fd );
+     }
+ }
+ 
+ 
+ /* get the current message queue status */
+ DECL_HANDLER(get_queue_status)
+ {
+     struct msg_queue *queue = current->queue;
+     if (queue)
+     {
+         const queue_shm_t *queue_shm = queue->shared;
+ 
++        if (do_msync() && !is_signaled( queue ))
++            msync_clear( &queue->obj );
++
++        if (do_esync() && !is_signaled( queue ))
++            esync_clear( queue->esync_fd );
++
+         reply->wake_bits    = queue_shm->wake_bits;
+         reply->changed_bits = queue_shm->changed_bits;
+ 
+         SHARED_WRITE_BEGIN( queue_shm, queue_shm_t )
+         {
+             shared->changed_bits &= ~req->clear_bits;
+@@ -3391,12 +3465,18 @@
+         shared->wake_mask = req->wake_mask;
+         shared->changed_mask = req->changed_mask;
+     }
+     SHARED_WRITE_END;
+ 
+     set_error( STATUS_PENDING );  /* FIXME */
++
++    if (do_msync() && !is_signaled( queue ))
++        msync_clear( &queue->obj );
++
++    if (do_esync() && !is_signaled( queue ))
++        esync_clear( queue->esync_fd );
+ }
+ 
+ 
+ /* reply to a sent message */
+ DECL_HANDLER(reply_message)
+ {
+@@ -4181,6 +4261,36 @@
+     if (req->period >= 0) desktop->key_repeat.period = -req->period * 10000;
+ 
+     if (!desktop->key_repeat.enable) stop_key_repeat( desktop );
+ 
+     release_object( desktop );
+ }
++
++DECL_HANDLER(esync_msgwait)
++{
++    struct msg_queue *queue = get_current_queue();
++
++    if (!queue) return;
++    queue->esync_in_msgwait = req->in_msgwait;
++
++    if (current->process->idle_event && !(queue->shared->wake_mask & QS_SMRESULT))
++        set_event( current->process->idle_event );
++
++    /* and start/stop waiting on the driver */
++    if (queue->fd)
++        set_fd_events( queue->fd, req->in_msgwait ? POLLIN : 0 );
++}
++
++DECL_HANDLER(msync_msgwait)
++{
++    struct msg_queue *queue = get_current_queue();
++
++    if (!queue) return;
++    queue->msync_in_msgwait = req->in_msgwait;
++
++    if (current->process->idle_event && !(queue->shared->wake_mask & QS_SMRESULT))
++        set_event( current->process->idle_event );
++
++    /* and start/stop waiting on the driver */
++    if (queue->fd)
++        set_fd_events( queue->fd, req->in_msgwait ? POLLIN : 0 );
++}
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -296,12 +296,23 @@
+ DECL_HANDLER(get_job_info);
+ DECL_HANDLER(terminate_job);
+ DECL_HANDLER(suspend_process);
+ DECL_HANDLER(resume_process);
+ DECL_HANDLER(get_next_thread);
+ DECL_HANDLER(set_keyboard_repeat);
++DECL_HANDLER(create_esync);
++DECL_HANDLER(open_esync);
++DECL_HANDLER(get_esync_read_fd);
++DECL_HANDLER(get_esync_write_fd);
++DECL_HANDLER(esync_msgwait);
++DECL_HANDLER(get_esync_apc_fd);
++DECL_HANDLER(create_msync);
++DECL_HANDLER(open_msync);
++DECL_HANDLER(get_msync_idx);
++DECL_HANDLER(msync_msgwait);
++DECL_HANDLER(get_msync_apc_idx);
+ 
+ typedef void (*req_handler)( const void *req, void *reply );
+ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+ {
+     (req_handler)req_new_process,
+     (req_handler)req_get_new_process_info,
+@@ -592,12 +603,23 @@
+     (req_handler)req_get_job_info,
+     (req_handler)req_terminate_job,
+     (req_handler)req_suspend_process,
+     (req_handler)req_resume_process,
+     (req_handler)req_get_next_thread,
+     (req_handler)req_set_keyboard_repeat,
++    (req_handler)req_create_esync,
++    (req_handler)req_open_esync,
++    (req_handler)req_get_esync_read_fd,
++    (req_handler)req_get_esync_write_fd,
++    (req_handler)req_esync_msgwait,
++    (req_handler)req_get_esync_apc_fd,
++    (req_handler)req_create_msync,
++    (req_handler)req_open_msync,
++    (req_handler)req_get_msync_idx,
++    (req_handler)req_msync_msgwait,
++    (req_handler)req_get_msync_apc_idx,
+ };
+ 
+ C_ASSERT( sizeof(abstime_t) == 8 );
+ C_ASSERT( sizeof(affinity_t) == 8 );
+ C_ASSERT( sizeof(apc_param_t) == 8 );
+ C_ASSERT( sizeof(atom_t) == 4 );
+@@ -2267,6 +2289,63 @@
+ C_ASSERT( offsetof(struct set_keyboard_repeat_request, enable) == 12 );
+ C_ASSERT( offsetof(struct set_keyboard_repeat_request, delay) == 16 );
+ C_ASSERT( offsetof(struct set_keyboard_repeat_request, period) == 20 );
+ C_ASSERT( sizeof(struct set_keyboard_repeat_request) == 24 );
+ C_ASSERT( offsetof(struct set_keyboard_repeat_reply, enable) == 8 );
+ C_ASSERT( sizeof(struct set_keyboard_repeat_reply) == 16 );
++C_ASSERT( offsetof(struct create_esync_request, access) == 12 );
++C_ASSERT( offsetof(struct create_esync_request, initval) == 16 );
++C_ASSERT( offsetof(struct create_esync_request, type) == 20 );
++C_ASSERT( offsetof(struct create_esync_request, max) == 24 );
++C_ASSERT( sizeof(struct create_esync_request) == 32 );
++C_ASSERT( offsetof(struct create_esync_reply, handle) == 8 );
++C_ASSERT( offsetof(struct create_esync_reply, type) == 12 );
++C_ASSERT( offsetof(struct create_esync_reply, shm_idx) == 16 );
++C_ASSERT( sizeof(struct create_esync_reply) == 24 );
++C_ASSERT( offsetof(struct open_esync_request, access) == 12 );
++C_ASSERT( offsetof(struct open_esync_request, attributes) == 16 );
++C_ASSERT( offsetof(struct open_esync_request, rootdir) == 20 );
++C_ASSERT( offsetof(struct open_esync_request, type) == 24 );
++C_ASSERT( sizeof(struct open_esync_request) == 32 );
++C_ASSERT( offsetof(struct open_esync_reply, handle) == 8 );
++C_ASSERT( offsetof(struct open_esync_reply, type) == 12 );
++C_ASSERT( offsetof(struct open_esync_reply, shm_idx) == 16 );
++C_ASSERT( sizeof(struct open_esync_reply) == 24 );
++C_ASSERT( offsetof(struct get_esync_read_fd_request, handle) == 12 );
++C_ASSERT( sizeof(struct get_esync_read_fd_request) == 16 );
++C_ASSERT( offsetof(struct get_esync_read_fd_reply, type) == 8 );
++C_ASSERT( offsetof(struct get_esync_read_fd_reply, shm_idx) == 12 );
++C_ASSERT( sizeof(struct get_esync_read_fd_reply) == 16 );
++C_ASSERT( offsetof(struct get_esync_write_fd_request, handle) == 12 );
++C_ASSERT( sizeof(struct get_esync_write_fd_request) == 16 );
++C_ASSERT( sizeof(struct get_esync_write_fd_reply) == 8 );
++C_ASSERT( offsetof(struct esync_msgwait_request, in_msgwait) == 12 );
++C_ASSERT( sizeof(struct esync_msgwait_request) == 16 );
++C_ASSERT( sizeof(struct get_esync_apc_fd_request) == 16 );
++C_ASSERT( offsetof(struct create_msync_request, access) == 12 );
++C_ASSERT( offsetof(struct create_msync_request, low) == 16 );
++C_ASSERT( offsetof(struct create_msync_request, high) == 20 );
++C_ASSERT( offsetof(struct create_msync_request, type) == 24 );
++C_ASSERT( sizeof(struct create_msync_request) == 32 );
++C_ASSERT( offsetof(struct create_msync_reply, handle) == 8 );
++C_ASSERT( offsetof(struct create_msync_reply, type) == 12 );
++C_ASSERT( offsetof(struct create_msync_reply, shm_idx) == 16 );
++C_ASSERT( sizeof(struct create_msync_reply) == 24 );
++C_ASSERT( offsetof(struct open_msync_request, access) == 12 );
++C_ASSERT( offsetof(struct open_msync_request, attributes) == 16 );
++C_ASSERT( offsetof(struct open_msync_request, rootdir) == 20 );
++C_ASSERT( offsetof(struct open_msync_request, type) == 24 );
++C_ASSERT( sizeof(struct open_msync_request) == 32 );
++C_ASSERT( offsetof(struct open_msync_reply, handle) == 8 );
++C_ASSERT( offsetof(struct open_msync_reply, type) == 12 );
++C_ASSERT( offsetof(struct open_msync_reply, shm_idx) == 16 );
++C_ASSERT( sizeof(struct open_msync_reply) == 24 );
++C_ASSERT( offsetof(struct get_msync_idx_request, handle) == 12 );
++C_ASSERT( sizeof(struct get_msync_idx_request) == 16 );
++C_ASSERT( offsetof(struct get_msync_idx_reply, type) == 8 );
++C_ASSERT( offsetof(struct get_msync_idx_reply, shm_idx) == 12 );
++C_ASSERT( sizeof(struct get_msync_idx_reply) == 16 );
++C_ASSERT( offsetof(struct msync_msgwait_request, in_msgwait) == 12 );
++C_ASSERT( sizeof(struct msync_msgwait_request) == 16 );
++C_ASSERT( sizeof(struct get_msync_apc_idx_request) == 16 );
++C_ASSERT( offsetof(struct get_msync_apc_idx_reply, shm_idx) == 8 );
++C_ASSERT( sizeof(struct get_msync_apc_idx_reply) == 16 );
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3339,14 +3339,128 @@
+     fprintf( stderr, ", period=%d", req->period );
+ }
+ 
+ static void dump_set_keyboard_repeat_reply( const struct set_keyboard_repeat_reply *req )
+ {
+     fprintf( stderr, " enable=%d", req->enable );
++}
++
++static void dump_create_esync_request( const struct create_esync_request *req )
++{
++    fprintf( stderr, " access=%08x", req->access );
++    fprintf( stderr, ", initval=%d", req->initval );
++    fprintf( stderr, ", type=%d", req->type );
++    fprintf( stderr, ", max=%d", req->max );
++    dump_varargs_object_attributes( ", objattr=", cur_size );
++}
++
++static void dump_create_esync_reply( const struct create_esync_reply *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", type=%d", req->type );
++    fprintf( stderr, ", shm_idx=%08x", req->shm_idx );
++}
++
++static void dump_open_esync_request( const struct open_esync_request *req )
++{
++    fprintf( stderr, " access=%08x", req->access );
++    fprintf( stderr, ", attributes=%08x", req->attributes );
++    fprintf( stderr, ", rootdir=%04x", req->rootdir );
++    fprintf( stderr, ", type=%d", req->type );
++    dump_varargs_unicode_str( ", name=", cur_size );
+ }
+ 
++static void dump_open_esync_reply( const struct open_esync_reply *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", type=%d", req->type );
++    fprintf( stderr, ", shm_idx=%08x", req->shm_idx );
++}
++
++static void dump_get_esync_read_fd_request( const struct get_esync_read_fd_request *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++}
++
++static void dump_get_esync_read_fd_reply( const struct get_esync_read_fd_reply *req )
++{
++    fprintf( stderr, " type=%d", req->type );
++    fprintf( stderr, ", shm_idx=%08x", req->shm_idx );
++}
++
++static void dump_get_esync_write_fd_request( const struct get_esync_write_fd_request *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++}
++
++static void dump_esync_msgwait_request( const struct esync_msgwait_request *req )
++{
++    fprintf( stderr, " in_msgwait=%d", req->in_msgwait );
++}
++
++static void dump_get_esync_apc_fd_request( const struct get_esync_apc_fd_request *req )
++{
++}
++
++static void dump_create_msync_request( const struct create_msync_request *req )
++{
++    fprintf( stderr, " access=%08x", req->access );
++    fprintf( stderr, ", low=%d", req->low );
++    fprintf( stderr, ", high=%d", req->high );
++    fprintf( stderr, ", type=%d", req->type );
++    dump_varargs_object_attributes( ", objattr=", cur_size );
++}
++
++static void dump_create_msync_reply( const struct create_msync_reply *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", type=%d", req->type );
++    fprintf( stderr, ", shm_idx=%08x", req->shm_idx );
++}
++
++static void dump_open_msync_request( const struct open_msync_request *req )
++{
++    fprintf( stderr, " access=%08x", req->access );
++    fprintf( stderr, ", attributes=%08x", req->attributes );
++    fprintf( stderr, ", rootdir=%04x", req->rootdir );
++    fprintf( stderr, ", type=%d", req->type );
++    dump_varargs_unicode_str( ", name=", cur_size );
++}
++
++static void dump_open_msync_reply( const struct open_msync_reply *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", type=%d", req->type );
++    fprintf( stderr, ", shm_idx=%08x", req->shm_idx );
++}
++
++static void dump_get_msync_idx_request( const struct get_msync_idx_request *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++}
++
++static void dump_get_msync_idx_reply( const struct get_msync_idx_reply *req )
++{
++    fprintf( stderr, " type=%d", req->type );
++    fprintf( stderr, ", shm_idx=%08x", req->shm_idx );
++}
++
++static void dump_msync_msgwait_request( const struct msync_msgwait_request *req )
++{
++    fprintf( stderr, " in_msgwait=%d", req->in_msgwait );
++}
++
++static void dump_get_msync_apc_idx_request( const struct get_msync_apc_idx_request *req )
++{
++}
++
++static void dump_get_msync_apc_idx_reply( const struct get_msync_apc_idx_reply *req )
++{
++    fprintf( stderr, " shm_idx=%08x", req->shm_idx );
++}
++
+ typedef void (*dump_func)( const void *req );
+ 
+ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+ {
+     (dump_func)dump_new_process_request,
+     (dump_func)dump_get_new_process_info_request,
+@@ -3637,12 +3751,23 @@
+     (dump_func)dump_get_job_info_request,
+     (dump_func)dump_terminate_job_request,
+     (dump_func)dump_suspend_process_request,
+     (dump_func)dump_resume_process_request,
+     (dump_func)dump_get_next_thread_request,
+     (dump_func)dump_set_keyboard_repeat_request,
++    (dump_func)dump_create_esync_request,
++    (dump_func)dump_open_esync_request,
++    (dump_func)dump_get_esync_read_fd_request,
++    (dump_func)dump_get_esync_write_fd_request,
++    (dump_func)dump_esync_msgwait_request,
++    (dump_func)dump_get_esync_apc_fd_request,
++    (dump_func)dump_create_msync_request,
++    (dump_func)dump_open_msync_request,
++    (dump_func)dump_get_msync_idx_request,
++    (dump_func)dump_msync_msgwait_request,
++    (dump_func)dump_get_msync_apc_idx_request,
+ };
+ 
+ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+ {
+     (dump_func)dump_new_process_reply,
+     (dump_func)dump_get_new_process_info_reply,
+@@ -3933,12 +4058,23 @@
+     (dump_func)dump_get_job_info_reply,
+     NULL,
+     NULL,
+     NULL,
+     (dump_func)dump_get_next_thread_reply,
+     (dump_func)dump_set_keyboard_repeat_reply,
++    (dump_func)dump_create_esync_reply,
++    (dump_func)dump_open_esync_reply,
++    (dump_func)dump_get_esync_read_fd_reply,
++    NULL,
++    NULL,
++    NULL,
++    (dump_func)dump_create_msync_reply,
++    (dump_func)dump_open_msync_reply,
++    (dump_func)dump_get_msync_idx_reply,
++    NULL,
++    (dump_func)dump_get_msync_apc_idx_reply,
+ };
+ 
+ static const char * const req_names[REQ_NB_REQUESTS] =
+ {
+     "new_process",
+     "get_new_process_info",
+@@ -4229,12 +4365,23 @@
+     "get_job_info",
+     "terminate_job",
+     "suspend_process",
+     "resume_process",
+     "get_next_thread",
+     "set_keyboard_repeat",
++    "create_esync",
++    "open_esync",
++    "get_esync_read_fd",
++    "get_esync_write_fd",
++    "esync_msgwait",
++    "get_esync_apc_fd",
++    "create_msync",
++    "open_msync",
++    "get_msync_idx",
++    "msync_msgwait",
++    "get_msync_apc_idx",
+ };
+ 
+ static const struct
+ {
+     const char  *name;
+     unsigned int value;
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -47,12 +47,14 @@
+ #include "handle.h"
+ #include "process.h"
+ #include "thread.h"
+ #include "request.h"
+ #include "user.h"
+ #include "security.h"
++#include "esync.h"
++#include "msync.h"
+ 
+ 
+ /* thread queues */
+ 
+ struct thread_wait
+ {
+@@ -171,12 +173,14 @@
+         THREAD_ALL_ACCESS
+     },
+ };
+ 
+ static void dump_thread( struct object *obj, int verbose );
+ static int thread_signaled( struct object *obj, struct wait_queue_entry *entry );
++static struct esync_fd *thread_get_esync_fd( struct object *obj, enum esync_type *type );
++static unsigned int thread_get_msync_idx( struct object *obj, enum msync_type *type );
+ static unsigned int thread_map_access( struct object *obj, unsigned int access );
+ static void thread_poll_event( struct fd *fd, int event );
+ static struct list *thread_get_kernel_obj_list( struct object *obj );
+ static void destroy_thread( struct object *obj );
+ 
+ static const struct object_ops thread_ops =
+@@ -197,13 +201,15 @@
+     no_lookup_name,             /* lookup_name */
+     no_link_name,               /* link_name */
+     NULL,                       /* unlink_name */
+     no_open_file,               /* open_file */
+     thread_get_kernel_obj_list, /* get_kernel_obj_list */
+     no_close_handle,            /* close_handle */
+-    destroy_thread              /* destroy */
++    destroy_thread,             /* destroy */
++    thread_get_esync_fd,        /* get_esync_fd */
++    thread_get_msync_idx,       /* get_msync_idx */
+ };
+ 
+ static const struct fd_ops thread_fd_ops =
+ {
+     NULL,                       /* get_poll_events */
+     thread_poll_event,          /* poll_event */
+@@ -223,12 +229,16 @@
+ 
+     thread->unix_pid        = -1;  /* not known yet */
+     thread->unix_tid        = -1;  /* not known yet */
+     thread->context         = NULL;
+     thread->teb             = 0;
+     thread->entry_point     = 0;
++    thread->esync_fd        = NULL;
++    thread->esync_apc_fd    = NULL;
++    thread->msync_idx       = 0;
++    thread->msync_apc_idx   = 0;
+     thread->system_regs     = 0;
+     thread->queue           = NULL;
+     thread->wait            = NULL;
+     thread->error           = 0;
+     thread->req_data        = NULL;
+     thread->req_toread      = 0;
+@@ -370,12 +380,24 @@
+         {
+             set_thread_default_desktop( thread, desktop, process->desktop );
+             release_object( desktop );
+         }
+     }
+ 
++    if (do_msync())
++    {
++        thread->msync_idx = msync_alloc_shm( 0, 0 );
++        thread->msync_apc_idx = msync_alloc_shm( 0, 0 );
++    }
++
++    if (do_esync())
++    {
++        thread->esync_fd = esync_create_fd( 0, 0 );
++        thread->esync_apc_fd = esync_create_fd( 0, 0 );
++    }
++
+     set_fd_events( thread->request_fd, POLLIN );  /* start listening to events */
+     add_process_thread( thread->process, thread );
+     return thread;
+ }
+ 
+ /* handle a client event */
+@@ -449,12 +471,24 @@
+ 
+     list_remove( &thread->entry );
+     cleanup_thread( thread );
+     release_object( thread->process );
+     if (thread->id) free_ptid( thread->id );
+     if (thread->token) release_object( thread->token );
++
++    if (do_esync())
++    {
++        esync_close_fd( thread->esync_fd );
++        esync_close_fd( thread->esync_apc_fd );
++    }
++
++    if (do_msync())
++    {
++        msync_destroy_semaphore( thread->msync_idx );
++        msync_destroy_semaphore( thread->msync_apc_idx );
++    }
+ }
+ 
+ /* dump a thread on stdout for debugging purposes */
+ static void dump_thread( struct object *obj, int verbose )
+ {
+     struct thread *thread = (struct thread *)obj;
+@@ -467,12 +501,26 @@
+ static int thread_signaled( struct object *obj, struct wait_queue_entry *entry )
+ {
+     struct thread *mythread = (struct thread *)obj;
+     return (mythread->state == TERMINATED);
+ }
+ 
++static struct esync_fd *thread_get_esync_fd( struct object *obj, enum esync_type *type )
++{
++    struct thread *thread = (struct thread *)obj;
++    *type = ESYNC_MANUAL_SERVER;
++    return thread->esync_fd;
++}
++
++static unsigned int thread_get_msync_idx( struct object *obj, enum msync_type *type )
++{
++    struct thread *thread = (struct thread *)obj;
++    *type = MSYNC_MANUAL_SERVER;
++    return thread->msync_idx;
++}
++
+ static unsigned int thread_map_access( struct object *obj, unsigned int access )
+ {
+     access = default_map_access( obj, access );
+     if (access & THREAD_QUERY_INFORMATION) access |= THREAD_QUERY_LIMITED_INFORMATION;
+     if (access & THREAD_SET_INFORMATION) access |= THREAD_SET_LIMITED_INFORMATION;
+     return access;
+@@ -1062,12 +1110,18 @@
+ /* attempt to wake threads sleeping on the object wait queue */
+ void wake_up( struct object *obj, int max )
+ {
+     struct list *ptr;
+     int ret;
+ 
++    if (do_msync())
++        msync_wake_up( obj );
++
++    if (do_esync())
++        esync_wake_up( obj );
++
+     LIST_FOR_EACH( ptr, &obj->wait_queue )
+     {
+         struct wait_queue_entry *entry = LIST_ENTRY( ptr, struct wait_queue_entry, entry );
+         if (!(ret = wake_thread( get_wait_queue_thread( entry )))) continue;
+         if (ret > 0 && max && !--max) break;
+         /* restart at the head of the list since a wake up can change the object wait queue */
+@@ -1146,14 +1200,22 @@
+         if (apc->owner) thread_cancel_apc( thread, apc->owner, apc->call.type );
+     }
+ 
+     grab_object( apc );
+     list_add_tail( queue, &apc->entry );
+     if (!list_prev( queue, &apc->entry ))  /* first one */
++    {
+         wake_thread( thread );
+ 
++        if (do_msync() && queue == &thread->user_apc)
++            msync_signal_all( thread->msync_apc_idx );
++
++        if (do_esync() && queue == &thread->user_apc)
++            esync_wake_fd( thread->esync_apc_fd );
++    }
++
+     return 1;
+ }
+ 
+ /* queue an async procedure call */
+ int thread_queue_apc( struct process *process, struct thread *thread, struct object *owner, const union apc_call *call_data )
+ {
+@@ -1193,12 +1255,19 @@
+ 
+     if (ptr)
+     {
+         apc = LIST_ENTRY( ptr, struct thread_apc, entry );
+         list_remove( ptr );
+     }
++
++    if (do_msync() && list_empty( &thread->system_apc ) && list_empty( &thread->user_apc ))
++        msync_clear_shm( thread->msync_apc_idx );
++
++    if (do_esync() && list_empty( &thread->system_apc ) && list_empty( &thread->user_apc ))
++        esync_clear( thread->esync_apc_fd );
++
+     return apc;
+ }
+ 
+ /* clear an APC queue, cancelling all the APCs on it */
+ static void clear_apc_queue( struct list *queue )
+ {
+@@ -1288,12 +1357,16 @@
+         send_thread_wakeup( thread, 0, thread->exit_code );
+         /* if it is waiting on the socket, we don't need to send a SIGQUIT */
+         violent_death = 0;
+     }
+     kill_console_processes( thread, 0 );
+     abandon_mutexes( thread );
++    if (do_msync())
++        msync_abandon_mutexes( thread );
++    if (do_esync())
++        esync_abandon_mutexes( thread );
+     wake_up( &thread->obj, 0 );
+     if (violent_death) send_thread_signal( thread, SIGQUIT );
+     cleanup_thread( thread );
+     remove_process_thread( thread->process, thread );
+     release_object( thread );
+ }
+--- a/server/thread.h
++++ b/server/thread.h
+@@ -53,12 +53,16 @@
+     struct list            entry;         /* entry in system-wide thread list */
+     struct list            proc_entry;    /* entry in per-process thread list */
+     struct list            desktop_entry; /* entry in per-desktop thread list */
+     struct process        *process;
+     thread_id_t            id;            /* thread id */
+     struct list            mutex_list;    /* list of currently owned mutexes */
++    struct esync_fd       *esync_fd;      /* esync file descriptor (signalled on exit) */
++    struct esync_fd       *esync_apc_fd;  /* esync apc fd (signalled when APCs are present) */
++    unsigned int           msync_idx;
++    unsigned int           msync_apc_idx;
+     unsigned int           system_regs;   /* which system regs have been set */
+     struct msg_queue      *queue;         /* message queue */
+     struct thread_wait    *wait;          /* current wait condition if sleeping */
+     struct list            system_apc;    /* queue of system async procedure calls */
+     struct list            user_apc;      /* queue of user async procedure calls */
+     struct inflight_fd     inflight[MAX_INFLIGHT_FDS];  /* fds currently in flight */
+--- a/server/timer.c
++++ b/server/timer.c
+@@ -32,12 +32,14 @@
+ #include "windef.h"
+ #include "winternl.h"
+ 
+ #include "file.h"
+ #include "handle.h"
+ #include "request.h"
++#include "esync.h"
++#include "msync.h"
+ 
+ static const WCHAR timer_name[] = {'T','i','m','e','r'};
+ 
+ struct type_descr timer_type =
+ {
+     { timer_name, sizeof(timer_name) },   /* name */
+@@ -58,16 +60,20 @@
+     unsigned int         period;    /* timer period in ms */
+     abstime_t            when;      /* next expiration */
+     struct timeout_user *timeout;   /* timeout user */
+     struct thread       *thread;    /* thread that set the APC function */
+     client_ptr_t         callback;  /* callback APC function */
+     client_ptr_t         arg;       /* callback argument */
++    struct esync_fd     *esync_fd;  /* esync file descriptor */
++    unsigned int         msync_idx; /* msync shm index */
+ };
+ 
+ static void timer_dump( struct object *obj, int verbose );
+ static int timer_signaled( struct object *obj, struct wait_queue_entry *entry );
++static struct esync_fd *timer_get_esync_fd( struct object *obj, enum esync_type *type );
++static unsigned int timer_get_msync_idx( struct object *obj, enum msync_type *type );
+ static void timer_satisfied( struct object *obj, struct wait_queue_entry *entry );
+ static void timer_destroy( struct object *obj );
+ 
+ static const struct object_ops timer_ops =
+ {
+     sizeof(struct timer),      /* size */
+@@ -86,13 +92,15 @@
+     no_lookup_name,            /* lookup_name */
+     directory_link_name,       /* link_name */
+     default_unlink_name,       /* unlink_name */
+     no_open_file,              /* open_file */
+     no_kernel_obj_list,        /* get_kernel_obj_list */
+     no_close_handle,           /* close_handle */
+-    timer_destroy              /* destroy */
++    timer_destroy,             /* destroy */
++    timer_get_esync_fd,        /* get_esync_fd */
++    timer_get_msync_idx,       /* get_msync_idx */
+ };
+ 
+ 
+ /* create a timer object */
+ static struct timer *create_timer( struct object *root, const struct unicode_str *name,
+                                    unsigned int attr, int manual, const struct security_descriptor *sd )
+@@ -107,12 +115,19 @@
+             timer->manual   = manual;
+             timer->signaled = 0;
+             timer->when     = 0;
+             timer->period   = 0;
+             timer->timeout  = NULL;
+             timer->thread   = NULL;
++            timer->esync_fd = NULL;
++
++            if (do_msync())
++                timer->msync_idx = msync_alloc_shm( 0, 0 );
++
++            if (do_esync())
++                timer->esync_fd = esync_create_fd( 0, 0 );
+         }
+     }
+     return timer;
+ }
+ 
+ /* callback on timer expiration */
+@@ -178,12 +193,18 @@
+ {
+     int signaled = cancel_timer( timer );
+     if (timer->manual)
+     {
+         period = 0;  /* period doesn't make any sense for a manual timer */
+         timer->signaled = 0;
++
++        if (do_msync())
++            msync_clear( &timer->obj );
++
++        if (do_esync())
++            esync_clear( timer->esync_fd );
+     }
+     timer->when     = (expire <= 0) ? expire - monotonic_time : max( expire, current_time );
+     timer->period   = period;
+     timer->callback = callback;
+     timer->arg      = arg;
+     if (callback) timer->thread = (struct thread *)grab_object( current );
+@@ -205,12 +226,26 @@
+ {
+     struct timer *timer = (struct timer *)obj;
+     assert( obj->ops == &timer_ops );
+     return timer->signaled;
+ }
+ 
++static struct esync_fd *timer_get_esync_fd( struct object *obj, enum esync_type *type )
++{
++    struct timer *timer = (struct timer *)obj;
++    *type = timer->manual ? ESYNC_MANUAL_SERVER : ESYNC_AUTO_SERVER;
++    return timer->esync_fd;
++}
++
++static unsigned int timer_get_msync_idx( struct object *obj, enum msync_type *type )
++{
++    struct timer *timer = (struct timer *)obj;
++    *type = timer->manual ? MSYNC_MANUAL_SERVER : MSYNC_AUTO_SERVER;
++    return timer->msync_idx;
++}
++
+ static void timer_satisfied( struct object *obj, struct wait_queue_entry *entry )
+ {
+     struct timer *timer = (struct timer *)obj;
+     assert( obj->ops == &timer_ops );
+     if (!timer->manual) timer->signaled = 0;
+ }
+@@ -219,12 +254,15 @@
+ {
+     struct timer *timer = (struct timer *)obj;
+     assert( obj->ops == &timer_ops );
+ 
+     if (timer->timeout) remove_timeout_user( timer->timeout );
+     if (timer->thread) release_object( timer->thread );
++    if (do_esync()) esync_close_fd( timer->esync_fd );
++    if (do_msync())
++        msync_destroy_semaphore( timer->msync_idx );
+ }
+ 
+ /* create a timer */
+ DECL_HANDLER(create_timer)
+ {
+     struct timer *timer;

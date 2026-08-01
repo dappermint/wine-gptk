@@ -1,0 +1,53 @@
+--- a/dlls/dwrite/font.c
++++ b/dlls/dwrite/font.c
+@@ -1229,13 +1229,14 @@
+     *mode = IDWriteRenderingParams_GetRenderingMode(params);
+     if (*mode != DWRITE_RENDERING_MODE_DEFAULT)
+         return S_OK;
+ 
+     ppem = emSize * ppdip;
+ 
+-    if (ppem >= RECOMMENDED_OUTLINE_AA_THRESHOLD) {
++    /* CXHACK: disable outline rendering mode to workaround d2d issue, see bug 14558, bug 14721 */
++    if (0 && ppem >= RECOMMENDED_OUTLINE_AA_THRESHOLD) {
+         *mode = DWRITE_RENDERING_MODE_OUTLINE;
+         return S_OK;
+     }
+ 
+     flags = opentype_get_gasp_flags(get_fontface_gasp(fontface), ppem);
+     *mode = fontface_renderingmode_from_measuringmode(measuring, ppem, flags);
+@@ -4603,12 +4604,16 @@
+ static void fontcollection_add_replacements(struct dwrite_fontcollection *collection)
+ {
+     DWORD max_namelen, max_datalen, i = 0, type, datalen, namelen;
+     WCHAR *name;
+     void *data;
+     HKEY hkey;
++#ifdef __ANDROID__
++    WCHAR meiryoW[] = {'M','e','i','r','y','o',0};
++    WCHAR meiryo_replacement[] = {'D','r','o','i','d',' ','S','a','n','s',' ','F','a','l','l','b','a','c','k',0};
++#endif
+ 
+     if (RegOpenKeyA(HKEY_CURRENT_USER, "Software\\Wine\\Fonts\\Replacements", &hkey))
+         return;
+ 
+     if (RegQueryInfoKeyW(hkey, NULL, NULL, NULL, NULL, NULL, NULL, NULL, &max_namelen, &max_datalen, NULL, NULL)) {
+         RegCloseKey(hkey);
+@@ -4641,12 +4646,17 @@
+         namelen = max_namelen;
+     }
+ 
+     free(data);
+     free(name);
+     RegCloseKey(hkey);
++
++#ifdef __ANDROID__
++    /* CROSSOVER HACK - bug 14034 */
++    fontcollection_add_replacement(collection, meiryoW, meiryo_replacement);
++#endif
+ }
+ 
+ HRESULT create_font_collection(IDWriteFactory7 *factory, IDWriteFontFileEnumerator *enumerator, BOOL is_system,
+     IDWriteFontCollection3 **ret)
+ {
+     struct fontfile_enum {

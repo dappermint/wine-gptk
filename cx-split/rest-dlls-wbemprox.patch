@@ -1,0 +1,116 @@
+--- a/dlls/wbemprox/builtin.c
++++ b/dlls/wbemprox/builtin.c
+@@ -518,12 +518,18 @@
+     { L"TimeOfLastReset",             CIM_DATETIME },
+     { L"VideoArchitecture",           CIM_UINT16 },
+     { L"VideoMemoryType",             CIM_UINT16 },
+     { L"VideoMode",                   CIM_UINT16 },
+     { L"VideoModeDescription",        CIM_STRING|COL_FLAG_DYNAMIC },
+     { L"VideoProcessor",              CIM_STRING|COL_FLAG_DYNAMIC },
++};
++static const struct column col_serverfeature[] =
++{
++    { L"ID",       CIM_UINT32|COL_FLAG_KEY },
++    { L"ParentID", CIM_UINT32 },
++    { L"Name",     CIM_STRING },
+ };
+ 
+ static const struct column col_volume[] =
+ {
+     { L"DeviceId",      CIM_STRING|COL_FLAG_DYNAMIC|COL_FLAG_KEY },
+     { L"DriveLetter",   CIM_STRING|COL_FLAG_DYNAMIC },
+@@ -1010,12 +1016,18 @@
+     const WCHAR *time_reset;
+     UINT16       videoarchitecture;
+     UINT16       videomemorytype;
+     UINT16       videomode;
+     const WCHAR *videomodedescription;
+     const WCHAR *videoprocessor;
++};
++struct record_serverfeature
++{
++    UINT32       id;
++    UINT32       parentid;
++    const WCHAR *name;
+ };
+ 
+ struct record_volume
+ {
+     const WCHAR *deviceid;
+     const WCHAR *driveletter;
+@@ -1161,12 +1173,16 @@
+     &systemenclosure_chassistypes
+ };
+ static const struct record_systemsecurity data_systemsecurity[] =
+ {
+     { security_get_sd, security_set_sd }
+ };
++static const struct record_serverfeature data_serverfeatures[] =
++{
++    { 35, 0, L"Desktop Experience" },
++};
+ static const struct record_winsat data_winsat[] =
+ {
+     { 8.0f, 8.0f, 8.0f, 8.0f, 8.0f, L"MostRecentAssessment", 1 /* Valid */, 8.0f },
+ };
+ 
+ /* check if row matches condition and update status */
+@@ -4397,21 +4413,38 @@
+     { L"Win32_Service", C(col_service), 0, 0, NULL, fill_service },
+     { L"Win32_SoundDevice", C(col_sounddevice), 0, 0, NULL, fill_sounddevice },
+     { L"Win32_SystemEnclosure", C(col_systemenclosure), 0, 0, NULL, fill_systemenclosure },
+     { L"Win32_VideoController", C(col_videocontroller), 0, 0, NULL, fill_videocontroller },
+     { L"Win32_Volume", C(col_volume), 0, 0, NULL, fill_volume },
+     { L"Win32_WinSAT", C(col_winsat), D(data_winsat) },
++};
++
++static struct table server_feature[] =
++{
++    { L"Win32_ServerFeature", C(col_serverfeature), D(data_serverfeatures) },
+ };
+ 
+ static struct table wmi_builtin_classes[] =
+ {
+     { L"MSSMBios_RawSMBiosTables", C(col_rawsmbiostables), D(data_rawsmbiostables) },
+ };
+ #undef C
+ #undef D
+ 
++static BOOL is_onenote(void)
++{
++    static const char *onenote = "ONENOTE.EXE";
++    char name[MAX_PATH], *ptr;
++
++    if (!GetModuleFileNameA(NULL, name, sizeof(name)))
++        return FALSE;
++
++    ptr = strstr(name, onenote);
++    return ptr && !ptr[strlen(onenote)];
++}
++
+ static const struct
+ {
+     const WCHAR  *name;
+     struct table *tables;
+     unsigned int  table_count;
+ }
+@@ -4435,12 +4468,19 @@
+         {
+             struct table *table = &builtin_namespaces[ns].tables[i];
+             InitializeCriticalSectionEx( &table->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
+             table->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": table.cs" );
+             list_add_tail( &tables[ns], &table->entry );
+         }
++        /* CXHACK: 16057 - Client system do not support this class, for some reason OneNote asks for it anyway. */
++        if (!ns && is_onenote()) {
++            struct table *table = &server_feature[0];
++            InitializeCriticalSectionEx( &table->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++            table->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": table.cs" );
++            list_add_tail( &tables[ns], &table->entry );
++        }
+         table_list[ns] = &tables[ns];
+     }
+ }
+ 
+ enum wbm_namespace get_namespace_from_string( const WCHAR *namespace )
+ {

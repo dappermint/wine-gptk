@@ -1,0 +1,105 @@
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -236,23 +251,102 @@
+         if (requestSource)
+         {
+             CFRunLoopSourceInvalidate(requestSource);
+             CFRelease(requestSource);
+         }
+         [super dealloc];
++    }
++
++    // CrossOver Hack 10912: Mac Edit menu
++    - (BOOL) isEditMenuAction:(SEL)selector
++    {
++        return selector == @selector(copy:) || selector == @selector(cut:) ||
++               selector == @selector(delete:) || selector == @selector(paste:) ||
++               selector == @selector(selectAll:) || selector == @selector(undo:);
+     }
+ 
++    - (void) changeEditMenuKeyEquivalentsForWindow:(NSWindow*)window
++    {
++        if (mac_edit_menu == MAC_EDIT_MENU_DISABLED)
++        {
++            if ([window isKindOfClass:[WineWindow class]])
++            {
++                NSMutableArray* menus = [NSMutableArray arrayWithObject:[NSApp mainMenu]];
++
++                while ([menus count])
++                {
++                    NSMenu* menu = [menus objectAtIndex:0];
++                    [menus removeObjectAtIndex:0];
++
++                    for (NSMenuItem* item in [menu itemArray])
++                    {
++                        if ([self isEditMenuAction:[item action]] && ![item target] &&
++                            [[item keyEquivalent] length])
++                        {
++                            NSDictionary* record = [NSDictionary dictionaryWithObjectsAndKeys:
++                                                    item, @"menuItem",
++                                                    [item keyEquivalent], @"keyEquivalent",
++                                                    nil];
++                            if (!changedKeyEquivalents)
++                                changedKeyEquivalents = [[NSMutableArray alloc] init];
++                            [changedKeyEquivalents addObject:record];
++
++                            [item setKeyEquivalent:@""];
++                        }
++
++                        if ([item hasSubmenu])
++                            [menus addObject:[item submenu]];
++                    }
++                }
++            }
++            else
++            {
++                for (NSDictionary* record in changedKeyEquivalents)
++                {
++                    NSMenuItem* item = [record objectForKey:@"menuItem"];
++                    NSString* equiv = [record objectForKey:@"keyEquivalent"];
++                    [item setKeyEquivalent:equiv];
++                }
++
++                [changedKeyEquivalents removeAllObjects];
++            }
++        }
++    }
++
+     - (void) transformProcessToForeground:(BOOL)activateIfTransformed
+     {
+         if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular)
+         {
+             NSMenu* mainMenu;
+             NSMenu* submenu;
+             NSString* bundleName;
+             NSString* title;
+             NSMenuItem* item;
++
++            /* CW HACK 24141: Prevent dock icon creation for certain apps. */
++            {
++                static NSArray *blacklistedProcesses;
++                static dispatch_once_t onceToken;
++                NSString *exeName;
++
++                dispatch_once(&onceToken, ^{
++                    blacklistedProcesses = [@[
++                        @"GOG Galaxy Notifications Renderer.exe",  /* Hack 24141 */
++                    ] retain];
++                });
++
++                exeName = [NSRunningApplication currentApplication].executableURL.lastPathComponent;
++                if ([blacklistedProcesses containsObject:exeName])
++                {
++                    /* Try to honor the activation request regardless. */
++                    if (activateIfTransformed)
++                        [self tryToActivateIgnoringOtherApps:YES];
++
++                    return;
++                }
++            }
+ 
+             [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+ 
+             if (activateIfTransformed)
+                 [self tryToActivateIgnoringOtherApps:YES];
+ 

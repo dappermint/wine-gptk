@@ -1,0 +1,57 @@
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -518,12 +518,16 @@
+     RTL_USER_PROCESS_PARAMETERS *params = NULL;
+     RTL_USER_PROCESS_INFORMATION rtl_info;
+     HANDLE parent = 0, debug = 0;
+     ULONG nt_flags = 0;
+     USHORT machine = 0;
+     NTSTATUS status;
++    /* CW Hack 24938 */
++    BOOL epic_launcher_hack = FALSE;
++    WCHAR winsta0_defaultW[] = L"winsta0\\Default";
++    WCHAR *orig_lpDesktop = NULL;
+ 
+     /* Process the AppName and/or CmdLine to get module name and path */
+ 
+     TRACE( "app %s cmdline %s\n", debugstr_w(app_name), debugstr_w(cmd_line) );
+ 
+     if (new_token) FIXME( "No support for returning created process token\n" );
+@@ -540,12 +544,21 @@
+     else
+     {
+         if (!(tidy_cmdline = get_file_name( cmd_line, name, ARRAY_SIZE(name) ))) return FALSE;
+         app_name = name;
+     }
+ 
++    /* CW Hack 24938 */
++    if (cmd_line && wcsstr(cmd_line, L"\\EpicGamesLauncher.exe"))
++    {
++        FIXME("HACK: moving EpicGamesLauncher.exe to the default winstation\n");
++        epic_launcher_hack = TRUE;
++        orig_lpDesktop = startup_info->lpDesktop;
++        startup_info->lpDesktop = winsta0_defaultW;
++    }
++
+     /* Warn if unsupported features are used */
+ 
+     if (flags & (IDLE_PRIORITY_CLASS | HIGH_PRIORITY_CLASS | REALTIME_PRIORITY_CLASS |
+                  CREATE_DEFAULT_ERROR_MODE | PROFILE_USER | PROFILE_KERNEL | PROFILE_SERVER))
+         WARN( "(%s,...): ignoring some flags in %lx\n", debugstr_w(app_name), flags );
+ 
+@@ -671,12 +684,15 @@
+         info->dwThreadId  = HandleToUlong( rtl_info.ClientId.UniqueThread );
+         if (!(flags & CREATE_SUSPENDED)) NtResumeThread( rtl_info.Thread, NULL );
+         TRACE( "started process pid %04lx tid %04lx\n", info->dwProcessId, info->dwThreadId );
+     }
+ 
+  done:
++    /* CW Hack 24938 */
++    if (epic_launcher_hack) startup_info->lpDesktop = orig_lpDesktop;
++
+     RtlDestroyProcessParameters( params );
+     if (tidy_cmdline != cmd_line) HeapFree( GetProcessHeap(), 0, tidy_cmdline );
+     return set_ntstatus( status );
+ }
+ 
+ 

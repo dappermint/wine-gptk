@@ -1,0 +1,909 @@
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -720,13 +720,220 @@
+     }
+ 
+     window_surface_unlock( surface );
+ 
+     window_surface_flush( surface );
+ }
++
++
++/* CX HACK 23950 - START */
++
++struct shm_window_surface
++{
++    struct window_surface header;
++    HANDLE      section;
++    HWND        parent;
++    BITMAPINFO  info;
++};
+ 
++static struct shm_window_surface *get_shm_surface( struct window_surface *surface )
++{
++    return CONTAINING_RECORD(surface, struct shm_window_surface, header);
++}
++
++static void shm_surface_set_clip( struct window_surface *window_surface, const RECT *rects, UINT count )
++{
++    struct shm_window_surface *surface = get_shm_surface( window_surface );
++    FIXME( "(%p %p)\n", surface, rects );
++}
++
++static BOOL shm_surface_flush( struct window_surface *window_surface, const RECT *rect, const RECT *dirty,
++                               const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
++                               const BITMAPINFO *shape_info, const void *shape_bits )
++{
++    struct shm_window_surface *surface = get_shm_surface( window_surface );
++    struct flush_shm_surface_params params;
++
++    TRACE("%p\n", surface);
++
++    params.section = HandleToLong( surface->section );
++    params.hwnd = HandleToLong( surface->header.hwnd );
++    params.info = surface->info;
++    params.bounds = *dirty;
++
++    return send_message_timeout( surface->parent, WM_WINE_FLUSHSHMSURFACE, 0, (LPARAM)&params,
++                                 SMTO_ABORTIFHUNG | SMTO_BLOCK, 500, FALSE );
++}
++
++static void shm_surface_destroy( struct window_surface *window_surface )
++{
++    struct shm_window_surface *surface = get_shm_surface( window_surface );
++    OBJECT_ATTRIBUTES attr = { .Length = sizeof(OBJECT_ATTRIBUTES) };
++    HANDLE parent_process;
++    NTSTATUS status;
++    CLIENT_ID cid;
++    HANDLE h2;
++    DWORD pid;
++
++    TRACE( "freeing %p\n", surface );
++    if (surface->section)
++    {
++        get_window_thread( surface->parent, &pid );
++        cid.UniqueProcess = ULongToHandle(pid);
++        cid.UniqueThread  = 0;
++        status = NtOpenProcess( &parent_process, PROCESS_DUP_HANDLE, &attr, &cid );
++        if (status)
++        {
++            ERR( "NtOpenProcess failed: %x\n", status );
++        }
++        else
++        {
++            status = NtDuplicateObject( parent_process, surface->section, GetCurrentProcess(), &h2,
++                                        0, FALSE, DUPLICATE_CLOSE_SOURCE );
++            if (status)
++                ERR( "NtDuplicateObject failed: %x\n", status );
++            else
++                NtClose(h2);
++
++            NtClose(parent_process);
++        }
++    }
++}
++
++static const struct window_surface_funcs shm_surface_funcs =
++{
++    shm_surface_set_clip,
++    shm_surface_flush,
++    shm_surface_destroy,
++};
++
++struct window_surface *create_shm_surface( HWND window, HWND parent, const RECT *visible_rect,
++                                           struct window_surface *old_surface )
++{
++    OBJECT_ATTRIBUTES attr = { .Length = sizeof(OBJECT_ATTRIBUTES) };
++    struct shm_window_surface *surface;
++    LARGE_INTEGER section_size;
++    HANDLE parent_process;
++    CLIENT_ID cid;
++    BITMAPINFO info;
++    HANDLE mapping;
++    unsigned int status;
++    HBITMAP bitmap;
++    DWORD pid;
++    RECT r;
++
++    TRACE( "hwnd %p parent %p\n", window, parent );
++
++    r = *visible_rect;
++    OffsetRect( &r, -r.left, -r.top );
++    if (IsRectEmpty( &r )) return NULL;
++
++    if (old_surface && old_surface->funcs == &shm_surface_funcs)
++    {
++        surface = get_shm_surface( old_surface );
++        if (EqualRect( &surface->header.rect, &r ))
++        {
++            TRACE( "reusing surface %p\n", surface );
++            window_surface_add_ref( old_surface );
++            return old_surface;
++        }
++    }
++
++    info.bmiHeader.biSize        = sizeof(info.bmiHeader);
++    info.bmiHeader.biWidth       = r.right;
++    info.bmiHeader.biHeight      = -r.bottom;
++    info.bmiHeader.biPlanes      = 1;
++    info.bmiHeader.biBitCount    = 32;
++    info.bmiHeader.biSizeImage   = get_dib_image_size( &info );
++    info.bmiHeader.biCompression = BI_RGB;
++    info.bmiHeader.biClrUsed     = 0;
++
++    section_size.QuadPart = info.bmiHeader.biSizeImage;
++    status = NtCreateSection( &mapping,
++                              GENERIC_READ | SECTION_MAP_READ | SECTION_MAP_WRITE,
++                              NULL, &section_size, PAGE_READWRITE, SEC_COMMIT, 0 );
++    if (status)
++    {
++        ERR( "NtCreateSection failed: %x\n", status );
++        return NULL;
++    }
++
++    if (!(bitmap = NtGdiCreateDIBSection( 0, mapping, 0, &info, DIB_RGB_COLORS, 0, 0, 0, NULL )))
++    {
++        ERR( "NtGdiCreateDIBSection failed: %x\n", status );
++        NtClose( mapping );
++        return NULL;
++    }
++
++    surface = (struct shm_window_surface *)window_surface_create( sizeof(*surface), &shm_surface_funcs, window, &r, &info, bitmap );
++    surface->info = info;
++
++    TRACE( "crating surface %p for visible_rect %s of window %p\n", surface,
++           wine_dbgstr_rect(visible_rect), window );
++
++    surface->parent = parent;
++
++    get_window_thread( parent, &pid );
++    cid.UniqueProcess = ULongToHandle(pid);
++    cid.UniqueThread  = 0;
++    status = NtOpenProcess( &parent_process, PROCESS_DUP_HANDLE, &attr, &cid );
++    if (status)
++    {
++        ERR( "NtDuplicateObject failed: %x\n", status );
++        window_surface_release( &surface->header );
++        NtClose( mapping );
++        return NULL;
++    }
++
++    status = NtDuplicateObject( GetCurrentProcess(), mapping, parent_process,
++                                &surface->section, FILE_MAP_READ, FALSE, 0 );
++    NtClose( parent_process );
++    NtClose( mapping );
++    if (status)
++    {
++        ERR( "NtDuplicateObject failed: %x\n", status );
++        window_surface_release( &surface->header );
++        return NULL;
++    }
++
++    return &surface->header;
++}
++
++void process_surface_message( struct flush_shm_surface_params *params )
++{
++    HANDLE mapping = LongToHandle( params->section );
++    HWND hwnd = LongToHandle( params->hwnd );
++    SIZE_T view_size = 0;
++    unsigned int height;
++    unsigned int status;
++    void *bits = NULL;
++    HDC hdc;
++
++    TRACE( "Flushing %p window surface %s\n", hwnd, wine_dbgstr_rect( &params->bounds ));
++
++    status = NtMapViewOfSection( mapping, GetCurrentProcess(), (void**)&bits,
++                                 0, 0, NULL, &view_size, ViewShare, 0, PAGE_READONLY );
++    if (!bits)
++    {
++        ERR( "NtMapViewOfSection failed: %x\n", status );
++        return;
++    }
++    height = abs( params->info.bmiHeader.biHeight );
++
++    hdc = NtUserGetDCEx( hwnd, NULL, DCX_CLIPSIBLINGS );
++    NtGdiSetDIBitsToDeviceInternal( hdc, params->bounds.left, params->bounds.top,
++                                    params->bounds.right - params->bounds.left, params->bounds.bottom - params->bounds.top,
++                                    params->bounds.left, height - params->bounds.bottom, 0, height,
++                                    bits, &params->info, DIB_RGB_COLORS, 0, 0, FALSE, NULL);
++    NtUserReleaseDC( hwnd, hdc );
++    NtUnmapViewOfSection( GetCurrentProcess(), bits );
++}
++
++/* CX HACK 23950 - END */
++
++
+ /*******************************************************************
+  *           register_window_surface
+  *
+  * Register a window surface in the global list, possibly replacing another one.
+  */
+ void register_window_surface( struct window_surface *old, struct window_surface *new )
+--- a/dlls/win32u/defwnd.c
++++ b/dlls/win32u/defwnd.c
+@@ -911,12 +911,17 @@
+             if (drag_full_windows)
+                 NtUserSetWindowPos( hwnd, 0, orig_rect.left, orig_rect.top,
+                                     orig_rect.right - orig_rect.left,
+                                     orig_rect.bottom - orig_rect.top,
+                                     hittest == HTCAPTION ? SWP_NOSIZE : 0 );
+         }
++
++        /* CrossOver Hack 10879 */
++        if (hittest != HTCAPTION)
++            NtUserRedrawWindow( hwnd, NULL, NULL,
++                                RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN );
+     }
+ 
+     if (is_iconic(hwnd) && !moved && (style & WS_SYSMENU))
+     {
+         /* Single click brings up the system menu when iconized */
+         send_message( hwnd, WM_SYSCOMMAND, SC_MOUSEMENU + HTSYSMENU, MAKELONG(pt.x, pt.y) );
+--- a/dlls/win32u/driver.c
++++ b/dlls/win32u/driver.c
+@@ -914,15 +914,25 @@
+ static struct opengl_funcs *nulldrv_wine_get_wgl_driver( UINT version )
+ {
+     return (void *)-1;
+ }
+ 
+ static void nulldrv_ThreadDetach( void )
++{
++}
++
++static NTSTATUS nulldrv_SetCurrentProcessExplicitAppUserModelID( LPCWSTR aumid )
+ {
++    return E_NOTIMPL;
+ }
+ 
++static NTSTATUS nulldrv_GetCurrentProcessExplicitAppUserModelID( LPWSTR buffer, INT size )
++{
++    return E_NOTIMPL;
++}
++
+ static const WCHAR guid_key_prefixW[] =
+ {
+     '\\','R','e','g','i','s','t','r','y',
+     '\\','M','a','c','h','i','n','e',
+     '\\','S','y','s','t','e','m',
+     '\\','C','u','r','r','e','n','t','C','o','n','t','r','o','l','S','e','t',
+@@ -1226,14 +1236,24 @@
+     load_driver()->pUpdateLayeredWindow( hwnd, flags );
+ }
+ 
+ static UINT loaderdrv_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs )
+ {
+     return load_driver()->pVulkanInit( version, vulkan_handle, driver_funcs );
++}
++
++static NTSTATUS loaderdrv_SetCurrentProcessExplicitAppUserModelID( LPCWSTR aumid )
++{
++    return load_driver()->pSetCurrentProcessExplicitAppUserModelID( aumid );
+ }
+ 
++static NTSTATUS loaderdrv_GetCurrentProcessExplicitAppUserModelID( LPWSTR buffer, INT size )
++{
++    return load_driver()->pGetCurrentProcessExplicitAppUserModelID( buffer, size );
++}
++
+ static const struct user_driver_funcs lazy_load_driver =
+ {
+     { NULL },
+     /* keyboard functions */
+     loaderdrv_ActivateKeyboardLayout,
+     loaderdrv_Beep,
+@@ -1395,12 +1419,14 @@
+     SET_USER_FUNC(MoveWindowBits);
+     SET_USER_FUNC(WindowPosChanged);
+     SET_USER_FUNC(SystemParametersInfo);
+     SET_USER_FUNC(VulkanInit);
+     SET_USER_FUNC(wine_get_wgl_driver);
+     SET_USER_FUNC(ThreadDetach);
++    SET_USER_FUNC(SetCurrentProcessExplicitAppUserModelID);
++    SET_USER_FUNC(GetCurrentProcessExplicitAppUserModelID);
+ #undef SET_USER_FUNC
+ 
+     prev = InterlockedCompareExchangePointer( (void **)&user_driver, driver, (void *)&lazy_load_driver );
+     if (prev != &lazy_load_driver)
+     {
+         /* another thread beat us to it */
+--- a/dlls/win32u/font.c
++++ b/dlls/win32u/font.c
+@@ -949,35 +949,121 @@
+     KEY_VALUE_FULL_INFORMATION *info = (KEY_VALUE_FULL_INFORMATION *)buffer;
+     HKEY hkey;
+     DWORD i = 0;
+     WCHAR value[LF_FACESIZE];
+ 
+     static const WCHAR replacementsW[] = {'R','e','p','l','a','c','e','m','e','n','t','s'};
++
++/* CROSSOVER HACK - bug 13095 and 13610 */
++    static const WCHAR STSong[] = {'S','T','S','o','n','g',0};
++    static const WCHAR atSTSong[] = {'@','S','T','S','o','n','g',0};
++    static const WCHAR SongTi[] = {0x5b8b,0x4f53,0};
++    static const WCHAR atSongTi[] = {'@',0x5b8b,0x4f53,0};
++    static const WCHAR XinSongTi[] = {0x65B0,0x5b8b,0x4f53,0};
++    static const WCHAR atXinSongTi[] = {'@',0x65B0,0x5b8b,0x4f53,0};
++    static const WCHAR SimSun[] = {'S','i','m','S','u','n',0};
++    static const WCHAR NSimSun[] = {'N','S','i','m','S','u','n',0};
++    static const WCHAR atSimSun[] = {'@','S','i','m','S','u','n',0};
++    static const WCHAR atNSimSun[] = {'@','N','S','i','m','S','u','n',0};
++    static const WCHAR *cn_font_replacement[] = {
++        SimSun,
++        NSimSun,
++        SongTi,
++        XinSongTi,
++        atSimSun,
++        atNSimSun,
++        atSongTi,
++        atXinSongTi
++    };
++    BOOL cn_font_seen[ARRAY_SIZE(cn_font_replacement)] = {FALSE};
++    static const WCHAR new_cn_font[] =
++        {'H','i','r','a','g','i','n','o',' ','S','a','n','s',' ','G','B',' ','W','3','\0',
++        'S','T','S','o','n','g','\0',
++        /* Noto Sans CJK SC Regular - default Simplified Chinese font for Ubuntu 16.04 or later */
++        'N','o','t','o',' ','S','a','n','s',' ','C','J','K',' ','S','C',' ','R','e','g','u','l','a','r','\0',
++        /* Source Han Sans CN - Fedora's default Simplified Chinese font */
++        'S','o','u','r','c','e',' ','H','a','n',' ','S','a','n','s',' ','C','N',' ','R','e','g','u','l','a','r','\0',
++        /* WenQuanYi Micro Hei - popular open source Simplified Chinese font */
++        'W','e','n','Q','u','a','n','Y','i',' ','M','i','c','r','o',' ','H','e','i','\0',
++        /* Droid Sans Fallback - Ubuntu's default Simplified Chinese font */
++        'D','r','o','i','d',' ','S','a','n','s',' ','F','a','l','l','b','a','c','k','\0',0};
++    static const WCHAR vertical_new_cn_font[] =
++        {'@','H','i','r','a','g','i','n','o',' ','S','a','n','s',' ','G','B',' ','W','3','\0',
++        '@','S','T','S','o','n','g','\0',
++        /* Noto Sans CJK SC Regular - default Simplified Chinese font for Ubuntu 16.04 or later */
++        '@','N','o','t','o',' ','S','a','n','s',' ','C','J','K',' ','S','C',' ','R','e','g','u','l','a','r','\0',
++        /* Source Han Sans CN - Fedora's default Simplified Chinese font */
++        '@','S','o','u','r','c','e',' ','H','a','n',' ','S','a','n','s',' ','C','N',' ','R','e','g','u','l','a','r','\0',
++        /* WenQuanYi Micro Hei - popular open source Simplified Chinese font */
++        '@','W','e','n','Q','u','a','n','Y','i',' ','M','i','c','r','o',' ','H','e','i','\0',
++        /* Droid Sans Fallback - Ubuntu's default Simplified Chinese font */
++        '@','D','r','o','i','d',' ','S','a','n','s',' ','F','a','l','l','b','a','c','k','\0',0};
+ 
++    if (getenv( "CX_TURN_OFF_FONT_REPLACEMENTS" )) return;
++
+     /* @@ Wine registry key: HKCU\Software\Wine\Fonts\Replacements */
+     if (!(hkey = reg_open_key( wine_fonts_key, replacementsW, sizeof(replacementsW) ))) return;
+ 
+     while (reg_enum_value( hkey, i++, info, sizeof(buffer), value, sizeof(value) ))
+     {
+         WCHAR *data = (WCHAR *)((char *)info + info->DataOffset);
+         /* "NewName"="Oldname" */
+         if (!find_family_from_any_name( value ))
+         {
++            const WCHAR *replace = data;
++
++            /* CROSSOVER HACK - bug 13095 and 13610 */
++            int j;
++            for (j = 0; j < ARRAY_SIZE(cn_font_replacement); j++)
++            {
++                if (!cn_font_seen[j] && !wcscmp(value, cn_font_replacement[j]))
++                {
++                    BOOL is_vertical = value[0] == '@';
++                    if (info->Type == REG_SZ && !wcscmp(data, is_vertical ? atSTSong : STSong))
++                    {
++                        if (is_vertical) replace = vertical_new_cn_font;
++                        else replace = new_cn_font;
++                        info->Type = REG_MULTI_SZ;
++                    }
++                    cn_font_seen[j] = TRUE;
++                    break;
++                }
++            }
++
+             if (info->Type == REG_MULTI_SZ)
+             {
+-                WCHAR *replace = data;
+                 while (*replace)
+                 {
+                     if (add_family_replacement( value, replace )) break;
+                     replace += lstrlenW(replace) + 1;
+                 }
+             }
+             else if (info->Type == REG_SZ) add_family_replacement( value, data );
+         }
+         else TRACE("%s is available. Skip this replacement.\n", debugstr_w(value));
+     }
++
++    /* CROSSOVER HACK - bug 13095 and 13610 */
++    for (i = 0; i < ARRAY_SIZE(cn_font_replacement); i++)
++    {
++        if (!cn_font_seen[i] && !find_family_from_any_name(cn_font_replacement[i]))
++        {
++            const WCHAR *replace;
++            if (cn_font_replacement[i][0] == '@')
++                replace = vertical_new_cn_font;
++            else
++                replace = new_cn_font;
++            while (*replace)
++            {
++                if (add_family_replacement(cn_font_replacement[i], replace))
++                    break;
++                replace += lstrlenW(replace) + 1;
++            }
++        }
++    }
++
+     NtClose( hkey );
+ }
+ 
+ static void dump_gdi_font_list(void)
+ {
+     struct gdi_font_family *family;
+--- a/dlls/win32u/freetype.c
++++ b/dlls/win32u/freetype.c
+@@ -395,12 +395,16 @@
+     const char *filename;
+     int output_len;
+     struct {
+         char **array;
+         unsigned int size, max_size;
+     } ret;
++
++    /* CrossOver HACK #15526.  High Sierra can block when using the FSRef api, so ignore
++       suitcase fonts. */
++    return NULL;
+ 
+     TRACE("path %s\n", path);
+ 
+     s = FSPathMakeRef((unsigned char*)path, &ref, FALSE);
+     if(s != noErr)
+     {
+@@ -1280,12 +1284,37 @@
+         get_fontsig( This->ft_face, &This->fs );
+     }
+     else
+     {
+         free( This );
+         This = NULL;
++    }
++
++    /* CROSSOVER HACK - bug 4862 */
++    {
++        static const WCHAR zenkaiW[] = {'A','R',' ','P','L',' ','Z','e','n','K','a','i',' ','U','n','i',0};
++        static const WCHAR samyakW[] = {'S','a','m','y','a','k',' ','O','r','i','y','a',0};
++        static const WCHAR symbolW[] = {'s','y','m','b','o','l',0};
++        if (This && (!wcscmp(This->family_name, zenkaiW) || !wcscmp(This->family_name, samyakW)))
++        {
++            /* These fonts (ukai.ttf, samyak-oriya.ttf) cause native gdiplus to crash */
++            TRACE("Skipping %s\n", debugstr_w(This->family_name));
++            free( This );
++            This = NULL;
++        }
++        /* Ignore Apple's Symbol font */
++        if (This && !wcsicmp( This->family_name, symbolW ) && This->scalable)
++        {
++            if(!(This->fs.fsCsb[0] & 0x80000000))
++            {
++                TRACE( "Skipping Apple's Symbol font\n" );
++                free( This );
++                This = NULL;
++                goto done;
++            }
++        }
+     }
+ 
+ done:
+     if (unix_name) munmap( data_ptr, data_size );
+     return This;
+ }
+@@ -1795,13 +1824,22 @@
+ 
+ #endif
+ 
+ 
+ static BOOL init_freetype(void)
+ {
+-    ft_handle = dlopen(SONAME_LIBFREETYPE, RTLD_NOW);
++    const char *ftname = "libcxfreetype.so";
++
++    TRACE("Trying freetype library %s (hard-coded)\n",ftname);
++    ft_handle = dlopen(ftname, RTLD_NOW);
++
++    if(!ft_handle) {
++        TRACE("Can't find freetype library %s, trying %s instead\n", ftname, SONAME_LIBFREETYPE);
++        ft_handle = dlopen(SONAME_LIBFREETYPE, RTLD_NOW);
++    }
++
+     if(!ft_handle) {
+         WINE_MESSAGE(
+       "Wine cannot find the FreeType font library.  To enable Wine to\n"
+       "use TrueType fonts please install a version of FreeType greater than\n"
+       "or equal to 2.0.5.\n"
+       "http://www.freetype.org\n");
+@@ -3522,12 +3560,44 @@
+                                       matrices, buflen, buf );
+ 
+     case GGO_GRAY2_BITMAP:
+     case GGO_GRAY4_BITMAP:
+     case GGO_GRAY8_BITMAP:
+     case WINE_GGO_GRAY16_BITMAP:
++
++        /****************** CodeWeavers hack to fix HL2 crash **************************
++         *
++         * Both glyphs 0x2e and 0x39 of this font get rendered to a larger
++         * size with FreeType than under Windows, and HL2 uses a fixed size
++         * buffer on the stack to copy the data into.  For now we'll clip glyphs
++         * from that font into a rather smaller BBox
++         *
++         ******************************************************************************/
++        if ((ft_face->family_name != NULL) &&
++           (!strcmp(ft_face->family_name, "HL2MP") ||
++            !strcmp(ft_face->family_name, "csd")))
++        {
++            int i;
++            DWORD width  = (bbox.xMax - bbox.xMin ) >> 6;
++            DWORD height = (bbox.yMax - bbox.yMin ) >> 6;
++
++            if(width) width--;
++
++            for(i = 0; i < 2; i++)
++            {
++                if(height)
++                {
++                    height--;
++                    lpgm->gmptGlyphOrigin.y--;
++                }
++            }
++            lpgm->gmBlackBoxX = width  ? width  : 1;
++            lpgm->gmBlackBoxY = height ? height : 1;
++        }
++        /*********************************** End CW's hack ****************************/
++
+         return get_antialias_glyph_bitmap( ft_face->glyph, bbox, format, font->fake_bold,
+                                            matrices, buflen, buf );
+ 
+     case WINE_GGO_HRGB_BITMAP:
+     case WINE_GGO_HBGR_BITMAP:
+     case WINE_GGO_VRGB_BITMAP:
+--- a/dlls/win32u/hook.c
++++ b/dlls/win32u/hook.c
+@@ -204,12 +204,13 @@
+  * thread.
+  */
+ static LRESULT call_hook( struct win_hook_params *info, const WCHAR *module, size_t lparam_size,
+                           size_t message_size, BOOL ansi )
+ {
+     DWORD_PTR ret = 0;
++    LRESULT lres = 0;
+ 
+     if (info->tid)
+     {
+         struct hook_extra_info h_extra;
+         h_extra.handle = info->handle;
+         h_extra.lparam = info->lparam;
+@@ -218,25 +219,32 @@
+                (int)info->tid, hook_names[info->id-WH_MINHOOK],
+                info->code, (long)info->wparam, info->lparam );
+ 
+         switch(info->id)
+         {
+         case WH_KEYBOARD_LL:
+-            send_internal_message_timeout( info->pid, info->tid, WM_WINE_KEYBOARD_LL_HOOK,
++            lres = send_internal_message_timeout( info->pid, info->tid, WM_WINE_KEYBOARD_LL_HOOK,
+                                            info->wparam, (LPARAM)&h_extra, SMTO_ABORTIFHUNG,
+                                            get_ll_hook_timeout(), &ret );
+             break;
+         case WH_MOUSE_LL:
+-            send_internal_message_timeout( info->pid, info->tid, WM_WINE_MOUSE_LL_HOOK,
++            lres = send_internal_message_timeout( info->pid, info->tid, WM_WINE_MOUSE_LL_HOOK,
+                                            info->wparam, (LPARAM)&h_extra, SMTO_ABORTIFHUNG,
+                                            get_ll_hook_timeout(), &ret );
+             break;
+         default:
+             ERR("Unknown hook id %d\n", info->id);
+             assert(0);
+             break;
++        }
++
++        /* CrossOver HACK 19354 */
++        if (!lres && RtlGetLastWin32Error() == ERROR_TIMEOUT)
++        {
++            TRACE("Hook %p timed out; removing it.\n", info->handle);
++            NtUserUnhookWindowsHookEx( info->handle );
+         }
+     }
+     else if (info->proc)
+     {
+         struct user_thread_info *thread_info = get_user_thread_info();
+         size_t size, lparam_offset = 0, message_offset = 0;
+--- a/dlls/win32u/main.c
++++ b/dlls/win32u/main.c
+@@ -2301,12 +2301,22 @@
+     SYSCALL_FUNC( __wine_get_file_outline_text_metric );
+ }
+ 
+ BOOL SYSCALL_API __wine_get_icm_profile( HDC hdc, BOOL allow_default, DWORD *size, WCHAR *filename )
+ {
+     SYSCALL_FUNC( __wine_get_icm_profile );
++}
++
++NTSTATUS SYSCALL_API __wine_get_current_process_explicit_app_user_model_id( WCHAR *buffer, INT size )
++{
++    SYSCALL_FUNC( __wine_get_current_process_explicit_app_user_model_id );
++}
++
++NTSTATUS SYSCALL_API __wine_set_current_process_explicit_app_user_model_id( const WCHAR *aumid )
++{
++    SYSCALL_FUNC( __wine_set_current_process_explicit_app_user_model_id );
+ }
+ 
+ #else /*  __arm64ec__ */
+ 
+ #ifdef _WIN64
+ #define SYSCALL_ENTRY(id,name,args) __ASM_SYSCALL_FUNC( id + 0x1000, name )
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -865,12 +865,15 @@
+         if (size < minsize) return FALSE;
+         h_extra.handle = wine_server_ptr_handle( ps->hook.handle );
+         h_extra.lparam = (LPARAM)(&ps->hook + 1);
+         memcpy( &ps->hook, &h_extra, sizeof(h_extra) );
+         break;
+     }
++    case WM_WINE_FLUSHSHMSURFACE: /* CX HACK 23950 */
++        minsize = sizeof(struct flush_shm_surface_params);
++        break;
+     case CB_GETCOMBOBOXINFO:
+     {
+         COMBOBOXINFO cbi = { sizeof(COMBOBOXINFO) };
+         memcpy( ps, &cbi, sizeof(cbi) );
+         break;
+     }
+@@ -1234,12 +1237,15 @@
+         struct hook_extra_info *h_extra = (struct hook_extra_info *)lparam;
+         data->ps.hook.handle = wine_server_user_handle( h_extra->handle );
+         push_data( data, &data->ps.hook, sizeof(data->ps.hook) );
+         push_data( data, (LPVOID)h_extra->lparam, sizeof(MSLLHOOKSTRUCT) );
+         return 0;
+     }
++    case WM_WINE_FLUSHSHMSURFACE: /* CX HACK 23950 */
++        push_data( data, (struct flush_shm_surface_params *)lparam, sizeof(struct flush_shm_surface_params) );
++        return 0;
+     case WM_NCPAINT:
+         if (wparam <= 1) return 0;
+         FIXME( "WM_NCPAINT hdc packing not supported yet\n" );
+         data->count = -1;
+         return 0;
+     case WM_PAINT:
+@@ -2148,12 +2154,15 @@
+         }
+         return 0;
+     }
+     case WM_WINE_UPDATEWINDOWSTATE:
+         update_window_state( hwnd );
+         return 0;
++    case WM_WINE_FLUSHSHMSURFACE: /* CX HACK 23950 */
++        process_surface_message( (struct flush_shm_surface_params *)lparam );
++        return 1;
+     default:
+         if (msg >= WM_WINE_FIRST_DRIVER_MSG && msg <= WM_WINE_LAST_DRIVER_MSG)
+             return user_driver->pWindowMessage( hwnd, msg, wparam, lparam );
+         FIXME( "unknown internal message %x\n", msg );
+         return 0;
+     }
+@@ -2996,12 +3005,21 @@
+                 if (len == sizeof(*result))
+                 {
+                     info.msg.wParam = result->wparam;
+                     info.msg.lParam = result->lparam;
+                 }
+             }
++            /* CXHACK 19488 */
++            if (info.msg.message == WM_PAINT &&
++                    flags == (PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT | PM_QS_SENDMESSAGE) &&
++                    (get_window_long( info.msg.hwnd, GWL_EXSTYLE ) & WS_EX_COMPOSITED ))
++            {
++                send_message( info.msg.hwnd, info.msg.message, info.msg.wParam, info.msg.lParam );
++                flags &= ~PM_QS_PAINT;
++                continue;
++            }
+             *msg = info.msg;
+             msg->pt = point_phys_to_win_dpi( info.msg.hwnd, info.msg.pt );
+             thread_info->client_info.message_pos   = MAKELONG( msg->pt.x, msg->pt.y );
+             thread_info->client_info.message_time  = info.msg.time;
+             thread_info->client_info.message_extra = 0;
+             thread_info->client_info.msg_source = msg_source_unavailable;
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -6398,14 +6398,39 @@
+     }
+     TRACE( "(%u, %u, %p, %u) ret %d\n", action, val, ptr, winini, ret );
+     return ret;
+ 
+ #undef WINE_SPI_FIXME
+ #undef WINE_SPI_WARN
++}
++
++/* CX HACK 19134 */
++#ifdef __APPLE__
++static BOOL is_star_trek_away_team(void)
++{
++    static const WCHAR star_trekW[] = {'S','t','a','r',' ','T','r','e','k','.','e','x','e',0};
++    WCHAR *module_exe, *name = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
++
++    module_exe = wcsrchr(name, '\\');
++    module_exe = module_exe ? module_exe + 1 : name;
++    return !wcsicmp(module_exe, star_trekW );
+ }
+ 
++static BOOL needs_mouse_hack(void)
++{
++    static BOOL needs_hack, did_check = FALSE;
++
++    if (!did_check) {
++        needs_hack = is_star_trek_away_team();
++        did_check = TRUE;
++    }
++    return needs_hack;
++}
++#endif
++/* End hack */
++
+ int get_system_metrics( int index )
+ {
+     NONCLIENTMETRICSW ncm;
+     MINIMIZEDMETRICS mm;
+     ICONMETRICSW im;
+     RECT rect;
+@@ -6456,12 +6481,16 @@
+         /* see the remark for SM_CYMAXIMIZED, at least this formulation is
+          * correct */
+         return get_system_metrics( SM_CYMAXIMIZED ) - get_system_metrics( SM_CYMIN );
+     case SM_CYKANJIWINDOW:
+         return 0;
+     case SM_MOUSEPRESENT:
++        /* CX HACK 19134 */
++#ifdef __APPLE__
++        if (needs_mouse_hack()) return 0;
++#endif
+         return 1;
+     case SM_DEBUG:
+         return 0;
+     case SM_SWAPBUTTON:
+         get_entry( &entry_MOUSEBUTTONSWAP, 0, &ret );
+         return ret;
+--- a/dlls/win32u/win32syscalls.h
++++ b/dlls/win32u/win32syscalls.h
+@@ -427,14 +427,16 @@
+     SYSCALL_ENTRY( 0x01a7, NtUserValidateRect, 8 ) \
+     SYSCALL_ENTRY( 0x01a8, NtUserVkKeyScanEx, 8 ) \
+     SYSCALL_ENTRY( 0x01a9, NtUserWaitForInputIdle, 12 ) \
+     SYSCALL_ENTRY( 0x01aa, NtUserWaitMessage, 0 ) \
+     SYSCALL_ENTRY( 0x01ab, NtUserWindowFromDC, 4 ) \
+     SYSCALL_ENTRY( 0x01ac, NtUserWindowFromPoint, 8 ) \
+-    SYSCALL_ENTRY( 0x01ad, __wine_get_file_outline_text_metric, 16 ) \
+-    SYSCALL_ENTRY( 0x01ae, __wine_get_icm_profile, 16 )
++    SYSCALL_ENTRY( 0x01ad, __wine_get_current_process_explicit_app_user_model_id, 8 ) \
++    SYSCALL_ENTRY( 0x01ae, __wine_get_file_outline_text_metric, 16 ) \
++    SYSCALL_ENTRY( 0x01af, __wine_get_icm_profile, 16 ) \
++    SYSCALL_ENTRY( 0x01b0, __wine_set_current_process_explicit_app_user_model_id, 4 )
+ 
+ #define ALL_SYSCALLS64 \
+     SYSCALL_ENTRY( 0x0000, NtGdiAbortDoc, 8 ) \
+     SYSCALL_ENTRY( 0x0001, NtGdiAbortPath, 8 ) \
+     SYSCALL_ENTRY( 0x0002, NtGdiAddFontMemResourceEx, 40 ) \
+     SYSCALL_ENTRY( 0x0003, NtGdiAddFontResourceW, 48 ) \
+@@ -860,8 +862,10 @@
+     SYSCALL_ENTRY( 0x01a7, NtUserValidateRect, 16 ) \
+     SYSCALL_ENTRY( 0x01a8, NtUserVkKeyScanEx, 16 ) \
+     SYSCALL_ENTRY( 0x01a9, NtUserWaitForInputIdle, 24 ) \
+     SYSCALL_ENTRY( 0x01aa, NtUserWaitMessage, 0 ) \
+     SYSCALL_ENTRY( 0x01ab, NtUserWindowFromDC, 8 ) \
+     SYSCALL_ENTRY( 0x01ac, NtUserWindowFromPoint, 16 ) \
+-    SYSCALL_ENTRY( 0x01ad, __wine_get_file_outline_text_metric, 32 ) \
+-    SYSCALL_ENTRY( 0x01ae, __wine_get_icm_profile, 32 )
++    SYSCALL_ENTRY( 0x01ad, __wine_get_current_process_explicit_app_user_model_id, 16 ) \
++    SYSCALL_ENTRY( 0x01ae, __wine_get_file_outline_text_metric, 32 ) \
++    SYSCALL_ENTRY( 0x01af, __wine_get_icm_profile, 32 ) \
++    SYSCALL_ENTRY( 0x01b0, __wine_set_current_process_explicit_app_user_model_id, 8 )
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -53,12 +53,15 @@
+ extern void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *valid_rects );
+ extern void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window_surface *old_surface,
+                                       const RECT *old_visible_rect, const RECT *valid_rects );
+ extern void register_window_surface( struct window_surface *old,
+                                      struct window_surface *new );
+ extern void *window_surface_get_color( struct window_surface *surface, BITMAPINFO *info );
++extern struct window_surface *create_shm_surface( HWND hwnd, HWND parent, const RECT *visible_rect,
++                                                  struct window_surface *old_surface );
++extern void process_surface_message( struct flush_shm_surface_params *params );
+ 
+ /* defwnd.c */
+ extern BOOL adjust_window_rect( RECT *rect, DWORD style, BOOL menu, DWORD ex_style, UINT dpi );
+ extern LRESULT default_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
+                                     BOOL ansi );
+ extern LRESULT desktop_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, BOOL ansi );
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2043,30 +2043,51 @@
+ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, struct window_surface *new_surface,
+                               const struct window_rects *new_rects, const RECT *valid_rects )
+ {
+     struct window_rects monitor_rects;
+     WND *win;
+     HWND owner_hint, surface_win = 0, parent = NtUserGetAncestor( hwnd, GA_PARENT );
+-    BOOL ret, is_fullscreen, is_layered, is_child;
++    BOOL ret, is_fullscreen, is_layered, is_child, dummy_shm_surface = FALSE;
+     struct window_rects old_rects;
+     RECT extra_rects[3];
+     struct window_surface *old_surface;
+     UINT raw_dpi, monitor_dpi;
+ 
++    /* CX HACK 23950: provide a default shm surface for windows with parents in other process */
++    if (!(swp_flags & SWP_HIDEWINDOW))
++    {
++        win = get_win_ptr( parent );
++        if (win == OBJ_OTHER_PROCESS)
++        {
++            new_surface = &dummy_surface;
++            window_surface_add_ref( new_surface );
++            dummy_shm_surface = TRUE;
++        }
++        else if (win && win != WND_DESKTOP) release_win_ptr( win );
++    }
++
+     is_layered = new_surface && new_surface->alpha_mask;
+     is_fullscreen = is_window_rect_full_screen( &new_rects->visible, get_thread_dpi() );
+     is_child = parent && parent != NtUserGetDesktopWindow();
+ 
+     if (is_child) monitor_dpi = get_win_monitor_dpi( parent, &raw_dpi );
+     else monitor_dpi = monitor_dpi_from_rect( new_rects->window, get_thread_dpi(), &raw_dpi );
+ 
+     get_window_rects( hwnd, COORDS_PARENT, &old_rects, get_thread_dpi() );
+     if (IsRectEmpty( &valid_rects[0] ) || is_layered) valid_rects = NULL;
+ 
+     if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
+     old_surface = win->surface;
++
++    /* CX HACK 23950 */
++    if (dummy_shm_surface && new_surface == &dummy_surface)
++    {
++        window_surface_release( new_surface );
++        new_surface = create_shm_surface( hwnd, parent, &new_rects->visible, old_surface );
++    }
++
+     if (old_surface != new_surface) swp_flags |= SWP_FRAMECHANGED;  /* force refreshing non-client area */
+ 
+     if (new_surface == &dummy_surface) swp_flags |= SWP_NOREDRAW;
+     else if (old_surface == &dummy_surface)
+     {
+         swp_flags |= SWP_NOCOPYBITS;
+@@ -2476,12 +2497,32 @@
+     TRACE( "window %p new_rects %s\n", hwnd, debugstr_window_rects( &new_rects ) );
+ 
+     surface = get_window_surface( hwnd, swp_flags, TRUE, &new_rects, &surface_rect );
+     apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, NULL );
+     if (!surface) return FALSE;
+ 
++    /*
++     * CrossOver hack:
++     * Hide non-working, semi-transparent window in Quicken 2012.
++     * for bug 8982.
++     */
++    if(1)
++    {
++        static const WCHAR QWinLightbox[] = {'Q','W','i','n','L','i','g','h','t','b','o','x',0};
++        WCHAR buffer[sizeof(QWinLightbox) / sizeof(WCHAR)];
++        UNICODE_STRING name = { .Buffer = buffer, .MaximumLength = sizeof(QWinLightbox) };
++
++        if (NtUserGetClassName( hwnd, FALSE, &name )
++                && !memcmp( QWinLightbox, buffer, sizeof(QWinLightbox) ))
++        {
++            FIXME( "Hide semi-transparent window that is created over application window.\n" );
++            NtUserSetWindowPos( hwnd, HWND_BOTTOM, 0, 0, 0, 0,
++                                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOSENDCHANGING );
++        }
++    }
++
+     if (!hdc_src || surface == &dummy_surface) ret = TRUE;
+     else
+     {
+         BLENDFUNCTION src_blend = { AC_SRC_OVER, 0, 255, 0 };
+         RECT rect = new_rects.window, src_rect;
+         HDC hdc = NULL;

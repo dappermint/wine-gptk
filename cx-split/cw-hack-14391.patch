@@ -1,0 +1,90 @@
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -1757,6 +1757,12 @@
+ @ cdecl wine_get_build_id()
+ @ cdecl wine_get_host_version(ptr ptr)
+ 
+ # Filesystem
+ @ stdcall -syscall wine_nt_to_unix_file_name(ptr ptr ptr long)
+ @ stdcall -syscall wine_unix_to_nt_file_name(str ptr ptr)
++
++# CW HACK 14391
++@ stdcall -syscall __wine_rpc_NtReadFile(long long ptr ptr ptr ptr long ptr ptr)
++
++# CW HACK 22435
++@ stdcall __wine_unix_call(int64 long ptr) __wine_unix_call_exported
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -5473,14 +5508,30 @@
+         req->handle = wine_server_obj_handle( device );
+         req->flags  = SERIALINFO_PENDING_WRITE;
+         status = wine_server_call( req );
+     }
+     SERVER_END_REQ;
+     return status;
++}
++
++static BOOL is_quickenpatch(void)
++{
++    static const WCHAR qkn[] = {'q','u','i','c','k','e','n','P','a','t','c','h','.','e','x','e',0};
++    WCHAR *path = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
++    DWORD len = sizeof(qkn)/sizeof(qkn[0]) - 1, len2 = wcslen(path);
++    return (len <= len2 && !wcsicmp( path + len2 - len, qkn ));
+ }
+ 
++
++/* CW HACK 14391 */
++NTSTATUS WINAPI __wine_rpc_NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
++                                IO_STATUS_BLOCK *io, void *buffer, ULONG length,
++                                LARGE_INTEGER *offset, ULONG *key )
++{
++    return NtReadFile( handle, event, apc, apc_user, io, buffer, length, offset, key );
++}
+ 
+ /******************************************************************************
+  *              NtReadFile   (NTDLL.@)
+  */
+ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
+                             IO_STATUS_BLOCK *io, void *buffer, ULONG length,
+--- a/dlls/wow64/file.c
++++ b/dlls/wow64/file.c
+@@ -945,12 +954,39 @@
+ 
+     IO_STATUS_BLOCK io;
+     NTSTATUS status;
+ 
+     status = NtWriteFileGather( handle, event, apc_32to64( apc ), apc_param_32to64( apc, apc_param ),
+                                 iosb_32to64( &io, io32 ), segments, len, offset, key );
++    put_iosb( io32, &io );
++    return status;
++}
++
++
++/* CW HACK 14391 */
++/**********************************************************************
++ *           wow64___wine_rpc_NtReadFile
++ */
++extern typeof(NtReadFile) __wine_rpc_NtReadFile;
++NTSTATUS WINAPI wow64___wine_rpc_NtReadFile( UINT *args )
++{
++    HANDLE handle = get_handle( &args );
++    HANDLE event = get_handle( &args );
++    ULONG apc = get_ulong( &args );
++    ULONG apc_param = get_ulong( &args );
++    IO_STATUS_BLOCK32 *io32 = get_ptr( &args );
++    void *buffer = get_ptr( &args );
++    ULONG len = get_ulong( &args );
++    LARGE_INTEGER *offset = get_ptr( &args );
++    ULONG *key = get_ptr( &args );
++
++    IO_STATUS_BLOCK io;
++    NTSTATUS status;
++
++    status = __wine_rpc_NtReadFile( handle, event, apc_32to64( apc ), apc_param_32to64( apc, apc_param ),
++                             iosb_32to64( &io, io32 ), buffer, len, offset, key );
+     put_iosb( io32, &io );
+     return status;
+ }
+ 
+ 
+ /**********************************************************************

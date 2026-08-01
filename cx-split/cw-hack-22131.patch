@@ -1,0 +1,42 @@
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -1020,13 +1039,17 @@
+ 
+     if (!self)
+     {
+         ret = set_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_AMD64 );
+ #ifdef __APPLE__
+         if ((flags & CONTEXT_DEBUG_REGISTERS) && (ret == STATUS_UNSUCCESSFUL))
+-            WARN_(seh)( "Setting debug registers is not supported under Rosetta\n" );
++        {
++            /* CW HACK 22131 */
++            WARN_(seh)( "Setting debug registers is not supported under Rosetta, faking success\n" );
++            ret = STATUS_SUCCESS;
++        }
+ #endif
+         if (ret || !self) return ret;
+         if (flags & CONTEXT_DEBUG_REGISTERS)
+         {
+             amd64_thread_data()->dr0 = context->Dr0;
+             amd64_thread_data()->dr1 = context->Dr1;
+@@ -1233,12 +1256,20 @@
+                 amd64_thread_data()->dr6 == context->Dr6 &&
+                 amd64_thread_data()->dr7 == context->Dr7);
+ 
+     if (!self)
+     {
+         NTSTATUS ret = set_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_I386 );
++#ifdef __APPLE__
++        if ((flags & CONTEXT_DEBUG_REGISTERS) && (ret == STATUS_UNSUCCESSFUL))
++        {
++            /* CW HACK 22131 */
++            WARN_(seh)( "Setting debug registers is not supported under Rosetta, faking success\n" );
++            ret = STATUS_SUCCESS;
++        }
++#endif
+         if (ret || !self) return ret;
+         if (flags & CONTEXT_I386_DEBUG_REGISTERS)
+         {
+             amd64_thread_data()->dr0 = context->Dr0;
+             amd64_thread_data()->dr1 = context->Dr1;
+             amd64_thread_data()->dr2 = context->Dr2;

@@ -1,0 +1,69 @@
+--- a/dlls/user32/hook.c
++++ b/dlls/user32/hook.c
+@@ -333,17 +333,49 @@
+  *
+  * Retrieve the hook procedure real value for a module-relative proc
+  */
+ void *get_hook_proc( void *proc, const WCHAR *module, HMODULE *free_module )
+ {
+     HMODULE mod;
++    static INT isBlocking = -1;
+ 
+     GetModuleHandleExW( 0, module, &mod );
+     *free_module = mod;
+     if (!mod)
+     {
++        /* Codeweavers Hack for Quicken Update */
++        if (isBlocking == -1)
++        {
++            char processName[MAX_PATH];
++            char *p;
++            GetModuleFileNameA(GetModuleHandleA(NULL),processName,MAX_PATH);
++            p = strrchr(processName,'\\');
++            if (p)
++                p++;
++            else
++                p = processName;
++            if (strcasecmp(p,"explorer.exe")==0 || strcasecmp(p,"qwpatch.exe")==0)
++                isBlocking = 1;
++            else
++                isBlocking = 0;
++        }
++
++        if (isBlocking)
++        {
++            LPCWSTR ptr;
++            static const WCHAR szQwMain[] = {'Q','W','M','A','I','N','.','D','L','L',0};
++            static const WCHAR szQwWin[] = {'Q','W','W','I','N','.','D','L','L',0};
++
++            ptr = wcsrchr(module,'\\');
++            if (!ptr) ptr = module; else ptr++;
++            if (lstrcmpiW(ptr,szQwMain)==0 || lstrcmpiW(ptr,szQwWin)==0)
++            {
++                TRACE("Blocking Hook for Quicken Update\n");
++                return NULL;
++            }
++        }
+         TRACE( "loading %s\n", debugstr_w(module) );
+         /* FIXME: the library will never be freed */
+         if (!(mod = LoadLibraryExW(module, NULL, LOAD_WITH_ALTERED_SEARCH_PATH))) return NULL;
+     }
+     return (char *)mod + (ULONG_PTR)proc;
+ }
+--- a/dlls/user32/user32.spec
++++ b/dlls/user32/user32.spec
+@@ -195,13 +195,13 @@
+ # 2695 stub ReportPointerDeviceInertia
+ 
+ 2700 stub @
+ 
+ 2703 stub @
+ 2704 stub @
+-2705 stub @
++# 2705 stub @
+ 2706 stub @
+ 2707 stub @
+ 2708 stub @
+ 2709 stub @
+ 2710 stub @
+ 2711 stub @

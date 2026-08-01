@@ -1,0 +1,263 @@
+--- a/dlls/ieframe/ieframe.h
++++ b/dlls/ieframe/ieframe.h
+@@ -185,12 +185,13 @@
+     IDataObject              IDataObject_iface;
+     HlinkFrame hlink_frame;
+ 
+     LONG ref;
+ 
+     INT version;
++    DWORD tid;
+ 
+     IOleClientSite *client;
+     IOleClientSite *client_closed;
+     IOleContainer *container;
+     IOleInPlaceSiteEx *inplace;
+ 
+@@ -289,12 +290,13 @@
+ void create_doc_view_hwnd(DocHost*);
+ void on_commandstate_change(DocHost*,LONG,BOOL);
+ void notify_download_state(DocHost*,BOOL);
+ void update_navigation_commands(DocHost *dochost);
+ 
+ #define WM_DOCHOSTTASK (WM_USER+0x300)
++#define WM_GETMARSHALEDDOC (WM_USER+0x400)
+ void push_dochost_task(DocHost*,task_header_t*,task_proc_t,task_destr_t,BOOL);
+ void abort_dochost_tasks(DocHost*,task_proc_t);
+ LRESULT process_dochost_tasks(DocHost*);
+ 
+ void InternetExplorer_WebBrowser_Init(InternetExplorer*);
+ HRESULT update_ie_statustext(InternetExplorer*, LPCWSTR);
+--- a/dlls/ieframe/iexplore.c
++++ b/dlls/ieframe/iexplore.c
+@@ -49,14 +49,15 @@
+ 
+ #define WM_UPDATEADDRBAR    (WM_APP+1)
+ 
+ static const WCHAR szIEWinFrame[] = { 'I','E','F','r','a','m','e',0 };
+ 
+ /* Windows uses "Microsoft Internet Explorer" */
++/* CrossOver: We use "CrossOver Web Browser" */
+ static const WCHAR wszWineInternetExplorer[] =
+-        {'W','i','n','e',' ','I','n','t','e','r','n','e','t',' ','E','x','p','l','o','r','e','r',0};
++    {'C','r','o','s','s','O','v','e','r',' ','W','e','b',' ','B','r','o','w','s','e','r',0};
+ 
+ static LONG obj_cnt;
+ static DWORD dde_inst;
+ static HSZ ddestr_iexplore, ddestr_openurl;
+ static struct list ie_list = LIST_INIT(ie_list);
+ 
+--- a/dlls/ieframe/oleobject.c
++++ b/dlls/ieframe/oleobject.c
+@@ -86,13 +86,49 @@
+     case WM_SETFOCUS:
+         notify_on_focus(This, TRUE);
+         break;
+     case WM_KILLFOCUS:
+         notify_on_focus(This, FALSE);
+         break;
++    /* CX HACK 11688: Return marshaled MSHTML document if requested from wrong thread. */
++    case WM_GETMARSHALEDDOC: {
++        IStream **ret = (IStream**)lParam, *stream;
++        LARGE_INTEGER offset;
++        IDispatch *disp;
++        HRESULT hres;
++
++        TRACE("WM_GETMARSHALEDDOC\n");
++
++        *ret = NULL;
++        if(!This->doc_host.document)
++            return 0;
++
++        hres = IUnknown_QueryInterface(This->doc_host.document, &IID_IDispatch, (void**)&disp);
++        if(FAILED(hres))
++            return hres;
++
++        hres = CreateStreamOnHGlobal(NULL, TRUE, &stream);
++        if(FAILED(hres)) {
++            IDispatch_Release(disp);
++            return 0;
++        }
++
++        hres = CoMarshalInterface(stream, &IID_IDispatch, (IUnknown*)disp, MSHCTX_INPROC, NULL, MSHLFLAGS_NORMAL);
++        IDispatch_Release(disp);
++        if(FAILED(hres)) {
++            IStream_Release(stream);
++            return 0;
++        }
++
++        offset.QuadPart = 0;
++        IStream_Seek(stream, offset, STREAM_SEEK_SET, NULL);
++
++        *ret = stream;
++        return 0;
+     }
++    }
+ 
+     return DefWindowProcW(hwnd, msg, wParam, lParam);
+ }
+ 
+ static void create_shell_embedding_hwnd(WebBrowser *This)
+ {
+--- a/dlls/ieframe/shellbrowser.c
++++ b/dlls/ieframe/shellbrowser.c
+@@ -21,12 +21,13 @@
+ 
+ #include <assert.h>
+ 
+ #include "ieframe.h"
+ #include "exdispid.h"
+ #include "shlwapi.h"
++#include "shellapi.h"
+ 
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(ieframe);
+ 
+ const WCHAR *error_url_frag(const WCHAR *url)
+@@ -1017,20 +1018,94 @@
+     NewWindowManager *This = impl_from_INewWindowManager(iface);
+ 
+     TRACE("(%p)\n", This);
+ 
+     return IOleClientSite_Release(&This->doc_host->IOleClientSite_iface);
+ }
++
++static inline BOOL is_option_true(const char *value)
++{
++    char ch = toupper(*value);
++    return ch == 'Y' || ch == 'T' || ch == '1';
++}
++
++static BOOL use_external_browser_for_new_window(void)
++{
++    char buffer[MAX_PATH+16], *p = buffer, *appname = buffer;
++    BOOL is_iexplore;
++    HKEY key, tmpkey;
++    DWORD size;
++    DWORD res;
+ 
++    GetModuleFileNameA(0, buffer, MAX_PATH);
++    if((p = strrchr(appname, '/')))
++        appname = p + 1;
++    if((p = strrchr(appname, '\\')))
++        appname = p + 1;
++    is_iexplore = !strcasecmp(appname, "iexplore.exe");
++    TRACE("appname %s\n", debugstr_a(appname));
++
++    /* @@ Wine registry key: HKCU\Software\Wine\AppDefaults\app.exe\MSHTML */
++    if(!RegOpenKeyA( HKEY_CURRENT_USER, "Software\\Wine\\AppDefaults", &tmpkey)) {
++        strcat(appname, "\\MSHTML");
++        res = RegOpenKeyA(tmpkey, appname, &key);
++        RegCloseKey(tmpkey);
++        if(res == ERROR_SUCCESS) {
++            res = RegQueryValueExA(key, "UseExternalBrowserForNewWindow", 0, NULL, (LPBYTE)buffer, &size);
++            RegCloseKey(key);
++            if(res == ERROR_SUCCESS) {
++                TRACE("found appdefaults setting %s\n", debugstr_an(buffer, size));
++                return is_option_true(buffer);
++            }
++        }
++    }
++
++    /* iexplore.exe doesn't use external browser unless it's explicitly configured */
++    if(is_iexplore)
++        return FALSE;
++
++    /* @@ Wine registry key: HKCU\Software\Wine\MSHTML */
++    if(!RegOpenKeyA(HKEY_CURRENT_USER, "Software\\Wine\\MSHTML", &key)) {
++        ERR("found MSHTML key\n");
++        res = RegQueryValueExA(key, "UseExternalBrowserForNewWindow", 0, NULL, (LPBYTE)buffer, &size);
++        RegCloseKey(key);
++        if(res == ERROR_SUCCESS) {
++            TRACE("found global setting %s\n", debugstr_an(buffer, size));
++            return is_option_true(buffer);
++        }
++    }
++
++    TRACE("config not found\n");
++    return TRUE;
++}
++
+ static HRESULT WINAPI NewWindowManager_EvaluateNewWindow(INewWindowManager *iface, LPCWSTR pszUrl,
+         LPCWSTR pszName, LPCWSTR pszUrlContext, LPCWSTR pszFeatures, BOOL fReplace, DWORD dwFlags,
+         DWORD dwUserActionTime)
+ {
+     NewWindowManager *This = impl_from_INewWindowManager(iface);
+     FIXME("(%p)->(%s %s %s %s %x %lx %ld)\n", This, debugstr_w(pszUrl), debugstr_w(pszName), debugstr_w(pszUrlContext),
+           debugstr_w(pszFeatures), fReplace, dwFlags, dwUserActionTime);
++
++    /*
++     * CXHACK 12399: Open new window in default browser (usually winebrowser) instead of letting
++     *               MSHTML to open new IE window. This way the context (like scripts and cookies)
++     *               are not shared between embedded document and the new window, but if it's
++     *               not needed, user experience is better this way
++     */
++    if(use_external_browser_for_new_window()) {
++        SHELLEXECUTEINFOW exec_info = {sizeof(exec_info)};
++        static const WCHAR htmlfileW[] = {'h','t','m','l','f','i','l','e',0};
++        exec_info.fMask = SEE_MASK_CLASSNAME;
++        exec_info.lpFile = pszUrl;
++        exec_info.nShow = SW_SHOW;
++        exec_info.lpClass = htmlfileW;
++        TRACE("opening in external browser\n");
++        return ShellExecuteExW(&exec_info) ? E_FAIL : S_OK;
++    }
++
+     return S_OK;
+ }
+ 
+ static const INewWindowManagerVtbl NewWindowManagerVtbl = {
+     NewWindowManager_QueryInterface,
+     NewWindowManager_AddRef,
+--- a/dlls/ieframe/webbrowser.c
++++ b/dlls/ieframe/webbrowser.c
+@@ -399,12 +399,34 @@
+             /* Some broken apps cast returned IDispatch to IHTMLDocument2
+              * without QueryInterface call */
+             hres = IDispatch_QueryInterface(disp, &IID_IHTMLDocument2, (void**)&html_doc);
+             if(SUCCEEDED(hres)) {
+                 IDispatch_Release(disp);
+                 disp = html_doc;
++
++                /* CX HACK 11688: Return marshaled MSHTML document if requested from wrong thread. */
++                if(This->tid != GetCurrentThreadId() && This->shell_embedding_hwnd) {
++                    IStream *stream = NULL;
++
++                    FIXME("HACK! Document interface requested from wrong object.\n");
++
++                    SendMessageW(This->shell_embedding_hwnd, WM_GETMARSHALEDDOC, 0, (LPARAM)&stream);
++                    if(stream) {
++                        IDispatch *mdisp;
++                        HRESULT init_hres;
++
++                        init_hres = CoInitialize(NULL);
++                        hres = CoUnmarshalInterface(stream, &IID_IDispatch, (void**)&mdisp);
++                        if(SUCCEEDED(init_hres))
++                            CoUninitialize();
++                        if(SUCCEEDED(hres)) {
++                            IDispatch_Release(disp);
++                            disp = mdisp;
++                        }
++                    }
++                }
+             }
+         }
+     }
+ 
+     *ppDisp = disp;
+     return disp ? S_OK : S_FALSE;
+@@ -1291,12 +1313,13 @@
+ 
+     ret->IUnknown_inner.lpVtbl = &internal_unk_vtbl;
+     ret->IWebBrowser2_iface.lpVtbl = &WebBrowser2Vtbl;
+     ret->IServiceProvider_iface.lpVtbl = &ServiceProviderVtbl;
+     ret->ref = 1;
+     ret->version = version;
++    ret->tid = GetCurrentThreadId();
+ 
+     HlinkFrame_Init(&ret->hlink_frame, outer ? outer :  &ret->IUnknown_inner, &ret->doc_host);
+     DocHost_Init(&ret->doc_host, &ret->IWebBrowser2_iface, &DocHostContainerVtbl);
+ 
+     ret->visible = VARIANT_TRUE;
+     ret->menu_bar = VARIANT_TRUE;

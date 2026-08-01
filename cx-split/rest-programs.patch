@@ -1,0 +1,695 @@
+--- a/programs/arp/main.c
++++ b/programs/arp/main.c
+@@ -13,21 +13,39 @@
+  *
+  * You should have received a copy of the GNU Lesser General Public
+  * License along with this library; if not, write to the Free Software
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#include <windows.h>
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(arp);
+ 
++static int printA(const char *msgA)
++{
++    DWORD len;
++    DWORD count, ret;
++
++    len = lstrlenA(msgA);
++    ret = WriteConsoleA(GetStdHandle(STD_OUTPUT_HANDLE), msgA, len, &count, NULL);
++    if (!ret)
++    {
++        WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), msgA, len, &count, FALSE);
++    }
++
++    return count;
++}
++
+ int __cdecl wmain(int argc, WCHAR *argv[])
+ {
+     int i;
+ 
+     WINE_FIXME("stub:");
+     for (i = 0; i < argc; i++)
+         WINE_FIXME(" %s", wine_dbgstr_w(argv[i]));
+     WINE_FIXME("\n");
+ 
++    printA("\n");
++
+     return 0;
+ }
+--- a/programs/explorer/desktop.c
++++ b/programs/explorer/desktop.c
+@@ -1314,21 +1315,22 @@
+             CloseHandle( pi.hThread );
+             CloseHandle( pi.hProcess );
+         }
+     }
+ 
+     desktopshellbrowserwindow_init();
+-    shellwindows_init();
+ 
+     /* Ideally we would set the window of an IShellView here, but we never
+        actually create one, so the desktop window itself will have to do. */
+     set_shell_window( hwnd );
+ 
+     /* run the desktop message loop */
+     if (hwnd)
+     {
++        shellwindows_init();
++
+         TRACE( "desktop message loop starting on hwnd %p\n", hwnd );
+         while (GetMessageW( &msg, 0, 0, 0 )) DispatchMessageW( &msg );
+         TRACE( "desktop message loop exiting for hwnd %p\n", hwnd );
+     }
+ 
+     if (pShellDDEInit) pShellDDEInit( FALSE );
+--- a/programs/iexplore/iexplore.inf
++++ b/programs/iexplore/iexplore.inf
+@@ -37,12 +37,14 @@
+ 
+ [IE.Reg]
+ HKLM,"Software\Microsoft\Internet Explorer","Build",,"99600"
+ HKLM,"Software\Microsoft\Internet Explorer","Version",,"9.11.9600.18376"
+ HKLM,"Software\Microsoft\Internet Explorer","W2kVersion",,"9.11.9600.18376"
+ HKLM,"Software\Microsoft\Internet Explorer","svcVersion",,"11.0.9600.18376"
++HKLM,"Software\Microsoft\Windows\CurrentVersion\Uninstall\CXHTML","DisplayName",,"CrossOver HTML engine"
++HKLM,"Software\Microsoft\Windows\CurrentVersion\Uninstall\CXHTML","UninstallString",,"iexplore -unregserver"
+ 
+ 
+ [Strings]
+ CLSID_InternetExplorer="{0002df01-0000-0000-c000-000000000046}"
+ CLSID_Internet="{871c5380-42a0-1069-a2ea-08002b30309d}"
+ CLSID_InternetExplorerManager="{df4fcc34-067a-4e0a-8352-4a1a5095346e}"
+--- a/programs/taskmgr/taskmgr.c
++++ b/programs/taskmgr/taskmgr.c
+@@ -342,15 +342,15 @@
+     TaskManagerSettings.View_Details = TRUE;
+ 
+     /* Processes page settings */
+     TaskManagerSettings.ShowProcessesFromAllUsers = FALSE; /* Server-only? */
+     TaskManagerSettings.Column_ImageName = TRUE;
+     TaskManagerSettings.Column_PID = TRUE;
+-    TaskManagerSettings.Column_CPUUsage = TRUE;
+-    TaskManagerSettings.Column_CPUTime = TRUE;
+-    TaskManagerSettings.Column_MemoryUsage = TRUE;
++    TaskManagerSettings.Column_CPUUsage = FALSE;
++    TaskManagerSettings.Column_CPUTime = FALSE;
++    TaskManagerSettings.Column_MemoryUsage = FALSE;
+     TaskManagerSettings.Column_MemoryUsageDelta = FALSE;
+     TaskManagerSettings.Column_PeakMemoryUsage = FALSE;
+     TaskManagerSettings.Column_PageFaults = FALSE;
+     TaskManagerSettings.Column_USERObjects = FALSE;
+     TaskManagerSettings.Column_IOReads = FALSE;
+     TaskManagerSettings.Column_IOReadBytes = FALSE;
+--- a/programs/wineboot/shutdown.c
++++ b/programs/wineboot/shutdown.c
+@@ -20,13 +20,12 @@
+ #include <stdlib.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
+ #include "winuser.h"
+ #include "tlhelp32.h"
+-
+ #include "wine/debug.h"
+ 
+ #include "resource.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wineboot);
+ 
+@@ -286,13 +285,14 @@
+         return 1;
+     }
+ 
+     /* Check whether the app quit on its own */
+     ret = WaitForSingleObject( process_handle, 0 );
+     CloseHandle( process_handle );
+-    if (ret == WAIT_TIMEOUT)
++    /* CODEWEAVERS HACK: avoid killing winewrapper, other processes will be killed in kill_processes */
++    if (0 && ret == WAIT_TIMEOUT)
+     {
+         /* If not, it returned from all WM_ENDSESSION and is finished cleaning
+          * up, so we can safely kill the process. */
+         HANDLE handle = OpenProcess( PROCESS_TERMINATE, FALSE, win[0].pid );
+         if (handle)
+         {
+@@ -385,14 +385,18 @@
+         if (!(snapshot = CreateToolhelp32Snapshot( TH32CS_SNAPPROCESS, 0 ))) break;
+ 
+         killed = 0;
+         process.dwSize = sizeof(process);
+         for (res = Process32FirstW( snapshot, &process ); res; res = Process32NextW( snapshot, &process ))
+         {
++            static const WCHAR winewrapperW[] = {'w','i','n','e','w','r','a','p','p','e','r',0};
+             if (process.th32ProcessID == GetCurrentProcessId()) continue;
+             if (process.th32ProcessID == desktop_pid) continue;
++            /* CODEWEAVERS HACK: don't kill winewrapper so end-of-installation
++             * detection works properly */
++            if (wcsstr( process.szExeFile, winewrapperW )) continue;
+             WINE_TRACE("killing process %04lx %s\n",
+                        process.th32ProcessID, wine_dbgstr_w(process.szExeFile) );
+             if (!(handle = OpenProcess( PROCESS_TERMINATE, FALSE, process.th32ProcessID )))
+                 continue;
+             if (TerminateProcess( handle, 0 )) killed++;
+             CloseHandle( handle );
+--- a/programs/wineboot/wineboot.c
++++ b/programs/wineboot/wineboot.c
+@@ -1550,20 +1550,74 @@
+     TRACE( "machine %x starting %s\n", machine, debugstr_w(app) );
+ 
+     len = lstrlenW(app) + ARRAY_SIZE(L" setupapi,InstallHinfSection DefaultInstall 128 ") + lstrlenW(inf_path);
+ 
+     if (!(buffer = malloc( len * sizeof(WCHAR) ))) return 0;
+     swprintf( buffer, len, L"%s setupapi,InstallHinfSection %s 128 %s", app, install, inf_path );
++
++    if (1)
++    {
++        /* CROSSOVER HACK bug 7736. Do prefix initialization in the root desktop. */
++        static WCHAR root[] = {'r','o','o','t',0};
++        HDESK desktop;
++
++        desktop = CreateDesktopW(root, NULL, NULL, 0, GENERIC_ALL, NULL);
++        if (desktop)
++        {
++            SetThreadDesktop(desktop);
++            CloseHandle(desktop);
++        }
++    }
+ 
+     if (CreateProcessW( app, buffer, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi ))
+         CloseHandle( pi.hThread );
+     else
+         pi.hProcess = 0;
+ 
+     free( buffer );
+     return pi.hProcess;
++}
++
++/* ---------------------------------------------------------------
++**   This function is a CrossOver HACK for 9411 / 8979.
++** --------------------------------------------------------------- */
++static char* setup_dll_overrides(void)
++{
++    /* See CXBT.pm for reference */
++    static char overrides[] = "WINEDLLOVERRIDES=shdocvw=b;*iexplore.exe=b;advpack=b;atl=b;oleaut32=b;rpcrt4=b";
++    char* old_dlloverrides, *ret = NULL;
++    HANDLE hFile;
++
++    /* Save the original dll overrides so we can restore them after running
++     * rundll32.
++     */
++    old_dlloverrides = getenv("WINEDLLOVERRIDES");
++    if (old_dlloverrides)
++    {
++        ret = HeapAlloc( GetProcessHeap(), 0, sizeof("WINEDLLOVERRIDES=") + strlen(old_dlloverrides));
++        strcpy(ret, "WINEDLLOVERRIDES=");
++        strcat(ret, old_dlloverrides);
++    }
++
++    /* Check whether shdocvw is usable */
++    hFile = CreateFileA("c:/windows/system32/shdocvw.dll", FILE_READ_DATA,
++                        FILE_SHARE_READ | FILE_SHARE_WRITE,
++                        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (hFile != INVALID_HANDLE_VALUE)
++    {
++        char buf[0x40+20];
++        if (ReadFile(hFile, buf, sizeof(buf), NULL, NULL))
++        {
++            if (strncmp(buf+0x40, "Wine placeholder DLL", 20) != 0)
++                overrides[8] = 'd';
++        }
++        CloseHandle(hFile);
++    }
++    WINE_TRACE("for rundll32: %s\n", overrides);
++    putenv(overrides);
++    return ret;
+ }
+ 
+ static void install_root_pnp_devices(void)
+ {
+     static const struct
+     {
+@@ -1676,19 +1730,46 @@
+ 
+     if (update_timestamp( config_dir, st.st_mtime ) || force)
+     {
+         SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES_INFORMATION machines[8];
+         HANDLE process = 0;
+         DWORD count = 0;
++        char* old_dlloverrides = setup_dll_overrides();
++        HINF inf;
+ 
++        /* crossover hack 21088: initialize the prefix early, without using
++         * user32, so that explorer.exe can successfully register
++         * CLSID_ShellWindows.
++         *
++         * explorer needs actxprxy (for the COM proxy to be registered), rpcss
++         * (for the service to be found). both of these need dlls to exist on
++         * disk.
++         */
++        if ((inf = SetupOpenInfFileW( inf_path, NULL, INF_STYLE_WIN4, NULL )))
++        {
++            void *callback_context;
++
++            callback_context = SetupInitDefaultQueueCallback( NULL );
++            SetupInstallFromInfSectionW( NULL, inf, L"DefaultInstall", 0, NULL, NULL,
++                    SP_COPY_NEWER, SetupDefaultQueueCallbackW, callback_context, NULL, NULL );
++            SetupTermDefaultQueueCallback( callback_context );
++            SetupInstallServicesFromInfSectionW( inf, L"DefaultInstall.Services", 0 );
++            SetupCloseInfFile( inf );
++        }
++        else
++        {
++            ERR( "failed to open %s, error %lu\n", debugstr_w(inf_path), GetLastError() );
++        }
++
+         if (NtQuerySystemInformationEx( SystemSupportedProcessorArchitectures, &process, sizeof(process),
+                                         machines, sizeof(machines), NULL )) machines[0].Machine = 0;
+ 
+         if ((process = start_rundll32( inf_path, L"PreInstall", IMAGE_FILE_MACHINE_TARGET_HOST )))
+         {
+-            HWND hwnd = show_wait_window();
++            /* HACK: Disable the wait window as it is deemed confusing */
++            HWND hwnd = 1 ? NULL : show_wait_window();
+             for (;;)
+             {
+                 if (process)
+                 {
+                     MSG msg;
+                     DWORD res = MsgWaitForMultipleObjects( 1, &process, FALSE, INFINITE, QS_ALLINPUT );
+@@ -1709,12 +1790,17 @@
+             DestroyWindow( hwnd );
+         }
+         install_root_pnp_devices();
+         update_user_profile();
+ 
+         TRACE( "wine: configuration in %s has been updated.\n", debugstr_w(prettyprint_configdir()) );
++        if (old_dlloverrides)
++        {
++            putenv(old_dlloverrides);
++            free(old_dlloverrides);
++        }
+     }
+ 
+ done:
+     free( inf_path );
+ }
+ 
+@@ -1915,24 +2001,49 @@
+ 
+     if (init || (kill && !restart))
+     {
+         ProcessRunKeys( HKEY_LOCAL_MACHINE, L"RunServices", FALSE, FALSE );
+         start_services_process();
+     }
++
++    if (end_session || kill || restart) /* CodeWeavers hack: let reboot.exe do the reboot processing */
++    {
++        static const WCHAR rebootW[] = { '\\','r','e','b','o','o','t','.','e','x','e',0 };
++        WCHAR cmdline[MAX_PATH + sizeof(rebootW)/sizeof(WCHAR)];
++        PROCESS_INFORMATION pi;
++        STARTUPINFOW si;
++
++        GetSystemDirectoryW( cmdline, MAX_PATH );
++        lstrcatW( cmdline, rebootW );
++        memset( &si, 0, sizeof si );
++        si.cb = sizeof si;
++        if (CreateProcessW( NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi ))
++        {
++            WaitForSingleObject( pi.hProcess, INFINITE );
++            CloseHandle( pi.hProcess );
++            CloseHandle( pi.hThread );
++            goto done;
++        }
++        WINE_ERR("Failed to start reboot\n");
++    }
++
+     if (init || update) update_wineprefix( update );
+ 
+     create_volatile_environment_registry_key();
+ 
++    goto done;  /* CodeWeavers hack: reboot.exe should have handled these already */
++
+     ProcessRunKeys( HKEY_LOCAL_MACHINE, L"RunOnce", TRUE, TRUE );
+ 
+     if (!init && !restart)
+     {
+         ProcessRunKeys( HKEY_LOCAL_MACHINE, L"Run", FALSE, FALSE );
+         ProcessRunKeys( HKEY_CURRENT_USER, L"Run", FALSE, FALSE );
+         ProcessStartupItems();
+     }
+ 
++done:
+     WINE_TRACE("Operation done\n");
+ 
+     SetEvent( event );
+     return 0;
+ }
+--- a/programs/winebrowser/main.c
++++ b/programs/winebrowser/main.c
+@@ -423,12 +423,36 @@
+     }
+ 
+     free(ddeString);
+     IUri_GetScheme(uri, &scheme);
+ 
+     if(scheme == URL_SCHEME_FILE) {
++#ifdef __ANDROID__
++        /* on Chrome OS, open HTML in iexplore. Otherwise pass to native browser. */
++        static const WCHAR iexploreW[] = {'i','e','x','p','l','o','r','e','.','e','x','e',0};
++        static const WCHAR htmW[] = {'.','h','t','m',0};
++        static const WCHAR htmlW[] = {'.','h','t','m','l',0};
++
++        BSTR ext = NULL;
++
++        hres = IUri_GetExtension(uri, &ext);
++        if(SUCCEEDED(hres) && ext){
++            if(!strcmpiW(ext, htmW) ||
++                    !strcmpiW(ext, htmlW)){
++                BSTR path = NULL;
++
++                hres = IUri_GetPath(uri, &path);
++                if(SUCCEEDED(hres) && path){
++                    ShellExecuteW(NULL, NULL, iexploreW, path, NULL, SW_SHOW);
++                    return 0;
++                }
++            }
++            SysFreeString(ext);
++        }
++#endif
++
+         display_uri = convert_file_uri(uri);
+         if(!display_uri) {
+             WINE_ERR("Failed to convert file URL to unix path\n");
+         }
+     }
+ 
+--- a/programs/winedbg/Makefile.in
++++ b/programs/winedbg/Makefile.in
+@@ -1,9 +1,9 @@
+ MODULE    = winedbg.exe
+ IMPORTS   = $(CAPSTONE_PE_LIBS) dbghelp advapi32
+-EXTRAINCL = $(CAPSTONE_PE_CFLAGS)
++EXTRAINCL = $(CAPSTONE_PE_CFLAGS) -I$(top_srcdir)/..
+ DELAYIMPORTS = comdlg32 shell32 comctl32 user32 gdi32 ws2_32
+ 
+ EXTRADLLFLAGS = -mconsole
+ 
+ SOURCES = \
+ 	be_arm.c \
+--- a/programs/winedbg/resource.h
++++ b/programs/winedbg/resource.h
+@@ -17,12 +17,13 @@
+  * License along with this library; if not, write to the Free Software
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
+ #include <windef.h>
+ #include <winuser.h>
++#include "distversion.h"
+ 
+ #define IDD_CRASH_DLG   100
+ #define IDD_DETAILS_DLG 101
+ 
+ #define IDC_STATIC_BG   100
+ #define IDC_STATIC_TXT1 101
+--- a/programs/winedbg/winedbg.rc
++++ b/programs/winedbg/winedbg.rc
+@@ -50,30 +50,25 @@
+ FONT 8, "MS Shell Dlg"
+ BEGIN
+     LTEXT           "",IDC_STATIC_BG,0,0,273,52,WS_BORDER,0
+     LTEXT           "The program %s has encountered a serious problem and needs \
+                     to close. We are sorry for the inconvenience.",
+                     IDC_STATIC_TXT1,27,10,224,30
+-    CONTROL         "This can be caused by a problem in the program or a deficiency in Wine. \
+-                    You may want to check the <a href=\"https://appdb.winehq.org\">Application Database</a> \
+-                    for tips about running this application.",
++    CONTROL         WINDEBUG_WHAT_HAPPENED_MESSAGE,
+                     IDC_STATIC_TXT2,"SysLink",0,27,60,224,100
+     DEFPUSHBUTTON   "Close", IDOK, 205, 151, 60, 16, WS_TABSTOP
+     PUSHBUTTON      "Show &Details", ID_DETAILS, 140, 151, 60, 16, WS_TABSTOP
+ END
+ 
+ IDD_DETAILS_DLG DIALOGEX 100, 100, 400, 340
+ STYLE DS_SETFONT | DS_FIXEDSYS | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE
+ CAPTION "Program Error Details"
+ FONT 8, "MS Shell Dlg"
+ BEGIN
+     EDITTEXT        IDC_CRASH_TXT, 4, 4, 392, 272, ES_MULTILINE | ES_READONLY | WS_HSCROLL | WS_VSCROLL, WS_TABSTOP
+-    CONTROL         "If this problem is not present under Windows and has not been reported yet, \
+-                     you can save the detailed information to a file using the \"Save As\" button, \
+-                     then <a href=\"https://gitlab.winehq.org/wine/wine/-/wikis/Bugs\">file a bug report</a> \
+-                     and attach that file to the report.",
++    CONTROL         WINDEBUG_USER_SUGGESTION_MESSAGE,
+                     IDC_STATIC_TXT2,"SysLink",0,6,285,388,32
+     DEFPUSHBUTTON   "Close", IDOK, 326, 320, 70, 16, WS_TABSTOP
+     PUSHBUTTON      "&Save As...", ID_SAVEAS, 252, 320, 70, 16, WS_TABSTOP
+ END
+ 
+ /* @makedep: winedbg.manifest */
+--- a/programs/winemenubuilder/Makefile.in
++++ b/programs/winemenubuilder/Makefile.in
+@@ -1,7 +1,8 @@
+ MODULE    = winemenubuilder.exe
+ IMPORTS   = uuid windowscodecs shell32 shlwapi ole32 user32 advapi32
+ 
+ EXTRADLLFLAGS = -mwindows -municode
+ 
+ SOURCES = \
++	cxmenu.c \
+ 	winemenubuilder.c
+--- a/programs/winemenubuilder/winemenubuilder.c
++++ b/programs/winemenubuilder/winemenubuilder.c
+@@ -81,12 +81,14 @@
+ #include <initguid.h>
+ #include <wincodec.h>
+ 
+ #include "wine/debug.h"
+ #include "wine/list.h"
+ #include "wine/rbtree.h"
++
++#include "cxmenu.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(menubuilder);
+ 
+ #define in_desktop_dir(csidl) ((csidl)==CSIDL_DESKTOPDIRECTORY || \
+                                (csidl)==CSIDL_COMMON_DESKTOPDIRECTORY)
+ #define in_startmenu(csidl)   ((csidl)==CSIDL_STARTMENU || \
+@@ -292,13 +294,13 @@
+             *p = '\\';
+         }
+     }
+     return CreateDirectoryW( directory, NULL ) || GetLastError() == ERROR_ALREADY_EXISTS;
+ }
+ 
+-static char* wchars_to_utf8_chars(LPCWSTR string)
++char* wchars_to_utf8_chars(LPCWSTR string)
+ {
+     char *ret;
+     INT size = WideCharToMultiByte(CP_UTF8, 0, string, -1, NULL, 0, NULL, NULL);
+     ret = xmalloc(size);
+     WideCharToMultiByte(CP_UTF8, 0, string, -1, ret, size, NULL, NULL);
+     return ret;
+@@ -430,13 +432,15 @@
+         hr = IWICBitmapFrameEncode_SetSize(dstFrame, width, height);
+         if (FAILED(hr))
+         {
+             WINE_ERR("error 0x%08lX setting destination bitmap size\n", hr);
+             goto endloop;
+         }
+-        hr = IWICBitmapFrameEncode_SetResolution(dstFrame, 96, 96);
++        /* CROSSOVER HACK bug 4775: Set PNG resolution to 72 DPI so older
++         * CrossOver can correctly convert it to ICNS. */
++        hr = IWICBitmapFrameEncode_SetResolution(dstFrame, 72, 72);
+         if (FAILED(hr))
+         {
+             WINE_ERR("error 0x%08lX setting destination bitmap resolution\n", hr);
+             goto endloop;
+         }
+         hr = IWICBitmapFrameEncode_WriteSource(dstFrame, sourceBitmap, NULL);
+@@ -1030,12 +1034,14 @@
+     if (FAILED(hr))
+     {
+         hr = open_file_type_icon(filename, ppStream);
+         if (SUCCEEDED(hr))
+             hr = validate_ico(ppStream, ppIconDirEntries, numEntries);
+     }
++    if (FAILED(hr) && cx_mode) /* Let cxmenu provide the fallback */
++        return hr;
+     if (FAILED(hr) && !bWait)
+     {
+         hr = open_default_icon(ppStream);
+         if (SUCCEEDED(hr))
+             hr = validate_ico(ppStream, ppIconDirEntries, numEntries);
+     }
+@@ -2313,12 +2319,19 @@
+         {
+             lstrcpyW(szWMClass, p);
+             CharLowerW(szWMClass);
+         }
+     }
+ 
++    if (cx_mode)
++    {
++        r = cx_process_menu(link, in_desktop_dir(csidl), csidl,
++                            szPath, szArgs, icon_name, szDescription, sl);
++        goto cleanup;
++    }
++
+     /* building multiple menus concurrently has race conditions */
+     hsem = CreateSemaphoreA( NULL, 1, 1, "winemenubuilder_semaphore");
+     if( WAIT_OBJECT_0 != MsgWaitForMultipleObjects( 1, &hsem, FALSE, INFINITE, QS_ALLINPUT ) )
+     {
+         WINE_ERR("failed wait for semaphore\n");
+         goto cleanup;
+@@ -2430,18 +2443,27 @@
+             goto cleanup;
+         }
+         WINE_ERR("failed to extract icon from %s\n",
+                  wine_dbgstr_w( pv[0].pwszVal ));
+     }
+ 
++    if (cx_mode)
++    {
++        r = cx_process_menu(link, in_desktop_dir(csidl), csidl,
++                            NULL, NULL, icon_name, NULL, NULL);
++        ret = (r != 0);
++        goto cleanup;
++    }
++
+     hSem = CreateSemaphoreA( NULL, 1, 1, "winemenubuilder_semaphore");
+     if( WAIT_OBJECT_0 != MsgWaitForMultipleObjects( 1, &hSem, FALSE, INFINITE, QS_ALLINPUT ) )
+     {
+         WINE_ERR("failed wait for semaphore\n");
+         goto cleanup;
+     }
++
+     if (in_desktop_dir(csidl))
+         r = !write_desktop_entry(NULL, NULL, link_name, L"start.exe", urlPath, NULL, NULL, icon_name, NULL);
+     else
+         r = !write_menu_entry(link, link_name, L"start.exe", urlPath, NULL, NULL, icon_name, NULL);
+     ret = (r == 0);
+     ReleaseSemaphore(hSem, 1, NULL);
+@@ -2499,13 +2521,13 @@
+ done:
+     if (hprocess) CloseHandle( hprocess );
+     if (hsnapshot) CloseHandle( hsnapshot );
+     return ret;
+ }
+ 
+-static BOOL Process_Link( LPCWSTR linkname, BOOL bWait )
++BOOL Process_Link( LPCWSTR linkname, BOOL bWait )
+ {
+     IShellLinkW *sl;
+     IPersistFile *pf;
+     HRESULT r;
+     WCHAR fullname[MAX_PATH];
+     DWORD len;
+@@ -2560,13 +2582,13 @@
+     IPersistFile_Release( pf );
+     IShellLinkW_Release( sl );
+ 
+     return !r;
+ }
+ 
+-static BOOL Process_URL( LPCWSTR urlname, BOOL bWait )
++BOOL Process_URL( LPCWSTR urlname, BOOL bWait )
+ {
+     IUniformResourceLocatorW *url;
+     IPersistFile *pf;
+     HRESULT r;
+     WCHAR fullname[MAX_PATH];
+     DWORD len;
+@@ -2877,24 +2899,44 @@
+         RegCloseKey( hkey );
+     }
+ 
+     return ret;
+ }
+ 
++static const WCHAR* get_wine_config_dir(void)
++{
++    const WCHAR* nt_path = _wgetenv(L"WINECONFIGDIR");
++
++    if (!nt_path)
++        return NULL;
++
++    if (nt_path[0] == '\\' && nt_path[1] == '?' && nt_path[2] == '?' &&
++        nt_path[3] == '\\' && nt_path[4] && nt_path[5] == ':' && nt_path[6] == '\\')
++    {
++        /* NT path with \??\X:\ prefix */
++        return nt_path + 4;
++    }
++
++    return nt_path;
++}
++
+ /***********************************************************************
+  *
+  *           wWinMain
+  */
+ int PASCAL wWinMain (HINSTANCE hInstance, HINSTANCE prev, LPWSTR cmdline, int show)
+ {
+     LPWSTR token = NULL, p;
+     BOOL bWait = FALSE;
+     BOOL bURL = FALSE;
+     HRESULT hr;
+     int ret = 0;
+ 
++    if (cx_mode)
++        xdg_data_dir = heap_wprintf(L"%s\\windata\\cxmenu", get_wine_config_dir());
++    else
+     if (!init_xdg())
+         return 1;
+ 
+     hr = CoInitialize(NULL);
+     if (FAILED(hr))
+     {
+@@ -2906,18 +2948,19 @@
+     {
+         token = next_token( &p );
+ 	if( !token )
+ 	    break;
+         if( !wcscmp( token, L"-a" ) )
+         {
+-            if (associations_enabled())
++            if (!cx_mode && associations_enabled())
+                 RefreshFileTypeAssociations();
+             continue;
+         }
+         if( !wcscmp( token, L"-r" ) )
+         {
++            if (!cx_mode)
+             cleanup_menus();
+             continue;
+         }
+         if( !wcscmp( token, L"-w" ) )
+             bWait = TRUE;
+         else if ( !wcscmp( token, L"-u" ) )
+@@ -2929,12 +2972,22 @@
+             {
+                  WCHAR *outputFile = next_token( &p );
+                  if (outputFile)
+                      thumbnail_lnk(lnkFile, outputFile);
+             }
+         }
++        else if( !lstrcmpW( token, L"--cx-all-menus" ) )
++        {
++            if (!cx_process_all_menus())
++            {
++	        WINE_ERR("failed to build some menu items\n");
++                ret = 1;
++            }
++        }
++        else if( !lstrcmpW( token, L"--cx-dump-menus" ) )
++            cx_dump_menus = 1;
+ 	else if( token[0] == '-' )
+ 	{
+ 	    WINE_ERR( "unknown option %s\n", wine_dbgstr_w(token) );
+ 	}
+         else
+         {

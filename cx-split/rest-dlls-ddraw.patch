@@ -1,0 +1,148 @@
+--- a/dlls/ddraw/ddraw.c
++++ b/dlls/ddraw/ddraw.c
+@@ -802,12 +802,19 @@
+     HRESULT hr;
+ 
+     TRACE("ddraw %p, window %p, flags %#lx, restore_mode_on_normal %x.\n", ddraw, window, cooplevel,
+             restore_mode_on_normal);
+     DDRAW_dump_cooperativelevel(cooplevel);
+ 
++    /* hack for WA/WWP/Diablo, wine bug 2082
++     *
++     * These programs use dialog boxes containing standard controls, which they
++     * draw over using directdraw. If we draw to the given window, the draw will
++     * be clipped by the dialog. Instead, draw to the desktop window. */
++    if (use_desktop_hack) window = GetDesktopWindow();
++
+     wined3d_mutex_lock();
+ 
+     if (ddraw->flags & DDRAW_SCL_RECURSIVE)
+     {
+         WARN("Recursive call, returning DD_OK.\n");
+         hr = DD_OK;
+--- a/dlls/ddraw/ddraw_private.h
++++ b/dlls/ddraw/ddraw_private.h
+@@ -153,12 +153,15 @@
+ 
+ /* Utility functions */
+ void DDRAW_Convert_DDSCAPS_1_To_2(const DDSCAPS *pIn, DDSCAPS2 *pOut);
+ void DDRAW_Convert_DDDEVICEIDENTIFIER_2_To_1(const DDDEVICEIDENTIFIER2 *pIn, DDDEVICEIDENTIFIER *pOut);
+ struct wined3d_vertex_declaration *ddraw_find_decl(struct ddraw *ddraw, DWORD fvf);
+ 
++/* hack for WA/WWP/Diablo */
++extern int use_desktop_hack;
++
+ #define DDRAW_SURFACE_LOCATION_DEFAULT 0x00000001
+ #define DDRAW_SURFACE_LOCATION_DRAW    0x00000002
+ 
+ struct ddraw_surface
+ {
+     /* IUnknown fields */
+--- a/dlls/ddraw/main.c
++++ b/dlls/ddraw/main.c
+@@ -26,12 +26,15 @@
+ #include "rpcproxy.h"
+ 
+ #include "wine/exception.h"
+ #include "winreg.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(ddraw);
++
++/* hack for WA/WWP/Diablo */
++int use_desktop_hack = 0;
+ 
+ static struct list global_ddraw_list = LIST_INIT(global_ddraw_list);
+ 
+ static HINSTANCE instance;
+ 
+ /* value of ForceRefreshRate */
+@@ -787,12 +790,28 @@
+     *out = factory;
+     return S_OK;
+ }
+ 
+ 
+ /***********************************************************************
++ * get_config_key
++ *
++ * Reads a config key from the registry. Taken from WineD3D
++ *
++ ***********************************************************************/
++static inline DWORD get_config_key(HKEY defkey, HKEY appkey, const char* name, char* buffer, DWORD size)
++{
++    if (0 != appkey && !RegQueryValueExA( appkey, name, 0, NULL, (LPBYTE) buffer, &size )) return 0;
++    if (0 != defkey && !RegQueryValueExA( defkey, name, 0, NULL, (LPBYTE) buffer, &size )) return 0;
++    return ERROR_FILE_NOT_FOUND;
++}
++
++#define IS_OPTION_TRUE(ch) \
++    ((ch) == 'y' || (ch) == 'Y' || (ch) == 't' || (ch) == 'T' || (ch) == '1')
++
++/***********************************************************************
+  * DllMain (DDRAW.0)
+  *
+  * Could be used to register DirectDraw drivers, if we have more than
+  * one. Also used to destroy any objects left at unload if the
+  * app didn't release them properly(Gothic 2, Diablo 2, Moto racer, ...)
+  *
+@@ -801,14 +820,18 @@
+ {
+     switch (reason)
+     {
+     case DLL_PROCESS_ATTACH:
+     {
+         static HMODULE ddraw_self;
++        char buffer[MAX_PATH+10];
++        DWORD size = sizeof(buffer);
+         HKEY hkey = 0;
++        HKEY appkey = 0;
+         WNDCLASSA wc;
++        DWORD len;
+ 
+         /* Register the window class. This is used to create a hidden window
+          * for D3D rendering, if the application didn't pass one. It can also
+          * be used for creating a device window from SetCooperativeLevel(). */
+         wc.style = CS_HREDRAW | CS_VREDRAW;
+         wc.lpfnWndProc = DefWindowProcA;
+@@ -827,14 +850,41 @@
+         }
+ 
+         if (!ddraw_handle_table_init(&global_handle_table, 64))
+         {
+             UnregisterClassA(DDRAW_WINDOW_CLASS_NAME, inst);
+             return FALSE;
++        }
++
++        /* @@ Wine registry key: HKCU\Software\Wine\Direct3D */
++        if ( RegOpenKeyA( HKEY_CURRENT_USER, "Software\\Wine\\Direct3D", &hkey ) ) hkey = 0;
++
++        len = GetModuleFileNameA( 0, buffer, MAX_PATH );
++        if (len && len < MAX_PATH)
++        {
++            HKEY tmpkey;
++            /* @@ Wine registry key: HKCU\Software\Wine\AppDefaults\app.exe\Direct3D */
++            if (!RegOpenKeyA( HKEY_CURRENT_USER, "Software\\Wine\\AppDefaults", &tmpkey ))
++            {
++                char *p, *appname = buffer;
++                if ((p = strrchr( appname, '/' ))) appname = p + 1;
++                if ((p = strrchr( appname, '\\' ))) appname = p + 1;
++                strcat( appname, "\\Direct3D" );
++                TRACE("appname = [%s]\n", appname);
++                if (RegOpenKeyA( tmpkey, appname, &appkey )) appkey = 0;
++                RegCloseKey( tmpkey );
++            }
+         }
+ 
++        if ( 0 != hkey || 0 != appkey )
++        {
++            /* hack for WA/WWP/Diablo */
++            if ( !get_config_key( hkey, appkey, "DDrawDesktopHack", buffer, size) )
++                use_desktop_hack = IS_OPTION_TRUE( buffer[0] );
++        }
++
+         /* On Windows one can force the refresh rate that DirectDraw uses by
+          * setting an override value in dxdiag.  This is documented in KB315614
+          * (main article), KB230002, and KB217348.  By comparing registry dumps
+          * before and after setting the override, we see that the override value
+          * is stored in HKLM\Software\Microsoft\DirectDraw\ForceRefreshRate as a
+          * DWORD that represents the refresh rate to force.  We use this

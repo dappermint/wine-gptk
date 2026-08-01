@@ -1,0 +1,159 @@
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -457,17 +484,27 @@
+     }
+ }
+ 
+ static void init_paths( char *argv[] )
+ {
+     Dl_info info;
+-    char *basename, *env;
++    const char *basename;
++    char *env;
+ 
+     if ((basename = strrchr( argv[0], '/' ))) basename++;
+     else basename = argv[0];
+ 
++#if defined(__APPLE__) && !defined(HAVE_WINE_PRELOADER)
++    /* CW HACK 22144: When the preloader isn't being used and the Dock icon renaming
++     * hack is in-use, argv[0] is e.g. "explorer.exe".
++     * This isn't usable for building the path to the wineloader, so we need to hardcode
++     * the binary's name (which is just "wine" in upstream, but CrossOver hacks it to be "wineloader").
++     */
++    basename = "wineloader";
++#endif
++
+     if (!dladdr( init_paths, &info ) || !(ntdll_dir = realpath_dirname( info.dli_fname )))
+         fatal_error( "cannot get path to ntdll.so\n" );
+ 
+     if (!(build_dir = remove_tail( ntdll_dir, "/dlls/ntdll" )))
+     {
+         if (!(dll_dir = remove_tail( ntdll_dir, so_dir ))) dll_dir = ntdll_dir;
+@@ -545,41 +696,57 @@
+     memcpy( argv[0], argv[1], p - argv[1] );
+     strcpy( argv[0] + (p - argv[1]), preloader );
+ 
+ #ifdef __APPLE__
+     {
+         posix_spawnattr_t attr;
++
++        /* CW HACK 22144: Create and exec a more descriptively-named link to the preloader,
++         * which will show up as the icon name in the Dock. */
++        replace_wineloader_path_with_link( &(argv[0]), image_path );
++
+         posix_spawnattr_init( &attr );
+         posix_spawnattr_setflags( &attr, POSIX_SPAWN_SETEXEC | _POSIX_SPAWN_DISABLE_ASLR );
+         posix_spawn( NULL, argv[0], NULL, &attr, argv, *_NSGetEnviron() );
+         posix_spawnattr_destroy( &attr );
+     }
+ #endif
+     execv( argv[0], argv );
+     free( argv[0] );
+ #endif
++
++#if defined(__APPLE__) && !defined(HAVE_WINE_PRELOADER)
++    /* CW HACK 22144: Create and exec a more descriptively-named link to the loader,
++     * which will show up as the icon name in the Dock.
++     * When the preloader is not being used, WINEDLLPATH needs to be set correctly for
++     * the loader to find ntdll.so, so don't even attempt this unless WINEDLLPATH is set.
++     */
++    if (getenv("WINEDLLPATH"))
++        replace_wineloader_path_with_link( &(argv[1]), image_path );
++#endif
++
+     execv( argv[1], argv + 1 );
+ }
+ 
+ /* exec the appropriate wine loader for the specified machine */
+-static NTSTATUS loader_exec( char **argv, WORD machine )
++static NTSTATUS loader_exec( char **argv, WORD machine, const char *image_path )
+ {
+-    if (((argv[1] = get_alternate_wineloader( machine )))) preloader_exec( argv );
++    if (((argv[1] = get_alternate_wineloader( machine )))) preloader_exec( argv, image_path );
+ 
+     argv[1] = strdup( wineloader );
+-    preloader_exec( argv );
++    preloader_exec( argv, image_path );
+     return STATUS_INVALID_IMAGE_FORMAT;
+ }
+ 
+ 
+ /***********************************************************************
+  *           exec_wineloader
+  *
+  * argv[0] and argv[1] must be reserved for the preloader and loader respectively.
+  */
+-NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info )
++NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info, const char *image_path )
+ {
+     WORD machine = pe_info->machine;
+     ULONGLONG res_start = pe_info->base;
+     ULONGLONG res_end = pe_info->base + pe_info->map_size;
+     char preloader_reserve[64], socket_env[64];
+ 
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -458,13 +872,62 @@
+             {
+                 fchdir( unixdir );
+                 close( unixdir );
+             }
+             argv = build_argv( &params->CommandLine, 2 );
+ 
+-            exec_wineloader( argv, socketfd, pe_info );
++            /* CW HACK 22144: Pass the real image name to the loader. */
++            image_path_name_len = params->ImagePathName.Length / sizeof(WCHAR);
++            if ((image_path_name_a = malloc( image_path_name_len * 3 + 1 )))
++            {
++                image_path_name_len = ntdll_wcstoumbs( params->ImagePathName.Buffer, image_path_name_len, image_path_name_a, image_path_name_len * 3, FALSE );
++                image_path_name_a[image_path_name_len++] = 0;
++            }
++            else
++                image_path_name_a = argv[2];
++
++            /* CW Hack 24717: Promote specially prefixed PE variables into the Unix environment. */
++            {
++                static const WCHAR cx_unixW[] = {'_','_','C','X','_','U','N','I','X','_',0};
++                const WCHAR *ptr = params->Environment;
++                while (*ptr)
++                {
++                    if (!wcsncmp( ptr, cx_unixW, ARRAY_SIZE( cx_unixW ) - 1 ) &&
++                        ptr[ARRAY_SIZE( cx_unixW )] != '\0' &&
++                        ptr[ARRAY_SIZE( cx_unixW )] != '=')
++                    {
++                        const WCHAR *unprefixed_start = ptr + ARRAY_SIZE( cx_unixW ) - 1;
++                        DWORD unprefixed_len = wcslen( unprefixed_start );
++                        DWORD mb_len = unprefixed_len * 3 + 1;
++                        char *mb_str = malloc( mb_len );
++                        if (mb_str)
++                        {
++                            ntdll_wcstoumbs( unprefixed_start, unprefixed_len + 1, mb_str, mb_len, FALSE );
++                            putenv(mb_str);
++                        }
++                    }
++                    ptr += wcslen(ptr) + 1;
++                }
++            }
++
++        /* CW Hack 24560: Don't advertise Vulkan extensions for Path of Exile 2 */
++#ifdef __APPLE__
++        {
++            static const WCHAR pathofexilesteamW[] = {'\\','P','a','t','h',' ','o','f',' ','E','x','i','l','e',' ','2','\\','P','a','t','h','O','f','E','x','i','l','e','S','t','e','a','m','.','e','x','e',0};
++            USHORT path_len = params->ImagePathName.Length / sizeof(WCHAR);
++
++            if (path_len >= ARRAY_SIZE(pathofexilesteamW) &&
++                !wcsicmp( params->ImagePathName.Buffer + path_len - ARRAY_SIZE(pathofexilesteamW) + 1, pathofexilesteamW ))
++            {
++                FIXME( "HACK: setting MVK_CONFIG_ADVERTISE_EXTENSIONS=0\n" );
++                setenv( "MVK_CONFIG_ADVERTISE_EXTENSIONS", "0", 1 );
++            }
++        }
++#endif
++
++            exec_wineloader( argv, socketfd, pe_info, image_path_name_a );
+             _exit(1);
+         }
+ 
+         _exit(pid == -1);
+     }
+ 

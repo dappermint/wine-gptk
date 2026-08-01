@@ -1,0 +1,155 @@
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -138,12 +142,13 @@
+ #else
+     ALL_SYSCALLS32
+ #endif
+ #undef SYSCALL_ENTRY
+ };
+ 
++__attribute__((visibility("default")))  /* CW Hack 24067 */
+ SYSTEM_SERVICE_TABLE KeServiceDescriptorTable[4] =
+ {
+     { (ULONG_PTR *)syscalls, NULL, ARRAY_SIZE(syscalls), syscall_args }
+ };
+ 
+ #ifdef __GNUC__
+@@ -364,14 +369,36 @@
+     case IMAGE_FILE_MACHINE_AMD64: return "/x86_64-windows";
+     case IMAGE_FILE_MACHINE_ARMNT: return "/arm-windows";
+     case IMAGE_FILE_MACHINE_ARM64: return "/aarch64-windows";
+     default: return "";
+     }
+ }
++
++
++/* CW Hack 24067 */
++__attribute__((visibility("default")))
++void prepend_dll_path(const char *path)
++{
++    unsigned int i, count;
++    const char **new_dll_paths;
++    size_t path_len = strlen(path);
+ 
++    for (count = 0; dll_paths[count]; count++)
++        ;
+ 
++    new_dll_paths = calloc(count + 2, sizeof(char *));
++    new_dll_paths[0] = path;
++    for (i = 0; dll_paths[i]; i++)
++        new_dll_paths[i + 1] = dll_paths[i];
++
++    free(dll_paths);
++    dll_paths = new_dll_paths;
++    if (path_len > dll_path_maxlen)
++        dll_path_maxlen = path_len;
++}
++
+ static void set_dll_path(void)
+ {
+     char *p, *path = getenv( "WINEDLLPATH" );
+     int i, count = 0;
+ 
+     if (path) for (p = path, count = 1; *p; p++) if (*p == ':') count++;
+@@ -1844,34 +2112,101 @@
+     if (task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&dyld_info, &size) == KERN_SUCCESS)
+         return dyld_info.all_image_info_addr;
+ #endif
+     return 0;
+ }
+ 
++#if defined(__APPLE__) && defined(__x86_64__)
++static __thread struct tm localtime_tls;
++struct tm *my_localtime(const time_t *timep)
++{
++    return localtime_r(timep, &localtime_tls);
++}
++
++static void hook(void *to_hook, const void *replace)
++{
++    size_t offset;
++
++    struct hooked_function
++    {
++        char jmp[8];
++        const void *dst;
++    } *hooked_function = to_hook;
++    ULONG_PTR intval = (UINT_PTR)to_hook;
++
++    intval -= (intval % 4096);
++    mprotect((void *)intval, 0x2000, PROT_EXEC | PROT_READ | PROT_WRITE);
++
++    /* The offset is from the end of the jmp instruction (6 bytes) to the start of the destination. */
++    offset = offsetof(struct hooked_function, dst) - offsetof(struct hooked_function, jmp) - 0x6;
++
++    /* jmp *(rip + offset) */
++    hooked_function->jmp[0] = 0xff;
++    hooked_function->jmp[1] = 0x25;
++    hooked_function->jmp[2] = offset;
++    hooked_function->jmp[3] = 0x00;
++    hooked_function->jmp[4] = 0x00;
++    hooked_function->jmp[5] = 0x00;
++    /* Filler */
++    hooked_function->jmp[6] = 0xcc;
++    hooked_function->jmp[7] = 0xcc;
++    /* Dest address absolute */
++    hooked_function->dst = replace;
++
++    //size = sizeof(*hooked_function);
++    //NtProtectVirtualMemory(proc, (void **)hooked_function, &size, old_protect, &old_protect);
++}
++#endif
++
+ /***********************************************************************
+  *           start_main_thread
+  */
+ static void start_main_thread(void)
+ {
+     TEB *teb = virtual_alloc_first_teb();
+ 
+     signal_init_threading();
+     signal_alloc_thread( teb );
+     dbg_init();
+     startup_info_size = server_init_process();
++    hacks_init();
++    msync_init();
++    esync_init();
+     virtual_map_user_shared_data();
+     init_cpu_info();
+     init_files();
+     init_startup_info();
+     *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();
+     set_load_order_app_name( main_wargv[0] );
+     init_thread_stack( teb, 0, 0, 0 );
+     NtCreateKeyedEvent( &keyed_event, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
+     load_ntdll();
+     load_wow64_ntdll( main_image_info.Machine );
+     load_apiset_dll();
++
++#if defined(__APPLE__) && defined(__x86_64__)
++    /* This is necessary because we poke PEB into pthread TLS at offset 0x60. It is normally in use by
++     * localtime(), which is called a lot by system libraries. Make localtime() go away. */
++    hook(localtime, my_localtime);
++#endif
++
++    /* CW Hack 24067 */
++    {
++        void *cxcompatdb = NULL;
++        char *name = NULL;
++
++        asprintf( &name, "%s/cxcompatdb.so", ntdll_dir );
++        if (name)
++        {
++            cxcompatdb = dlopen( name, RTLD_LOCAL | RTLD_LAZY );
++            if (!cxcompatdb)
++                WARN( "error loading cxcompatdb.so: %s\n", dlerror() );
++            free(name);
++        }
++    }
++
+     server_init_process_done();
+ }
+ 
+ #ifdef __ANDROID__
+ 
+ #ifndef WINE_JAVA_CLASS

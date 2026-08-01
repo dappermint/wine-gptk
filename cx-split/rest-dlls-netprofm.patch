@@ -1,0 +1,19 @@
+--- a/dlls/netprofm/list.c
++++ b/dlls/netprofm/list.c
+@@ -1325,13 +1325,15 @@
+         {
+             *pbIsConnected = VARIANT_TRUE;
+             return S_OK;
+         }
+     }
+ 
+-    *pbIsConnected = VARIANT_FALSE;
++    /* CrossOver bug 14719 */
++    FIXME( "hack: returning VARIANT_TRUE\n" );
++    *pbIsConnected = VARIANT_TRUE;
+     return S_OK;
+ }
+ 
+ static HRESULT WINAPI list_manager_IsConnected(
+     INetworkListManager *iface,
+     VARIANT_BOOL *pbIsConnected )

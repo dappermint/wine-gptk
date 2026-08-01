@@ -1,0 +1,96 @@
+--- a/dlls/winhttp/session.c
++++ b/dlls/winhttp/session.c
+@@ -1543,13 +1543,13 @@
+             err = DhcpRequestParams( DHCPCAPI_REQUEST_SYNCHRONOUS, NULL, name, NULL, send_params, recv_params,
+                                      buf, &size, NULL );
+         }
+         if (err == ERROR_SUCCESS && param.nBytesData)
+         {
+             int len = MultiByteToWideChar( CP_ACP, 0, (const char *)param.Data, param.nBytesData, NULL, 0 );
+-            if ((ret = malloc( (len + 1) * sizeof(WCHAR) )))
++            if ((ret = GlobalAlloc( 0, (len + 1) * sizeof(WCHAR) )))
+             {
+                 MultiByteToWideChar( CP_ACP, 0,  (const char *)param.Data, param.nBytesData, ret, len );
+                 ret[len] = 0;
+             }
+             TRACE("returning %s\n", debugstr_w(ret));
+             break;
+@@ -1663,28 +1663,74 @@
+ 
+ /***********************************************************************
+  *          WinHttpDetectAutoProxyConfigUrl (winhttp.@)
+  */
+ BOOL WINAPI WinHttpDetectAutoProxyConfigUrl( DWORD flags, WCHAR **url )
+ {
++    static SRWLOCK apc_cache_lock = SRWLOCK_INIT;
++    static BOOL dhcp_cache_valid, dns_cache_valid;
++    static WCHAR *dhcp_apc_url, *dns_apc_url;
++    static HANDLE notifyaddr_handle = INVALID_HANDLE_VALUE;
++    static OVERLAPPED notifyaddr_ol;
++    DWORD bytes;
++
+     TRACE( "%#lx, %p\n", flags, url );
+ 
+     if (!flags || !url)
+     {
+         SetLastError( ERROR_INVALID_PARAMETER );
+         return FALSE;
+     }
+     *url = NULL;
+-    if (flags & WINHTTP_AUTO_DETECT_TYPE_DHCP)
++
++    AcquireSRWLockExclusive( &apc_cache_lock );
++    /* FIXME: use NotifyIpInterfaceChange once that's implemented */
++    if (notifyaddr_handle == INVALID_HANDLE_VALUE)
++        NotifyAddrChange( &notifyaddr_handle, &notifyaddr_ol );
++
++    if ((notifyaddr_handle != INVALID_HANDLE_VALUE) &&
++        GetOverlappedResult( notifyaddr_handle, &notifyaddr_ol, &bytes, FALSE ))
+     {
+-        *url = detect_autoproxyconfig_url_dhcp();
++        TRACE( "network config changed, invalidating cache\n" );
++        dhcp_cache_valid = dns_cache_valid = FALSE;
++        notifyaddr_handle = INVALID_HANDLE_VALUE;
++        NotifyAddrChange( &notifyaddr_handle, &notifyaddr_ol );
+     }
+-    if (flags & WINHTTP_AUTO_DETECT_TYPE_DNS_A)
++
++    if (flags & WINHTTP_AUTO_DETECT_TYPE_DHCP)
+     {
+-        if (!*url) *url = detect_autoproxyconfig_url_dns();
++        if (!dhcp_cache_valid)
++        {
++            GlobalFree( dhcp_apc_url );
++            dhcp_apc_url = detect_autoproxyconfig_url_dhcp();
++            dhcp_cache_valid = TRUE;
++        }
++
++        if (dhcp_apc_url)
++        {
++            *url = GlobalAlloc( 0, (wcslen( dhcp_apc_url ) + 1) * sizeof(WCHAR) );
++            if (*url) wcscpy( *url, dhcp_apc_url );
++        }
+     }
++    if ((flags & WINHTTP_AUTO_DETECT_TYPE_DNS_A) && !*url)
++    {
++        if (!dns_cache_valid)
++        {
++            GlobalFree( dns_apc_url );
++            dns_apc_url = detect_autoproxyconfig_url_dns();
++            dns_cache_valid = TRUE;
++        }
++
++        if (dns_apc_url)
++        {
++            *url = GlobalAlloc( 0, (wcslen( dns_apc_url ) + 1) * sizeof(WCHAR) );
++            if (*url) wcscpy( *url, dns_apc_url );
++        }
++    }
++    ReleaseSRWLockExclusive( &apc_cache_lock );
++
+     if (!*url)
+     {
+         SetLastError( ERROR_WINHTTP_AUTODETECTION_FAILED );
+         return FALSE;
+     }
+     SetLastError( ERROR_SUCCESS );

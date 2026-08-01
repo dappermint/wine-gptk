@@ -1,0 +1,25 @@
+--- a/dlls/wow64/process.c
++++ b/dlls/wow64/process.c
+@@ -31,12 +31,22 @@
+ #include "wine/asm.h"
+ #include "wine/exception.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wow);
+ 
++
++static BOOL is_32b_prefix_on_wow64( void )
++{
++    UNICODE_STRING val_str, name_str = RTL_CONSTANT_STRING( L"WINEWOW6432BPREFIXMODE" );
++
++    val_str.MaximumLength = 0;
++    if (RtlQueryEnvironmentVariable_U( NULL, &name_str, &val_str ) != STATUS_VARIABLE_NOT_FOUND)
++        return TRUE;
++    return FALSE;
++}
+ 
+ static BOOL is_process_wow64( HANDLE handle )
+ {
+     ULONG_PTR info;
+ 
+     if (handle == GetCurrentProcess()) return TRUE;

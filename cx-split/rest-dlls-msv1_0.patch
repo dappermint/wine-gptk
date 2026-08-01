@@ -1,0 +1,256 @@
+--- a/dlls/msv1_0/main.c
++++ b/dlls/msv1_0/main.c
+@@ -39,16 +39,19 @@
+ #include "unixlib.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(ntlm);
+ 
+ static ULONG ntlm_package_id;
+ static LSA_DISPATCH_TABLE lsa_dispatch;
++static char *wine_data_dir;
+ 
+-static NTSTATUS ntlm_check_version(void)
++static NTSTATUS ntlm_check_version( const char *datadir )
+ {
+-    return WINE_UNIX_CALL( unix_check_version, NULL );
++    struct check_version_params params = { datadir };
++
++    return WINE_UNIX_CALL( unix_check_version, &params );
+ }
+ 
+ static void ntlm_cleanup( struct ntlm_ctx *ctx )
+ {
+     WINE_UNIX_CALL( unix_cleanup, ctx );
+ }
+@@ -110,13 +113,13 @@
+     LSA_STRING *str;
+     char *ptr;
+ 
+     TRACE( "%#lx, %p, %s, %s, %p\n", package_id, dispatch, debugstr_as(database), debugstr_as(confidentiality),
+            package_name );
+ 
+-    if (ntlm_check_version())
++    if (ntlm_check_version( wine_data_dir ))
+     {
+         ERR( "no NTLM support, expect problems\n" );
+         return STATUS_UNSUCCESSFUL;
+     }
+ 
+     if (!(str = dispatch->AllocateLsaHeap( sizeof(*str) + sizeof("NTLM" )))) return STATUS_NO_MEMORY;
+@@ -133,13 +136,13 @@
+ 
+ static NTSTATUS NTAPI ntlm_SpInitialize( ULONG_PTR package_id, SECPKG_PARAMETERS *params,
+                                          LSA_SECPKG_FUNCTION_TABLE *lsa_function_table )
+ {
+     TRACE( "%#Ix, %p, %p\n", package_id, params, lsa_function_table );
+ 
+-    if (ntlm_check_version())
++    if (ntlm_check_version( wine_data_dir ))
+     {
+         ERR( "no NTLM support, expect problems\n" );
+         return STATUS_UNSUCCESSFUL;
+     }
+     return STATUS_SUCCESS;
+ }
+@@ -1608,17 +1611,35 @@
+     *package_version = SECPKG_INTERFACE_VERSION;
+     *table = &ntlm_user_table;
+     *table_count = 1;
+     return STATUS_SUCCESS;
+ }
+ 
++static char *get_data_dir(void)
++{
++    const WCHAR *dir = _wgetenv( L"WINEDATADIR" );
++    OBJECT_ATTRIBUTES attr;
++    UNICODE_STRING nt_name;
++    ULONG size = 1024;
++    char *ret;
++
++    if (!dir) return NULL;
++    RtlInitUnicodeString( &nt_name, dir );
++    InitializeObjectAttributes( &attr, &nt_name, 0, 0, NULL );
++    if (!(ret = RtlAllocateHeap( GetProcessHeap(), 0, size ))) return NULL;
++    if (!wine_nt_to_unix_file_name( &attr, ret, &size, 0 )) return ret;
++    RtlFreeHeap( GetProcessHeap(), 0, ret );
++    return NULL;
++}
++
+ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
+ {
+     switch (reason)
+     {
+     case DLL_PROCESS_ATTACH:
++        wine_data_dir = get_data_dir();
+         if (__wine_init_unix_call())
+             return FALSE;
+         DisableThreadLibraryCalls( hinst );
+         break;
+     }
+     return TRUE;
+--- a/dlls/msv1_0/unixlib.c
++++ b/dlls/msv1_0/unixlib.c
+@@ -156,19 +156,28 @@
+ 
+     if (com_buf) free( com_buf->buffer );
+     free( com_buf );
+     return STATUS_SUCCESS;
+ }
+ 
++static char ntlm_auth[256];
++static char *config_file_option;
++
+ static NTSTATUS ntlm_fork( void *args )
+ {
+     const struct fork_params *params = args;
+     struct ntlm_ctx *ctx = params->ctx;
+     posix_spawn_file_actions_t file_actions;
+     int pipe_in[2], pipe_out[2];
++    char *new_argv[6];
++    unsigned int i;
+ 
++    for (i = 0; params->argv[i]; i++) new_argv[i] = params->argv[i];
++    if (config_file_option) new_argv[i++] = config_file_option;
++    new_argv[i] = NULL;
++
+ #ifdef HAVE_PIPE2
+     if (pipe2( pipe_in, O_CLOEXEC ) < 0)
+ #endif
+     {
+         if (pipe( pipe_in ) < 0 ) return SEC_E_INTERNAL_ERROR;
+         fcntl( pipe_in[0], F_SETFD, FD_CLOEXEC );
+@@ -195,13 +204,13 @@
+     posix_spawn_file_actions_addclose( &file_actions, pipe_out[1] );
+ 
+     posix_spawn_file_actions_adddup2( &file_actions, pipe_in[1], 1 );
+     posix_spawn_file_actions_addclose( &file_actions, pipe_in[0] );
+     posix_spawn_file_actions_addclose( &file_actions, pipe_in[1] );
+ 
+-    if (posix_spawnp( &ctx->pid, params->argv[0], &file_actions, NULL, params->argv, environ ))
++    if (posix_spawnp( &ctx->pid, params->argv[0], &file_actions, NULL, new_argv, environ ))
+     {
+         ctx->pid = -1;
+         write( pipe_in[1], "BH\n", 3 );
+     }
+ 
+     ctx->pipe_in = pipe_in[0];
+@@ -213,20 +222,23 @@
+ 
+     return SEC_E_OK;
+ }
+ 
+ static NTSTATUS ntlm_check_version( void *args )
+ {
++    struct check_version_params *check_params = args;
++    const char *datadir = check_params->datadir;
+     struct ntlm_ctx ctx = { 0 };
+     char *argv[3], buf[80];
+     NTSTATUS status = STATUS_DLL_NOT_FOUND;
+     struct fork_params params = { &ctx, argv };
+     int len;
+ 
+     ctx.mode = MODE_CLIENT;
+-    argv[0] = (char *)"ntlm_auth";
++    strcpy( ntlm_auth, "ntlm_auth" );
++    argv[0] = ntlm_auth;
+     argv[1] = (char *)"--version";
+     argv[2] = NULL;
+     if (ntlm_fork( &params ) != SEC_E_OK) return status;
+ 
+     if ((len = read( ctx.pipe_in, buf, sizeof(buf) - 1 )) > 8)
+     {
+@@ -236,12 +248,40 @@
+         else buf[len] = 0;
+ 
+         TRACE( "detected ntlm_auth version %s\n", debugstr_a(buf) );
+         status = STATUS_SUCCESS;
+     }
+ 
++    if (status) /* CrossOver hack 13228 */
++    {
++        ntlm_cleanup( &ctx );
++        memset( &ctx, 0, sizeof(ctx) );
++
++        TRACE( "falling back to CrossOver version of ntlm_auth\n" );
++
++        strcpy( ntlm_auth, getenv("CX_ROOT") );
++        strcat( ntlm_auth, "/bin/cxntlm_auth" );
++
++        if (ntlm_fork( &params ) == SEC_E_OK && (len = read( ctx.pipe_in, buf, sizeof(buf) - 1 )) > 8)
++        {
++            static const char config_file_format[] = "--configfile=%s/smb.conf";
++            char *newline;
++
++            if ((newline = memchr( buf, '\n', len ))) *newline = 0;
++            else buf[len] = 0;
++
++            TRACE( "detected cxntlm_auth version %s datadir %s\n", debugstr_a(buf), datadir );
++            if (datadir)
++            {
++                config_file_option = malloc( sizeof(config_file_format) + strlen(datadir) );
++                sprintf( config_file_option, config_file_format, datadir );
++            }
++            status = STATUS_SUCCESS;
++        }
++    }
++
+     if (status) ERR_(winediag)( "ntlm_auth was not found. Make sure that ntlm_auth >= 3.0.25 is in your path. "
+                                 "Usually, you can find it in the winbind package of your distribution.\n" );
+     ntlm_cleanup( &ctx );
+     return status;
+ }
+ 
+@@ -302,17 +342,32 @@
+     params.argv = argv;
+     ret = ntlm_fork( &params );
+     free( argv );
+     return ret;
+ }
+ 
++static NTSTATUS wow64_ntlm_check_version( void *args )
++{
++    struct
++    {
++        PTR32 datadir;
++    } const *params32 = args;
++
++    struct check_version_params params =
++    {
++        ULongToPtr(params32->datadir)
++    };
++
++    return ntlm_check_version( &params );
++}
++
+ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+ {
+     wow64_ntlm_chat,
+     ntlm_cleanup,
+     wow64_ntlm_fork,
+-    ntlm_check_version,
++    wow64_ntlm_check_version,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
+ 
+ #endif  /* _WIN64 */
+--- a/dlls/msv1_0/unixlib.h
++++ b/dlls/msv1_0/unixlib.h
+@@ -103,12 +103,17 @@
+ struct fork_params
+ {
+     struct ntlm_ctx *ctx;
+     char **argv;
+ };
+ 
++struct check_version_params
++{
++    const char *datadir;
++};
++
+ enum ntlm_funcs
+ {
+     unix_chat,
+     unix_cleanup,
+     unix_fork,
+     unix_check_version,

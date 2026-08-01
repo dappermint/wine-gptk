@@ -1,0 +1,59 @@
+--- a/dlls/slc/Makefile.in
++++ b/dlls/slc/Makefile.in
+@@ -1,8 +1,12 @@
+ EXTRADEFS = -D_SLC_
+ MODULE    = slc.dll
+ IMPORTLIB = slc
+ 
++# CROSSOVER HACK: bug 19782
++PARENTSRC = ../sppc
++
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+ SOURCES = \
+-	slc.c
++	slc.c \
++	sppc.c
+--- a/dlls/slc/slc.spec
++++ b/dlls/slc/slc.spec
+@@ -3,23 +3,23 @@
+ @ stub SLpCheckProductKey
+ @ stub SLpGetGenuineBlob
+ @ stub SLpGetGenuineLocal
+ @ stub SLpGetLicenseAcquisitionInfo
+ @ stub SLpGetMachineUGUID
+ @ stub SLpVLActivateProduct
+-@ stdcall SLClose(ptr) sppc.SLClose
++@ stdcall SLClose(ptr)
+ @ stub SLConsumeRight
+ @ stub SLConsumeWindowsRight
+ @ stub SLDepositOfflineConfirmationId
+ @ stub SLFireEvent
+ @ stub SLGenerateOfflineInstallationId
+ @ stub SLGetInstalledSAMLicenseApplications
+ @ stub SLGetLicense
+ @ stub SLGetLicenseFileId
+ @ stub SLGetLicenseInformation
+-@ stdcall SLGetLicensingStatusInformation(ptr ptr ptr wstr ptr ptr) sppc.SLGetLicensingStatusInformation
++@ stdcall SLGetLicensingStatusInformation(ptr ptr ptr wstr ptr ptr)
+ @ stub SLGetPKeyId
+ @ stub SLGetPKeyInformation
+ @ stub SLGetPolicyInformation
+ @ stub SLGetPolicyInformationDWORD
+ @ stub SLGetProductSkuInformation
+ @ stub SLGetSAMLicense
+@@ -27,13 +27,13 @@
+ @ stub SLGetServiceInformation
+ @ stdcall SLGetWindowsInformation(wstr ptr ptr ptr)
+ @ stdcall SLGetWindowsInformationDWORD(wstr ptr)
+ @ stub SLInstallLicense
+ @ stub SLInstallProofOfPurchase
+ @ stub SLInstallSAMLicense
+-@ stdcall SLOpen(ptr) sppc.SLOpen
++@ stdcall SLOpen(ptr)
+ @ stub SLReArmWindows
+ @ stub SLRegisterEvent
+ @ stub SLRegisterWindowsEvent
+ @ stub SLUninstallLicense
+ @ stub SLUninstallProofOfPurchase
+ @ stub SLUninstallSAMLicense

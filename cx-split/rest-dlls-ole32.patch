@@ -1,0 +1,109 @@
+--- a/dlls/ole32/defaulthandler.c
++++ b/dlls/ole32/defaulthandler.c
+@@ -250,13 +250,16 @@
+   }
+ 
+   /* Check that we obtained an interface. */
+   if (*ppvObject == NULL)
+   {
+     WARN( "() : asking for unsupported interface %s\n", debugstr_guid(riid));
+-    return E_NOINTERFACE;
++    /* native returns CO_E_OBJNOTCONNECTED here instead of E_NOINTERFACE, since
++     * the latter means that an interface will *never* be supported, but it
++     * could be supported later when we connect to the delegate object */
++    return CO_E_OBJNOTCONNECTED;
+   }
+ 
+   /*
+    * Query Interface always increases the reference count by one when it is
+    * successful.
+    */
+--- a/dlls/ole32/ole2.c
++++ b/dlls/ole32/ole2.c
+@@ -2463,12 +2463,24 @@
+     IOleObject *pOleObject = NULL;
+ 
+     TRACE("%s, %s, %ld, %p, %p, %p, %p.\n", debugstr_guid(rclsid),
+         debugstr_guid(riid), renderopt, pFormatEtc, pClientSite, pStg, ppvObj);
+ 
+     hres = CoCreateInstance(rclsid, 0, CLSCTX_INPROC_SERVER|CLSCTX_INPROC_HANDLER, riid, (LPVOID*)&pUnk);
++
++    /*
++     * If that fails, as it will most times, load the default
++     * OLE handler.
++     */
++    if (FAILED(hres))
++    {
++        hres = OleCreateDefaultHandler(rclsid,
++				   NULL,
++				   riid,
++				   (void**)&pUnk);
++    }
+ 
+     if (SUCCEEDED(hres))
+         hres = IStorage_SetClass(pStg, rclsid);
+ 
+     if (pClientSite && SUCCEEDED(hres))
+     {
+--- a/dlls/ole32/usrmarshal.c
++++ b/dlls/ole32/usrmarshal.c
+@@ -1278,22 +1278,22 @@
+ }
+ 
+ HRESULT CALLBACK IClassFactory_LockServer_Proxy(
+     IClassFactory* This,
+     BOOL fLock)
+ {
+-    FIXME(":stub\n");
+-    return E_NOTIMPL;
++    TRACE("(%s)\n", fLock ? "TRUE" : "FALSE");
++    return S_OK; /* like native, ignore LockServer requests */
+ }
+ 
+ HRESULT __RPC_STUB IClassFactory_LockServer_Stub(
+     IClassFactory* This,
+     BOOL fLock)
+ {
+-    FIXME(":stub\n");
+-    return E_NOTIMPL;
++    TRACE("(%s)\n", fLock ? "TRUE" : "FALSE");
++    return IClassFactory_LockServer(This, fLock);
+ }
+ 
+ /* call_as/local stubs for objidl.idl */
+ 
+ HRESULT CALLBACK IEnumUnknown_Next_Proxy(
+     IEnumUnknown* This,
+@@ -2027,25 +2027,28 @@
+ HRESULT CALLBACK IOleInPlaceActiveObject_ResizeBorder_Proxy(
+     IOleInPlaceActiveObject* This,
+     LPCRECT prcBorder,
+     IOleInPlaceUIWindow *pUIWindow,
+     BOOL fFrameWindow)
+ {
+-    FIXME(":stub\n");
+-    return E_NOTIMPL;
++    TRACE("(%p, %p, %d)\n", prcBorder, pUIWindow, fFrameWindow);
++    return IOleInPlaceActiveObject_RemoteResizeBorder_Proxy(
++        This, prcBorder,
++        fFrameWindow ? &IID_IOleInPlaceFrame : &IID_IOleInPlaceUIWindow,
++        pUIWindow, fFrameWindow);
+ }
+ 
+ HRESULT __RPC_STUB IOleInPlaceActiveObject_ResizeBorder_Stub(
+     IOleInPlaceActiveObject* This,
+     LPCRECT prcBorder,
+     REFIID riid,
+     IOleInPlaceUIWindow *pUIWindow,
+     BOOL fFrameWindow)
+ {
+-    FIXME(":stub\n");
+-    return E_NOTIMPL;
++    TRACE("(%p, %s, %p, %d)\n", prcBorder, debugstr_guid(riid), pUIWindow, fFrameWindow);
++    return IOleInPlaceActiveObject_ResizeBorder(This, prcBorder, pUIWindow, fFrameWindow);
+ }
+ 
+ HRESULT CALLBACK IOleCache2_UpdateCache_Proxy(
+     IOleCache2* This,
+     LPDATAOBJECT pDataObject,
+     DWORD grfUpdf,

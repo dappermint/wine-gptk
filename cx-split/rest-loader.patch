@@ -1,0 +1,275 @@
+--- a/loader/main.c
++++ b/loader/main.c
+@@ -32,12 +32,21 @@
+ #include <dlfcn.h>
+ #include <limits.h>
+ #ifdef HAVE_SYS_SYSCTL_H
+ # include <sys/sysctl.h>
+ #endif
+ 
++#ifdef __APPLE__ /* CrossOver Hack 13438 */
++#include <crt_externs.h>
++#include <mach/mach.h>
++#include <mach/vm_map.h>
++#include <mach-o/dyld.h>
++#include <mach-o/getsect.h>
++#include <mach-o/ldsyms.h>
++#endif
++
+ #include "main.h"
+ 
+ #if defined(__APPLE__) && defined(__x86_64__) && !defined(HAVE_WINE_PRELOADER)
+ 
+ /* Not using the preloader on x86_64:
+  * Reserve the same areas as the preloader does, but using zero-fill sections
+@@ -242,23 +251,118 @@
+     }
+ 
+     if (!handle && !self) handle = try_dlopen( LIBDIR, "wine/" SO_DIR "ntdll.so" );
+ 
+     return handle;
+ }
++
++#ifdef __APPLE__
++#define min(a,b)   (((a) < (b)) ? (a) : (b))
++/***********************************************************************
++ *           apple_override_bundle_name
++ *
++ * Rewrite the bundle name in the Info.plist embedded in the loader.
++ * This is the only way to control the title of the application menu
++ * when using the Mac driver.  The GUI frameworks call down into Core
++ * Foundation to get the bundle name for that.
++ *
++ * CrossOver Hack 13438
++ */
++static void apple_override_bundle_name( int argc, char *argv[] )
++{
++    char* info_plist;
++    unsigned long remaining;
++    static const char prefix[] = "<key>CFBundleName</key>\n    <string>";
++    const size_t prefix_len = strlen(prefix);
++    static const char suffix[] = "</string>";
++    const size_t suffix_len = strlen(suffix);
++    static const char padding[] = "<!-- bundle name padding -->";
++    const size_t padding_len = strlen(padding);
++    char* bundle_name;
++    const char* p;
++    size_t bundle_name_len, max_bundle_name_len;
++    vm_address_t start, end;
++    const char* new_bundle_name = getenv("WINEPRELOADERAPPNAME");
++    size_t new_bundle_name_len;
++
++    unsetenv("WINEPRELOADERAPPNAME");
++
++    if (!new_bundle_name && argc < 2)
++        return;
++
++    info_plist = (char *)getsectiondata(_NSGetMachExecuteHeader(), "__TEXT", "__info_plist", &remaining);
++    if (!info_plist || !remaining)
++        return;
++
++    bundle_name = strnstr(info_plist, prefix, remaining);
++    if (!bundle_name)
++        return;
++
++    bundle_name += prefix_len;
++    remaining -= bundle_name - info_plist;
++    p = strnstr(bundle_name, suffix, remaining);
++    if (!p)
++        return;
+ 
++    bundle_name_len = p - bundle_name;
++    remaining -= bundle_name_len + suffix_len;
+ 
++    max_bundle_name_len = bundle_name_len;
++    if (padding_len <= remaining &&
++        !memcmp(bundle_name + bundle_name_len + suffix_len, padding, padding_len))
++        max_bundle_name_len += padding_len;
++
++    if (!new_bundle_name)
++    {
++        new_bundle_name = argv[1];
++        if ((p = strrchr(new_bundle_name, '\\'))) new_bundle_name = p + 1;
++        if ((p = strrchr(new_bundle_name, '/'))) new_bundle_name = p + 1;
++        if (strspn(new_bundle_name, "0123456789abcdefABCDEF") == 32 &&
++            new_bundle_name[32] == '.')
++            new_bundle_name += 33;
++        if ((p = strrchr(new_bundle_name, '.')) && p != new_bundle_name)
++            new_bundle_name_len = p - new_bundle_name;
++        else
++            new_bundle_name_len = strlen(new_bundle_name);
++    }
++    else
++        new_bundle_name_len = strlen(new_bundle_name);
++
++    if (!new_bundle_name_len)
++        return;
++
++    start = (vm_address_t)bundle_name;
++    end = (vm_address_t)(bundle_name + max_bundle_name_len + suffix_len);
++    start &= ~(getpagesize() - 1);
++    end = (end + getpagesize() - 1) & ~(getpagesize() - 1);
++    if (vm_protect(mach_task_self(), start, end - start, 0,
++                   VM_PROT_READ|VM_PROT_WRITE|VM_PROT_EXECUTE|VM_PROT_COPY) == KERN_SUCCESS)
++    {
++        size_t copy_len = min(new_bundle_name_len, max_bundle_name_len);
++        memcpy(bundle_name, new_bundle_name, copy_len);
++        memcpy(bundle_name + copy_len, suffix, suffix_len);
++        if (copy_len < max_bundle_name_len)
++            memset(bundle_name + copy_len + suffix_len, ' ', max_bundle_name_len - copy_len);
++        vm_protect(mach_task_self(), start, end - start, 0, VM_PROT_READ|VM_PROT_EXECUTE);
++    }
++}
++#endif
++
+ /**********************************************************************
+  *           main
+  */
+ int main( int argc, char *argv[] )
+ {
+     void *handle;
+ 
+     init_reserved_areas();
+ 
++#ifdef __APPLE__ /* CrossOver Hack 13438 */
++    apple_override_bundle_name(argc, argv);
++#endif
++
+     if ((handle = load_ntdll( argv[0] )))
+     {
+         void (*init_func)(int, char **) = dlsym( handle, "__wine_main" );
+         if (init_func) init_func( argc, argv );
+         fprintf( stderr, "wine: __wine_main function not found in ntdll.so\n" );
+         exit(1);
+--- a/loader/preloader_mac.c
++++ b/loader/preloader_mac.c
+@@ -346,12 +346,47 @@
+ MAKE_FUNCPTR(dladdr);
+ #undef MAKE_FUNCPTR
+ 
+ extern int _dyld_func_lookup( const char *dyld_func_name, void **address );
+ 
+ /* replacement for libc functions */
++
++#ifdef __i386__ /* CrossOver Hack #16371 */
++static inline size_t wld_strlen( const char *str )
++{
++    size_t len;
++    for (len = 0; str[len]; ++len)
++        /* nothing */;
++    return len;
++}
++
++static inline int wld_tolower( int c )
++{
++    if ('A' <= c && c <= 'Z')
++        return c - 'A' + 'a';
++    return c;
++}
++
++static inline int wld_strncasecmp( const char *str1, const char *str2, size_t len )
++{
++    if (len <= 0) return 0;
++    while ((--len > 0) && *str1 && (wld_tolower(*str1) == wld_tolower(*str2))) { str1++; str2++; }
++    return wld_tolower(*str1) - wld_tolower(*str2);
++}
++
++static inline const char * wld_strcasestr( const char *haystack, const char *needle )
++{
++    size_t len = wld_strlen(needle);
++    for ( ; *haystack ; ++haystack)
++    {
++        if (!wld_strncasecmp(haystack, needle, len))
++            return haystack;
++    }
++    return NULL;
++}
++#endif
+ 
+ void * memmove( void *dst, const void *src, size_t len )
+ {
+     char *d = dst;
+     const char *s = src;
+     if (d < s)
+@@ -713,12 +748,25 @@
+ 
+     LOAD_POSIX_DYLD_FUNC( dlopen );
+     LOAD_POSIX_DYLD_FUNC( dlsym );
+     LOAD_POSIX_DYLD_FUNC( dladdr );
+     LOAD_MACHO_DYLD_FUNC( _dyld_get_image_slide );
+ 
++#ifdef __i386__ /* CrossOver Hack #16371 */
++    {
++        const char *qw;
++        if (*pargc >= 3 && (qw = wld_strcasestr(argv[2], "qw")) && wld_strcasestr(qw + 2, "patch.exe"))
++        {
++            if (preload_info[3].addr == (void *)0x00110000 && preload_info[3].size == 0x67ef0000)
++                preload_info[3].size = 0x70ef0000;
++            else
++                wld_printf( "warning: detected Quicken patcher (%s) but preload_info is not as expected; not applying adjustment", argv[2] );
++        }
++    }
++#endif
++
+     /* reserve memory that Wine needs */
+     if (reserve) preload_reserve( reserve );
+     for (i = 0; preload_info[i].size; i++)
+     {
+         if (!map_region( &preload_info[i] ))
+         {
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -357,12 +357,13 @@
+ HKLM,System\CurrentControlSet\Control\Class\{6bdd1fc6-810f-11d0-bec7-08002be2092f},"Class",,"Image"
+ HKLM,System\CurrentControlSet\Control\Class\{745a17a0-74d3-11d0-b6fe-00a0c90f57da},,,"Human Interface Devices"
+ HKLM,System\CurrentControlSet\Control\Class\{745a17a0-74d3-11d0-b6fe-00a0c90f57da},"Class",,"HIDClass"
+ 
+ [CurrentVersion]
+ HKCU,%CurrentVersion%\Explorer\Advanced,,16
++HKCU,%CurrentVersion%\Explorer\FileExts,,16
+ HKCU,%CurrentVersion%\Run,,16
+ HKCU,%CurrentVersionNT%\Winlogon,,16
+ HKLM,%CurrentVersion%,"CommonFilesDir",,"%16427%"
+ HKLM,%CurrentVersion%,"FirstInstallDateTime",1,21,81,7c,23
+ HKLM,%CurrentVersion%,"ProductId",,"12345-oem-0000001-54321"
+ HKLM,%CurrentVersion%,"ProgramFilesDir",,"%16422%"
+@@ -2512,13 +2513,13 @@
+ ServiceBinary="%11%\wuauserv.exe"
+ ServiceType=32
+ StartType=3
+ ErrorControl=1
+ 
+ [Services]
+-HKLM,%CurrentVersion%\RunServices,"winemenubuilder",2,"%11%\winemenubuilder.exe -a -r"
++;(cw)HKLM,%CurrentVersion%\RunServices,"winemenubuilder",2,"%11%\winemenubuilder.exe -a -r"
+ HKLM,"System\CurrentControlSet\Services\Eventlog\Application",,16
+ HKLM,"System\CurrentControlSet\Services\Eventlog\System","Sources",0x10000,""
+ HKLM,"System\CurrentControlSet\Services\Tcpip\Parameters","DataBasePath",,"%12%\etc"
+ HKLM,"System\CurrentControlSet\Services\VxD\MSTCP",,16
+ HKLM,"System\CurrentControlSet\Services\Winsock\Parameters",,16
+ HKLM,"System\CurrentControlSet\Services\Winsock2\Parameters\Protocol_Catalog9\Catalog_Entries",,16
+--- a/loader/wine_info.plist.in
++++ b/loader/wine_info.plist.in
+@@ -4,19 +4,19 @@
+ <dict>
+     <key>CFBundleAllowMixedLocalizations</key>
+     <true/>
+     <key>CFBundleDevelopmentRegion</key>
+     <string>English</string>
+     <key>CFBundleExecutable</key>
+-    <string>wine</string>
++    <string>wineloader</string><!-- CrossOver Hack 10913 -->
+     <key>CFBundleIdentifier</key>
+-    <string>org.winehq.wine</string>
++    <string>com.codeweavers.CrossOver.wineloader</string><!-- CrossOver Hack 10913 -->
+     <key>CFBundleInfoDictionaryVersion</key>
+     <string>6.0</string>
+     <key>CFBundleName</key>
+-    <string>Wine</string>
++    <string>CrossOver-Hosted Application</string><!-- CrossOver Hack 10913 -->
+     <key>CFBundlePackageType</key>
+     <string>APPL</string>
+     <key>CFBundleShortVersionString</key>
+     <string>@PACKAGE_VERSION@</string>
+     <key>CFBundleSignature</key>
+     <string>????</string>

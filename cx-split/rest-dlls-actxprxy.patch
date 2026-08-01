@@ -1,0 +1,16 @@
+--- a/dlls/actxprxy/Makefile.in
++++ b/dlls/actxprxy/Makefile.in
+@@ -5,12 +5,13 @@
+ 	actxprxy_activscp.idl \
+ 	actxprxy_comcat.idl \
+ 	actxprxy_docobj.idl \
+ 	actxprxy_hlink.idl \
+ 	actxprxy_htiface.idl \
+ 	actxprxy_htiframe.idl \
++	actxprxy_mshtml.idl \
+ 	actxprxy_objsafe.idl \
+ 	actxprxy_ocmm.idl \
+ 	actxprxy_servprov.idl \
+ 	actxprxy_shldisp.idl \
+ 	actxprxy_shobjidl.idl \
+ 	actxprxy_urlhist.idl \

@@ -1,0 +1,134 @@
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -527,15 +564,129 @@
+         return ret;
+     }
+ 
+     return remove_tail( wineloader, "64" );
+ }
+ 
+-
+-static void preloader_exec( char **argv )
++/* CW HACK 22144 */
++#ifdef __APPLE__
++/* This is the same "exe path to display name" algorithm used in
++ * loader/main.c to determine the name used for the application menu (CW hack 13438).
++ *
++ * TODO: this could do something more complicated, like getting strings out of the
++ * version resource.
++ */
++static char *extract_exe_name(const char *exe_path)
+ {
++    char *exe_name, *exe_path_copy, *p, *ret;
++    size_t exe_name_len;
++
++    exe_path_copy = strdup(exe_path);
++    exe_name = exe_path_copy;
++
++    if ((p = strrchr(exe_name, '\\'))) exe_name = p + 1;
++    if ((p = strrchr(exe_name, '/'))) exe_name = p + 1;
++    if (strspn(exe_name, "0123456789abcdefABCDEF") == 32 &&
++        exe_name[32] == '.')
++        exe_name += 33;
++    if ((p = strrchr(exe_name, '.')) && p != exe_name)
++        exe_name_len = p - exe_name;
++    else
++        exe_name_len = strlen(exe_name);
++
++    if (exe_name_len)
++        ret = strdup(exe_name);
++    else
++        ret = NULL;
++
++    free(exe_path_copy);
++    return ret;
++}
++
++/* Returns a path to $TMPDIR/winetemp-<wineloader_inode>-<wineloader_size_in_bytes>-<wineloader_mtime_sec>-<-wineloader_mtime_nsec>
++ * The intention is that all links to the same wineloader will go in the same directory, and a different directory
++ * will be used if wineloader is updated or modified.
++ */
++static char *create_tempdir(const char *wineloader_path)
++{
++    char *str, *tempdir = malloc(MAX_PATH);
++    struct stat st;
++    size_t n;
++
++    if (!confstr(_CS_DARWIN_USER_TEMP_DIR, tempdir, MAX_PATH))
++        goto fail;
++
++    if (stat(wineloader_path, &st))
++        goto fail;
++
++    if (!asprintf(&str, "/winetemp-%llu-%llu-%lu-%lu/", st.st_ino, st.st_size, st.st_mtimespec.tv_sec, st.st_mtimespec.tv_nsec))
++        goto fail;
++
++    n = strlcat(tempdir, str, MAX_PATH);
++    free(str);
++    if (n >= MAX_PATH)
++        goto fail;
++
++    /* mkdir may fail if the directory already exists but that's ok */
++    mkdir(tempdir, 0700);
++    return tempdir;
++
++fail:
++    free(tempdir);
++    return NULL;
++}
++
++
++static char *create_preloader_link(const char *wineloader_path, const char *exe_name)
++{
++    struct stat st;
++    char *linkpath = create_tempdir(wineloader_path);
++
++    if (!linkpath)
++        return NULL;
++
++    if (strlcat(linkpath, exe_name, MAX_PATH) >= MAX_PATH)
++        goto fail;
++
++    /* If the link already exists, use it (if it's in this dir, it points to the right place). */
++    if (!stat(linkpath, &st))
++        return linkpath;
++
++    /* Try a hard link first, to avoid the little "alias" arrow that the Dock puts on the icon.
++     * But if that fails, fall back to a symlink.
++     */
++    if (!link(wineloader_path, linkpath) || !symlink(wineloader_path, linkpath))
++        return linkpath;
++
++fail:
++    free(linkpath);
++    return NULL;
++}
++
++static void replace_wineloader_path_with_link(char **wineloader_path, const char *image_path)
++{
++    char *app_name = extract_exe_name(image_path);
++    if (app_name)
++    {
++        char *preloader_path = create_preloader_link(*wineloader_path, app_name);
++        if (preloader_path)
++        {
++            free(*wineloader_path);
++            *wineloader_path = preloader_path;
++        }
++
++        /* Pass the app name to the preloader through an env var. */
++        setenv("WINEPRELOADERAPPNAME", app_name, 1);
++        free(app_name);
++    }
++}
++#endif
++
++
++static void preloader_exec( char **argv, const char *image_path )
++{
+ #ifdef HAVE_WINE_PRELOADER
+     static const char *preloader = "wine-preloader";
+     char *p;
+ 
+     if (!(p = strrchr( argv[1], '/' ))) p = argv[1];
+     else p++;

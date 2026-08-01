@@ -1,0 +1,38 @@
+--- a/dlls/xinput1_3/main.c
++++ b/dlls/xinput1_3/main.c
+@@ -1098,13 +1098,13 @@
+ 
+ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetDSoundAudioDeviceGuids(DWORD index, GUID *render_guid, GUID *capture_guid)
+ {
+     FIXME("index %lu, render_guid %s, capture_guid %s stub!\n", index, debugstr_guid(render_guid),
+           debugstr_guid(capture_guid));
+ 
+-    if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
++    if (index >= XUSER_MAX_COUNT || !render_guid || !capture_guid) return ERROR_BAD_ARGUMENTS;
+     if (!controllers[index].device) return ERROR_DEVICE_NOT_CONNECTED;
+ 
+     return ERROR_NOT_SUPPORTED;
+ }
+ 
+ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetBatteryInformation(DWORD index, BYTE type, XINPUT_BATTERY_INFORMATION* battery)
+--- a/dlls/xinput1_3/tests/xinput.c
++++ b/dlls/xinput1_3/tests/xinput.c
+@@ -251,12 +251,18 @@
+ 
+         if (!IsEqualGUID(&soundCapture, &emptyGuid))
+             ok(!IsEqualGUID(&soundCapture, &testGuid), "Broken GUID returned for sound capture device\n");
+         else
+             trace("Headset microphone not attached\n");
+     }
++
++    result = pXInputGetDSoundAudioDeviceGuids(0, NULL, &soundCapture);
++    ok(result == ERROR_BAD_ARGUMENTS, "XInputGetDSoundAudioDeviceGuids returned %lu\n", result);
++
++    result = pXInputGetDSoundAudioDeviceGuids(0, &soundRender, NULL);
++    ok(result == ERROR_BAD_ARGUMENTS, "XInputGetDSoundAudioDeviceGuids returned %lu\n", result);
+ 
+     result = pXInputGetDSoundAudioDeviceGuids(XUSER_MAX_COUNT+1, &soundRender, &soundCapture);
+     ok(result == ERROR_BAD_ARGUMENTS, "XInputGetDSoundAudioDeviceGuids returned %lu\n", result);
+ }
+ 
+ static void test_get_batteryinformation(void)
