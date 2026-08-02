@@ -140,6 +140,9 @@ jobs:
           gecko_sha_x64=$(sed -n 's/^#define GECKO_SHA "\(.*\)"/\1/p' winecx/dlls/appwiz.cpl/addons.c | sed -n 2p)
           mono_sha=$(sed -n 's/^#define MONO_SHA "\(.*\)"/\1/p' winecx/dlls/appwiz.cpl/addons.c | sed -n 1p)
 
+          for v in "$mono_ver" "$gecko_ver" "$mono_sha" "$gecko_sha_x86" "$gecko_sha_x64"; do
+            [ -n "$v" ] || { echo "could not read addon versions/hashes from addons.c"; exit 1; }
+          done
           mkdir -p addons
           fetch "https://dl.winehq.org/wine/wine-mono/$mono_ver/wine-mono-$mono_ver-x86.msi" \
                 "addons/wine-mono-$mono_ver-x86.msi" "$mono_sha"
