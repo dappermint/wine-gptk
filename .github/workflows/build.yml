@@ -100,9 +100,18 @@ jobs:
           # not something ccache picks up by itself
           mkdir -p ccache-bin
           for t in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
-            printf '#!/bin/sh\nexec ccache "$(command -v %s)" "$@"\n' "$t" > "ccache-bin/$t"
+            # resolve the real binary NOW and bake the absolute path in. doing
+            # the lookup inside the wrapper instead recurses forever, because
+            # by then ccache-bin is first on PATH and `command -v` finds the
+            # wrapper itself: configure hung for three hours on exactly that.
+            real=$(command -v "$t") || { echo "::error::$t not found"; exit 1; }
+            printf '#!/bin/sh\nexec ccache "%s" "$@"\n' "$real" > "ccache-bin/$t"
             chmod +x "ccache-bin/$t"
           done
+          # prove the wrapper terminates before anything depends on it
+          PATH="$PWD/ccache-bin:$PATH" x86_64-w64-mingw32-gcc --version >/dev/null
+          PATH="$PWD/ccache-bin:$PATH" i686-w64-mingw32-gcc --version >/dev/null
+          echo "ccache wrappers ok"
 
       - name: nix toolchain and x86_64 libs
         run: |
