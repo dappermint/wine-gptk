@@ -44,6 +44,39 @@ jobs:
             git -C winecx apply --verbose "$p"
           done
 
+      # compilation cache: harness-only changes rebuild in minutes instead of
+      # ~50. compilercheck=content so the cache survives runner image updates;
+      # a cold cache is still a full clean build, which is the right mode for
+      # a release artifact.
+      - name: ccache
+        run: |
+          brew install -q ccache
+          {
+            echo "CCACHE_DIR=$HOME/.ccache"
+            # two PE arches plus the unix half is ~10k objects
+            echo "CCACHE_MAXSIZE=4G"
+            echo "CCACHE_COMPILERCHECK=content"
+            # wine stamps __DATE__/__TIME__ into a few files and every run gets
+            # a fresh checkout, so without these the hit rate collapses on
+            # exactly the files that never changed
+            echo "CCACHE_SLOPPINESS=time_macros,locale,include_file_mtime,include_file_ctime"
+            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+            echo "CCACHE_NOHASHDIR=1"
+            # apfs clones instead of byte copies on a hit. not hardlinks: the
+            # package step strips outputs in place and would rewrite the cache
+            echo "CCACHE_FILECLONE=1"
+            echo "CCACHE_INODECACHE=1"
+          } >> "$GITHUB_ENV"
+
+      - name: restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ env.WINE_TAG }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.WINE_TAG }}-
+            ccache-
+
       # gcc, not llvm-mingw. measured 2026-08-04: with a kernelbase.dll built
       # by llvm-mingw, steam never completes its CM login -- it loops
       # "EConnect called - scheduling connection for 50ms from now" forever.
@@ -58,6 +91,13 @@ jobs:
           brew install -q mingw-w64
           x86_64-w64-mingw32-gcc --version | head -1
           i686-w64-mingw32-gcc --version | head -1
+          # wrappers so the PE half goes through ccache as well; brew's gcc is
+          # not something ccache picks up by itself
+          mkdir -p ccache-bin
+          for t in x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc; do
+            printf '#!/bin/sh\nexec ccache "$(command -v %s)" "$@"\n' "$t" > "ccache-bin/$t"
+            chmod +x "ccache-bin/$t"
+          done
 
       - name: nix toolchain and x86_64 libs
         run: |
@@ -97,10 +137,10 @@ jobs:
         env:
           OPT_LEVEL: ${{ inputs.opt }}
         run: |
-          export PATH="$NIX_TOOL_PATH$PATH"
+          export PATH="$PWD/ccache-bin:$NIX_TOOL_PATH$PATH"
           export SDKROOT="$(/usr/bin/xcrun --show-sdk-path)"
-          export CC="/usr/bin/clang -arch x86_64"
-          export CXX="/usr/bin/clang++ -arch x86_64"
+          export CC="ccache /usr/bin/clang -arch x86_64"
+          export CXX="ccache /usr/bin/clang++ -arch x86_64"
           export PKG_CONFIG_PATH="$NIX_PKG_CONFIG_PATH"
           # -O2 unless asked otherwise: what wine itself ships and where a
           # push build should stay. -O3 is opt-in for runtimes we release,
@@ -141,13 +181,21 @@ jobs:
 
       - name: make
         run: |
-          export PATH="$NIX_TOOL_PATH$PATH"
+          export PATH="$PWD/ccache-bin:$NIX_TOOL_PATH$PATH"
           cd build
-          make -j"$(sysctl -n hw.ncpu)"
+          ncpu=$(sysctl -n hw.logicalcpu)
+          ccache -z >/dev/null
+          make -j"$(( ncpu + ncpu / 2 ))"
+          {
+            echo "### ccache"
+            echo '```'
+            ccache -s
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: install and package
         run: |
-          export PATH="$NIX_TOOL_PATH$PATH"
+          export PATH="$PWD/ccache-bin:$NIX_TOOL_PATH$PATH"
           cd build
           make install DESTDIR="$PWD/../staging"
           cd ..
