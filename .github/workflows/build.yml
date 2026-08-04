@@ -50,7 +50,10 @@ jobs:
       # a release artifact.
       - name: ccache
         run: |
-          brew install -q ccache
+          # a self-hosted runner is a real machine, and this one is nix-darwin
+          # managed with brew cleanup=uninstall, which reaps imperative
+          # installs. use what is already there and only install if missing
+          command -v ccache >/dev/null || brew install -q ccache
           {
             echo "CCACHE_DIR=$HOME/.ccache"
             # two PE arches plus the unix half is ~10k objects
@@ -88,7 +91,7 @@ jobs:
       # (-O1 fails too), and not the SEH tables. see frankea-base-recipe.md.
       - name: mingw-w64 gcc for the PE half
         run: |
-          brew install -q mingw-w64
+          command -v x86_64-w64-mingw32-gcc >/dev/null || brew install -q mingw-w64
           x86_64-w64-mingw32-gcc --version | head -1
           i686-w64-mingw32-gcc --version | head -1
           # wrappers so the PE half goes through ccache as well; brew's gcc is
