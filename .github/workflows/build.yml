@@ -38,12 +38,20 @@ jobs:
             git -C winecx apply --verbose "$p"
           done
 
-      - name: llvm-mingw for the PE half
+      # gcc, not llvm-mingw. measured 2026-08-04: with a kernelbase.dll built
+      # by llvm-mingw, steam never completes its CM login -- it loops
+      # "EConnect called - scheduling connection for 50ms from now" forever.
+      # swapping in a gcc-built kernelbase.dll and changing nothing else makes
+      # it log in within 30s, and swapping it back reproduces the stall. every
+      # other module of ours is fine, including ntdll and the whole i386 half.
+      # cause inside kernelbase is still unknown: not a missing export, not
+      # QueryDosDeviceW codegen, not -fno-strict-aliasing, not the -O level
+      # (-O1 fails too), and not the SEH tables. see frankea-base-recipe.md.
+      - name: mingw-w64 gcc for the PE half
         run: |
-          curl -sL -o llvm-mingw.tar.xz \
-            https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/llvm-mingw-20260616-ucrt-macos-universal.tar.xz
-          tar -xf llvm-mingw.tar.xz
-          mv llvm-mingw-* llvm-mingw
+          brew install -q mingw-w64
+          x86_64-w64-mingw32-gcc --version | head -1
+          i686-w64-mingw32-gcc --version | head -1
 
       - name: nix toolchain and x86_64 libs
         run: |
@@ -81,15 +89,15 @@ jobs:
 
       - name: configure
         run: |
-          export PATH="$NIX_TOOL_PATH$PWD/llvm-mingw/bin:$PATH"
+          export PATH="$NIX_TOOL_PATH$PATH"
           export SDKROOT="$(/usr/bin/xcrun --show-sdk-path)"
           export CC="/usr/bin/clang -arch x86_64"
           export CXX="/usr/bin/clang++ -arch x86_64"
           export PKG_CONFIG_PATH="$NIX_PKG_CONFIG_PATH"
           export CFLAGS="-O3 -Wno-error=implicit-function-declaration $NIX_INCS"
-          # the PE half is built by llvm-mingw and takes CROSSCFLAGS, which
+          # the PE half is built by mingw-w64 gcc and takes CROSSCFLAGS, which
           # otherwise defaults to "-g -O2"
-          export CROSSCFLAGS="-g -O3"
+          export CROSSCFLAGS="-g -O2"
           export LDFLAGS="$NIX_LDFS"
           export ac_cv_lib_soname_freetype="libfreetype.6.dylib"
           export ac_cv_lib_soname_gnutls="libgnutls.30.dylib"
@@ -113,13 +121,13 @@ jobs:
 
       - name: make
         run: |
-          export PATH="$NIX_TOOL_PATH$PWD/llvm-mingw/bin:$PATH"
+          export PATH="$NIX_TOOL_PATH$PATH"
           cd build
           make -j"$(sysctl -n hw.ncpu)"
 
       - name: install and package
         run: |
-          export PATH="$NIX_TOOL_PATH$PWD/llvm-mingw/bin:$PATH"
+          export PATH="$NIX_TOOL_PATH$PATH"
           cd build
           make install DESTDIR="$PWD/../staging"
           cd ..
