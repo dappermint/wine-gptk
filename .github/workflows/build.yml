@@ -214,8 +214,8 @@ jobs:
           # what mscoree and mshtml load straight out of the datadir. without
           # them a fresh prefix stops on a modal wine-mono dialog and waits
           # for a click, which is a hang with no error (measured 2026-08-04).
-          mono_ver=$(sed -n 's/^#define MONO_VERSION "\(.*\)"/\1/p' wine/dlls/appwiz.cpl/addons.c)
-          gecko_ver=$(sed -n 's/^#define GECKO_VERSION "\(.*\)"/\1/p' wine/dlls/appwiz.cpl/addons.c)
+          mono_ver=$(sed -n 's/^#define MONO_VERSION "\(.*\)"/\1/p' winecx/dlls/appwiz.cpl/addons.c)
+          gecko_ver=$(sed -n 's/^#define GECKO_VERSION "\(.*\)"/\1/p' winecx/dlls/appwiz.cpl/addons.c)
           [ "$mono_ver" = "11.2.0" ] && [ "$gecko_ver" = "2.47.4" ] || {
             echo "::error::wine now wants mono $mono_ver gecko $gecko_ver; update the pinned hashes"
             exit 1
