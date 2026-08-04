@@ -13,6 +13,8 @@ on:
 
 env:
   WINE_TAG: wine-11.14
+  DXVK_VERSION: "1.10.3"
+  DXMT_VERSION: "0.80"
 
 jobs:
   build:
@@ -196,6 +198,51 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: wine-mono, wine-gecko and the graphics payloads
+        run: |
+          set -eu
+          # the extracted form, which is what the stock whisky engine ships and
+          # what mscoree and mshtml load straight out of the datadir. without
+          # them a fresh prefix stops on a modal wine-mono dialog and waits
+          # for a click, which is a hang with no error (measured 2026-08-04).
+          mono_ver=$(sed -n 's/^#define MONO_VERSION "\(.*\)"/\1/p' wine/dlls/appwiz.cpl/addons.c)
+          gecko_ver=$(sed -n 's/^#define GECKO_VERSION "\(.*\)"/\1/p' wine/dlls/appwiz.cpl/addons.c)
+          [ "$mono_ver" = "11.2.0" ] && [ "$gecko_ver" = "2.47.4" ] || {
+            echo "::error::wine now wants mono $mono_ver gecko $gecko_ver; update the pinned hashes"
+            exit 1
+          }
+
+          fetch() {
+            curl -fsSL -o "$2" "$1"
+            got=$(shasum -a 256 "$2" | cut -d' ' -f1)
+            [ "$got" = "$3" ] || { echo "::error::hash mismatch for $2: $got != $3"; exit 1; }
+          }
+
+          mkdir -p addons/mono addons/gecko payload
+          fetch "https://dl.winehq.org/wine/wine-mono/$mono_ver/wine-mono-$mono_ver-x86.tar.xz" \
+                mono.tar.xz c9fb2e2823acf30b000b8806177db0f40751786136dd3f8fb2be7897b1643d06
+          fetch "https://dl.winehq.org/wine/wine-gecko/$gecko_ver/wine-gecko-$gecko_ver-x86.tar.xz" \
+                gecko-x86.tar.xz 2cfc8d5c948602e21eff8a78613e1826f2d033df9672cace87fed56e8310afb6
+          fetch "https://dl.winehq.org/wine/wine-gecko/$gecko_ver/wine-gecko-$gecko_ver-x86_64.tar.xz" \
+                gecko-x64.tar.xz fd88fc7e537d058d7a8abf0c1ebc90c574892a466de86706a26d254710a82814
+          tar -xJf mono.tar.xz -C addons/mono
+          tar -xJf gecko-x86.tar.xz -C addons/gecko
+          tar -xJf gecko-x64.tar.xz -C addons/gecko
+          [ -d "addons/mono/wine-mono-$mono_ver" ] || { echo "::error::mono layout changed"; exit 1; }
+
+          # a runtime with no d3d11 implementation cannot render chromium:
+          # wined3d goes through apple's opengl, frozen at 4.1, which gives
+          # ANGLE feature level 9_3 and a hard "GLES 3.0 > max supported 2.0".
+          # measured on the first gcc artifact: steam logged in and painted
+          # nothing. dxvk and dxmt are what make the ui appear.
+          fetch "https://github.com/Gcenx/DXVK-macOS/releases/download/v$DXVK_VERSION-20230507-repack/dxvk-macOS-async-v$DXVK_VERSION-20230507-repack.tar.gz" \
+                dxvk.tar.gz acd1520ad105d8ef124a09c8e11a259a5dc8bdc565ad18e0e52693f9807b2477
+          fetch "https://github.com/3Shain/dxmt/releases/download/v$DXMT_VERSION/dxmt-v$DXMT_VERSION-builtin.tar.gz" \
+                dxmt.tar.gz 8f260e36b5739e68f3bad613381441385c4dc7b85b78ba8de653d5a6a264529d
+          tar -xzf dxvk.tar.gz -C payload
+          tar -xzf dxmt.tar.gz -C payload
+          ls payload
+
       - name: install and package
         run: |
           export PATH="$PWD/ccache-bin:$NIX_TOOL_PATH$PATH"
@@ -206,6 +253,36 @@ jobs:
           cp -R staging/opt/whiskywine/bin Libraries/Wine/bin
           cp -R staging/opt/whiskywine/lib Libraries/Wine/lib
           cp -R staging/opt/whiskywine/share Libraries/Wine/share
+
+          # the addons go in extracted, in the same place the stock engine
+          # puts them, so mscoree and mshtml find them in the datadir and no
+          # per-bottle copy is installed
+          mkdir -p Libraries/Wine/share/wine/mono Libraries/Wine/share/wine/gecko
+          cp -R addons/mono/* Libraries/Wine/share/wine/mono/
+          cp -R addons/gecko/* Libraries/Wine/share/wine/gecko/
+
+          # dxmt ships a wine-side builtin half as well as the per-bottle
+          # dlls; the builtin half is what puts winemetal.so in the tree
+          dxmt=payload/v$DXMT_VERSION
+          cp -R "$dxmt/x86_64-unix/." Libraries/Wine/lib/wine/x86_64-unix/
+          cp -R "$dxmt/x86_64-windows/." Libraries/Wine/lib/wine/x86_64-windows/
+          cp -R "$dxmt/i386-windows/." Libraries/Wine/lib/wine/i386-windows/
+
+          # and the per-bottle payloads whisky's backend picker offers
+          dxvk=payload/dxvk-macOS-async-v$DXVK_VERSION-20230507-repack
+          mkdir -p Libraries/DXVK Libraries/DXMT
+          cp -R "$dxvk/." Libraries/DXVK/
+          cp -R "$dxmt/x86_64-windows" Libraries/DXMT/x64
+          cp -R "$dxmt/i386-windows" Libraries/DXMT/x32
+
+          # gcc emits debug info and nothing removes it: kernelbase.dll came
+          # out at 7.6MB and the tarball at 557MB against the stock engine's
+          # 332MB. one file per invocation, since a non-COFF entry would
+          # otherwise take the rest of its batch down with it.
+          find Libraries/Wine/lib/wine/*-windows -name '*.a' -delete
+          find Libraries/Wine/lib/wine/*-windows -type f -print0 \
+            | xargs -0 -P "$(sysctl -n hw.logicalcpu)" -n 1 \
+                x86_64-w64-mingw32-strip --strip-debug 2>/dev/null || true
           # CW HACK 22144: on apple without a preloader the loader expects its
           # own binary to be named wineloader; whisky expects wine64
           cp Libraries/Wine/bin/wine Libraries/Wine/bin/wineloader
@@ -260,6 +337,18 @@ jobs:
           find Libraries/Wine/bin -type f | while read -r f; do fixup "$f"; done
           find Libraries/Wine/lib/wine -name "*.so" | while read -r f; do fixup "$f"; done
 
+          # the reference runtime ships both names
+          ln -sf libfreetype.6.dylib "$LIBDIR/libfreetype.dylib"
+
+          # the unix modules dlopen libgnutls/libfreetype/libMoltenVK by bare
+          # soname, and dlopen searches the caller's rpaths. lib/wine/<arch>-unix
+          # is two levels below the bundled dylibs, so without this entry none
+          # of them resolve: no tls, no fonts, no vulkan.
+          for f in Libraries/Wine/lib/wine/*-unix/*.so; do
+            install_name_tool -add_rpath "@loader_path/../../" "$f" 2>/dev/null || true
+            codesign -f -s - "$f" 2>/dev/null || true
+          done
+
           cat > Libraries/WhiskyWineVersion.plist <<'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -267,6 +356,10 @@ jobs:
           <dict>
             <key>gptkCapable</key>
             <true/>
+            <key>dxvkVersion</key>
+            <string>DXVK_VER</string>
+            <key>dxmtVersion</key>
+            <string>DXMT_VER</string>
             <key>version</key>
             <dict>
               <key>major</key>
@@ -279,8 +372,94 @@ jobs:
           </dict>
           </plist>
           PLIST
+          sed -i '' "s/DXVK_VER/$DXVK_VERSION/; s/DXMT_VER/$DXMT_VERSION/" Libraries/WhiskyWineVersion.plist
+
           tar -czf Libraries.tar.gz Libraries
           shasum -a 256 Libraries.tar.gz | tee Libraries.tar.gz.sha256
+
+      - name: verify the tree is relocatable
+        run: |
+          set -o pipefail
+          # a dylib whose own id is a /nix/store path exists only on the
+          # builder, so it cannot be dlopened anywhere else, and the runtime
+          # silently loses fonts, vulkan and tls with no error at all
+          : > /tmp/badrefs
+          scanned=0
+          while IFS= read -r -d '' f; do
+            file -b "$f" | grep -q Mach-O || continue
+            scanned=$((scanned + 1))
+            id=$(otool -D "$f" | sed -n '2p')
+            printf '%s\n' "$id" | grep -E '^/' | grep -vE '^(/usr/lib/|/System/)' \
+              | sed "s|^|id $f -> |" >> /tmp/badrefs || true
+            otool -L "$f" | tail -n +2 | awk '{print $1}' \
+              | { if [ -n "$id" ]; then grep -vFx "$id"; else cat; fi; } \
+              | grep -E '^/' | grep -vE '^(/usr/lib/|/System/)' \
+              | sed "s|^|dep $f -> |" >> /tmp/badrefs || true
+            otool -l "$f" | awk '/cmd LC_RPATH/{r=1} r && /path /{print $2; r=0}' \
+              | grep -E '^/' | grep -vE '^(/usr/lib/|/System/)' \
+              | sed "s|^|rpath $f -> |" >> /tmp/badrefs || true
+          done < <(find Libraries -type f ! -type l -print0)
+          [ "$scanned" -gt 1000 ] || {
+            echo "::error::sweep scanned only $scanned Mach-O files; the scan broke"
+            exit 1
+          }
+          if [ -s /tmp/badrefs ]; then
+            sed 's/^/::error::not relocatable: /' /tmp/badrefs
+            exit 1
+          fi
+          echo "relocatable: ok ($scanned Mach-O files)"
+
+          # a 64-bit-only tree cannot load syswow64\ntdll.dll and every
+          # 32-bit program dies with c0000135
+          i386=$(ls Libraries/Wine/lib/wine/i386-windows 2>/dev/null | wc -l | tr -d ' ')
+          [ "$i386" -gt 500 ] || { echo "::error::i386-windows has $i386 files"; exit 1; }
+          echo "i386 PE half: $i386 files"
+
+          for d in share/wine/mono share/wine/gecko; do
+            [ -d "Libraries/Wine/$d" ] || { echo "::error::missing $d"; exit 1; }
+          done
+          # without a d3d11 implementation chromium cannot start a gl context
+          [ -f Libraries/DXVK/x64/d3d11.dll ] || { echo "::error::no dxvk payload"; exit 1; }
+          [ -f Libraries/Wine/lib/wine/x86_64-unix/winemetal.so ] || { echo "::error::no dxmt builtin"; exit 1; }
+          echo "addons and graphics payloads: ok"
+
+      - name: verify the runtime can open a window
+        run: |
+          # the gate above only inspects the tree. a display driver that fails
+          # to init is invisible until something asks for a window: wine falls
+          # back to nodrv, keeps going, and only CreateWindowEx says so.
+          export PATH="$PWD/ccache-bin:$NIX_TOOL_PATH$PATH"
+          x86_64-w64-mingw32-gcc -O2 -o winmsg.exe tests/winmsg.c -luser32
+          i686-w64-mingw32-gcc -O2 -o winmsg32.exe tests/winmsg.c -luser32
+
+          export WINEPREFIX="$PWD/smoke-prefix"
+          export DYLD_FALLBACK_LIBRARY_PATH="$PWD/Libraries/Wine/lib"
+          # mono and mshtml are disabled here so a fresh prefix cannot stop on
+          # the addon dialog and hang the job
+          export WINEDLLOVERRIDES="mscoree=d;mshtml=d"
+          WINEDEBUG=-all ./Libraries/Wine/bin/wine64 wineboot -u >/dev/null 2>&1 || true
+
+          WINEDEBUG=+winediag ./Libraries/Wine/bin/wine64 winmsg.exe > smoke.log 2>&1 || true
+          WINEDEBUG=+winediag ./Libraries/Wine/bin/wine64 winmsg32.exe > smoke32.log 2>&1 || true
+          grep -E '^\[|^RESULT' smoke.log | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E '^RESULT' smoke32.log | sed 's/^/wow64 /' | tee -a "$GITHUB_STEP_SUMMARY"
+
+          if grep -q "nodrv_CreateWindow" smoke.log; then
+            echo "::error::the display driver did not load; the runtime fell back to nodrv"
+            sed -n 's/^.*winediag:/  /p' smoke.log | head -5
+            exit 1
+          fi
+          grep -q "RESULT: windows ok" smoke.log || {
+            echo "::error::the runtime cannot create a window"
+            tail -20 smoke.log
+            exit 1
+          }
+          grep -q "RESULT: windows ok" smoke32.log || {
+            echo "::error::the 32-bit half cannot create a window"
+            tail -20 smoke32.log
+            exit 1
+          }
+          echo "windows: ok (64 and 32)"
 
       - name: upload runtime
         uses: actions/upload-artifact@v7.0.1
