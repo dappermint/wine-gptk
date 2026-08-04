@@ -2,6 +2,12 @@ name: build wine 11 gptk runtime
 
 on:
   workflow_dispatch:
+    inputs:
+      opt:
+        description: "standard -O2, release -O3, fast -O0 for iteration only"
+        type: choice
+        default: standard
+        options: [standard, release, fast]
   push:
     branches: [main]
 
@@ -88,16 +94,30 @@ jobs:
           cat store-outs.txt
 
       - name: configure
+        env:
+          OPT_LEVEL: ${{ inputs.opt }}
         run: |
           export PATH="$NIX_TOOL_PATH$PATH"
           export SDKROOT="$(/usr/bin/xcrun --show-sdk-path)"
           export CC="/usr/bin/clang -arch x86_64"
           export CXX="/usr/bin/clang++ -arch x86_64"
           export PKG_CONFIG_PATH="$NIX_PKG_CONFIG_PATH"
-          export CFLAGS="-O3 -Wno-error=implicit-function-declaration $NIX_INCS"
+          # -O2 unless asked otherwise: what wine itself ships and where a
+          # push build should stay. -O3 is opt-in for runtimes we release,
+          # -O0 for runs that only need to answer whether a patch works
+          case "$OPT_LEVEL" in
+            release) OPT="-O3" ;;
+            fast)
+              OPT="-O0"
+              echo "::warning::fast build, -O0; do not publish this artifact"
+              ;;
+            *) OPT="-O2" ;;
+          esac
+          echo "optimisation: $OPT" | tee -a "$GITHUB_STEP_SUMMARY"
+          export CFLAGS="$OPT -Wno-error=implicit-function-declaration $NIX_INCS"
           # the PE half is built by mingw-w64 gcc and takes CROSSCFLAGS, which
           # otherwise defaults to "-g -O2"
-          export CROSSCFLAGS="-g -O2"
+          export CROSSCFLAGS="-g $OPT"
           export LDFLAGS="$NIX_LDFS"
           export ac_cv_lib_soname_freetype="libfreetype.6.dylib"
           export ac_cv_lib_soname_gnutls="libgnutls.30.dylib"
