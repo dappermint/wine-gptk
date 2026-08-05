@@ -1,47 +1,47 @@
-ntdll: Bridge Apple's GPTK 4 D3DMetal onto wine 11.14.
+ntdll: bridge apple's GPTK 4.0b2 D3DMetal into wine 11.14.
 
-Ported from rishiad/soju-wine, which proves the approach on wine 11.0.  Upstream
-MR !6866 switched macOS from TSD coexistence to gsbase swapping and names
-D3DMetal as a casualty that "will need to be changed to use Unix calls"; this is
-that route rather than a port of CrossOver's TSD model.
+Loads libd3dshared.dylib from lib/external, forces its internal enableUnixCall
+flag on, wraps the graphics dispatch init so the entries gptk routes through
+unix calls are cleared, bridges D3DMetal's native worker threads, and registers
+wine's PE mappings with rosetta.
 
-  - ntdll loads libd3dshared.dylib, flips its internal enableUnixCall flag by
-    walking the mach-o symtab, and calls its three Patch* entry points
-  - every native PE region is registered with rosetta via
-    register_non_native_code_region, so rosetta uses the windows TEB for %gs
-    inside those regions -- the TLS seam is crossed on Apple's side
-  - D3DMetal's worker threads are detected by their thunk prologue and routed
-    through __wine_native_thread_start so they run with a native stack
+Notes from bringing this up on 4.0b2 specifically:
 
-Ported rather than applied: soju's are zero-context diffs against wine 11.0 that
-place purely by line number, so most hunks land in the wrong function on 11.14.
-Each was re-placed against a named anchor.  Real 11.14 differences:
+  - PatchUnixCallTable() must NOT be called from here.  On 4.0b2 it does
+    memmove(__wine_unix_call_funcs + 840, NULL, 0x60) and faults.  It carries
+    its own dispatch_once token, so gptk invokes it once it is actually ready.
+    Kept behind WINE_D3DM_PATCH_MASK bit 2 for comparison.
 
-  - struct ntdll_thread_data and ntdll_get_thread_data() were renamed to
-    struct thread_data and get_thread_data()
-  - NtCreateThreadEx no longer assigns thread_data->start; wine 11 moved that
-    into create_server_thread(), so the thread bridge hooks there, which also
-    covers PsCreateSystemThread since it shares the helper
-  - virtual_map_module() was restructured, so native-region registration hangs
-    off the STATUS_IMAGE_ALREADY_LOADED path -- a real PE image rather than a
-    builtin
-  - register_non_native_code_region() for the main image must come AFTER
-    init_startup_info(), because that is what calls load_main_exe(); earlier
-    and the image is not mapped yet
+  - The dispatch entries to clear are gptk's own list, {0, 9, 11, 42, 43} kept
+    (mask 0xc0000000a01), read out of the disassembly of D3DRMDispatch_Init:
+    it clears exactly those indices itself when enableUnixCall is set, but its
+    init resets the flag before that test, so the clearing is redone here.
+    This only works after PatchEntrypointCallTable() has grown the unixlib
+    table from 9 to 39 entries.
 
-The entry in unix_call_funcs[] goes at the END, matching where
-unix_run_native_thread sits in enum ntdll_unix_funcs.  Putting it at the head
-of the table while the enum has it last shifts every unix call by one index,
-which corrupts the whole unix-call ABI: wineboot and cmd both die with
-c0000005 in a system thread.  The same applies to unix_call_wow64_funcs[].
+  - The native-thread thunk target lives in the per-module unixlib on 4.0b2
+    (whisky symlinks all four names to libd3dshared.dylib), so the owner
+    allowlist covers the d3d unixlib names too.
 
-Verified on a tree configured exactly as CI is (--host=x86_64-apple-darwin24,
---enable-archs=i386,x86_64): builds clean, wineboot and cmd both exit 0, and
-ntdll.so exports __wine_native_thread_start, run_native_thread and
-register_non_native_code_region.  D3DMetal itself is not yet exercised.
+  - wine 11.14 maps DLLs through virtual_map_image(); virtual_map_module() only
+    ever sees the main image and virtual_create_builtin_view() is not called at
+    all, so the rosetta registration lives in virtual_map_image().
 
-diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
-index d0912cc..5db62c3 100644
+  - Apple's pthread_self() reads the thread pointer from %gs:0x0.  Native code
+    called straight from PE therefore needs a valid self pointer there while
+    wine's TEB is in %gs; NT_TIB.ExceptionList is unused on x86_64 and carries
+    it.  The mach-thread-port slot cannot be mirrored the same way (it would
+    land on Tib.SubSystemTib, which wine uses), so direct native calls that
+    take an os_unfair_lock still fail -- see D3DMETAL_GS_THUNK, which is the
+    groundwork for routing those through a gsbase swap.
+
+  - The apple gsbase restore paths lacked the NULL guard the linux ones have;
+    without it a thread whose pthread_teb is not set yet gets gsbase zeroed.
+
+Verified: D3D12CreateDevice reports feature level 12_2 with adapter
+"AMD Compatibility Mode", i.e. D3DMetal rather than wine's vkd3d, with no
+environment variables set.
+
 --- a/dlls/ntdll/ntdll.spec
 +++ b/dlls/ntdll/ntdll.spec
 @@ -208,6 +208,7 @@
@@ -52,11 +52,9 @@ index d0912cc..5db62c3 100644
  @ stdcall -syscall NtCreateTimer(ptr long ptr long)
  @ stdcall -syscall NtCreateToken(ptr long ptr long ptr ptr ptr ptr ptr ptr ptr ptr ptr)
  @ stdcall -syscall NtCreateTransaction(ptr long ptr ptr long long long long ptr ptr)
-diff --git a/dlls/ntdll/thread.c b/dlls/ntdll/thread.c
-index fe083be..a8ee93c 100644
 --- a/dlls/ntdll/thread.c
 +++ b/dlls/ntdll/thread.c
-@@ -229,6 +229,19 @@ void set_native_thread_name( DWORD tid, const char *name )
+@@ -229,7 +229,20 @@
          NtClose(h);
  }
  
@@ -67,20 +65,49 @@ index fe083be..a8ee93c 100644
 +{
 +    struct native_thread_params params = { 0 };
 +    NTSTATUS status;
-+
+ 
 +    (void)arg;
 +    if ((status = WINE_UNIX_CALL( unix_run_native_thread, &params ))) return status;
 +    return params.result;
 +}
 +
- 
++
  /***********************************************************************
   *           RtlExitUserThread  (NTDLL.@)
-diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
-index e9b8375..875ac6e 100644
+  */
+--- a/dlls/ntdll/unixlib.h
++++ b/dlls/ntdll/unixlib.h
+@@ -59,6 +59,11 @@
+     void                      **module;
+ };
+ 
++struct native_thread_params
++{
++    ULONG result;
++};
++
+ struct unwind_builtin_dll_params
+ {
+     ULONG                       type;
+@@ -76,6 +81,7 @@
+     unix_wine_server_handle_to_fd,
+     unix_wine_spawnvp,
+     unix_system_time_precise,
++    unix_run_native_thread,
+ };
+ 
+ extern unixlib_handle_t __wine_unixlib_handle;
 --- a/dlls/ntdll/unix/loader.c
 +++ b/dlls/ntdll/unix/loader.c
-@@ -67,6 +67,8 @@
+@@ -28,6 +28,7 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <stdarg.h>
++#include <pthread.h>
+ #include <stdio.h>
+ #include <signal.h>
+ #include <spawn.h>
+@@ -67,6 +68,8 @@
  # undef GetCurrentThread
  # include <pthread.h>
  # include <mach/mach.h>
@@ -89,7 +116,7 @@ index e9b8375..875ac6e 100644
  # include <mach/mach_error.h>
  # include <mach-o/getsect.h>
  # include <crt_externs.h>
-@@ -105,6 +107,7 @@ void *pKiUserEmulationDispatcher = NULL;
+@@ -105,6 +108,7 @@
  void *pLdrInitializeThunk = NULL;
  void *pRtlUserThreadStart = NULL;
  void *p__wine_ctrl_routine = NULL;
@@ -97,22 +124,24 @@ index e9b8375..875ac6e 100644
  SYSTEM_DLL_INIT_BLOCK *pLdrSystemDllInitBlock = NULL;
  
  #ifdef __GNUC__
-@@ -126,6 +129,145 @@ const char **dll_paths = NULL;
+@@ -126,7 +130,261 @@
  const char **system_dll_paths = NULL;
  const char *user_name = NULL;
  SECTION_IMAGE_INFORMATION main_image_info = { NULL };
 +static void *main_image_base;
 +static SIZE_T main_image_size;
-+
+ 
 +#if defined(__APPLE__) && defined(__x86_64__)
 +static BOOL (*supports_non_native_code_regions)(void);
 +static void (*p_register_non_native_code_region)(void *, SIZE_T);
++extern void *d3dmetal_direct_call_target[8];
++extern void *d3dmetal_gs_thunks[8];
++static BOOL d3dmetal_bridge_active;
 +static BYTE *d3dmetal_enable_unix_call;
 +static void *d3dmetal_win32_dispatch;
 +static void (*d3dmetal_patch_entrypoint_calls)(void);
 +static void (*d3dmetal_patch_unix_calls)(void);
 +static void (*d3dmetal_patch_win32_calls)(void *);
-+static unixlib_entry_t d3dmetal_dispatch_init;
 +
 +static void *find_macho_symbol( void *base, const char *name )
 +{
@@ -153,28 +182,141 @@ index e9b8375..875ac6e 100644
 +    return NULL;
 +}
 +
-+static NTSTATUS d3dmetal_dispatch_init_compat( void *args )
++/* each gptk graphics module carries its own copy of the dispatch init, so the
++ * original has to be remembered per table rather than in one global; a small
++ * bank of wrappers gives each hooked table its own entry point. */
++#define D3DMETAL_MAX_UNIXLIBS 8
++static unixlib_entry_t d3dmetal_orig_init[D3DMETAL_MAX_UNIXLIBS];
++static unixlib_entry_t *d3dmetal_hooked_table[D3DMETAL_MAX_UNIXLIBS];
++static unsigned int d3dmetal_hooked_count;
++
++static NTSTATUS d3dmetal_post_init( void *args, NTSTATUS status, unsigned int slot )
 +{
 +    void **dispatch = args;
-+    NTSTATUS status;
 +    unsigned int i;
 +
-+    status = d3dmetal_dispatch_init( args );
 +    if (status) return status;
 +
 +    if (d3dmetal_enable_unix_call) *d3dmetal_enable_unix_call = TRUE;
 +    if (d3dmetal_patch_win32_calls && d3dmetal_win32_dispatch)
 +        d3dmetal_patch_win32_calls( d3dmetal_win32_dispatch );
 +    if (d3dmetal_patch_entrypoint_calls) d3dmetal_patch_entrypoint_calls();
-+    if (d3dmetal_patch_unix_calls) d3dmetal_patch_unix_calls();
-+
-+    for (i = 0; i < 0x160 / sizeof(*dispatch); i++)
++    /* PatchUnixCallTable() memmoves 0x60 bytes from a null source into
++       __wine_unix_call_funcs+840 on 4.0b2 and faults.  It carries its own
++       dispatch_once token, so gptk calls it when it is actually ready; calling
++       it from here is what crashes.  Bit 2 of the mask restores the old
++       behaviour for comparison. */
 +    {
-+        if (i == 0 || i == 0x48 / 8 || i == 0x58 / 8 || i == 0x150 / 8 || i == 0x158 / 8)
-+            continue;
-+        dispatch[i] = NULL;
++        const char *env = getenv( "WINE_D3DM_PATCH_MASK" );
++        unsigned int mask = env ? strtoul( env, NULL, 16 ) : 0;
++
++        if ((mask & 4) && d3dmetal_patch_unix_calls) d3dmetal_patch_unix_calls();
++    }
++
++
++    if (getenv( "WINE_D3DM_KEEP_DISPATCH" )) return status;
++
++    {
++        /* soju-wine keeps {0,9,11,42,43}, derived from gptk 4.0b1 where the
++         * table was sparse.  4.0b2 populates 43 of 44 entries, and bisecting
++         * the keep set on b2 shows exactly one entry cannot be called directly
++         * from PE code: index 1, which faults in pthread_setspecific because
++         * the direct call carries no gsbase swap.  keep the rest and route
++         * that one through the unix call.  overridable for further bisecting. */
++        /* gptk's own D3DRMDispatch_Init clears indices 1-8, 10, 12-41 when
++           enableUnixCall is set, i.e. it keeps {0, 9, 11, 42, 43}.  Its init
++           resets the flag before that test, so the clearing has to be redone
++           here with exactly gptk's list.  Verified against the disassembly of
++           _Z18D3DRMDispatch_InitPv in libd3dshared 4.0b2. */
++        const char *env = getenv( "WINE_D3DM_KEEP_MASK" );
++        unsigned long long keep = 0xc0000000a01ULL;
++
++        if (env) keep = strtoull( env, NULL, 16 );
++        for (i = 0; i < 0x160 / sizeof(*dispatch); i++)
++            if (!(keep & (1ULL << i))) dispatch[i] = NULL;
++    }
++
++    /* entries that must be called directly but whose native code touches
++       pthread state get a gsbase-swapping wrapper instead.  measured on
++       4.0b2: entry 1 (the dxgi factory creators) is the only one that needs
++       it; overridable while that is being re-measured. */
++    {
++        /* off by default: a C wrapper is not safe here, since the compiler may
++           emit %gs-dependent code between the swap and the call.  doing this
++           properly needs a hand-written asm thunk.  kept behind an env var so
++           the measurement can be repeated. */
++        const char *env = getenv( "WINE_D3DM_GS_WRAP_MASK" );
++        unsigned long long wrap = 0;
++
++        if (env) wrap = strtoull( env, NULL, 16 );
++        if (slot < 8)
++        {
++            for (i = 0; i < 0x160 / sizeof(*dispatch); i++)
++            {
++                if (!(wrap & (1ULL << i)) || !dispatch[i]) continue;
++                d3dmetal_direct_call_target[slot] = dispatch[i];
++                dispatch[i] = d3dmetal_gs_thunks[slot];
++                TRACE( "wrapped dispatch entry %u through the gsbase thunk\n", i );
++                break;  /* one wrapped entry per table for now */
++            }
++        }
 +    }
 +    return status;
++}
++
++#define D3DMETAL_INIT_WRAPPER(n) \
++    static NTSTATUS d3dmetal_dispatch_init_##n( void *args ) \
++    { return d3dmetal_post_init( args, d3dmetal_orig_init[n]( args ), n ); }
++D3DMETAL_INIT_WRAPPER(0)
++D3DMETAL_INIT_WRAPPER(1)
++D3DMETAL_INIT_WRAPPER(2)
++D3DMETAL_INIT_WRAPPER(3)
++D3DMETAL_INIT_WRAPPER(4)
++D3DMETAL_INIT_WRAPPER(5)
++D3DMETAL_INIT_WRAPPER(6)
++D3DMETAL_INIT_WRAPPER(7)
++#undef D3DMETAL_INIT_WRAPPER
++
++static const unixlib_entry_t d3dmetal_init_wrappers[D3DMETAL_MAX_UNIXLIBS] =
++{
++    d3dmetal_dispatch_init_0, d3dmetal_dispatch_init_1,
++    d3dmetal_dispatch_init_2, d3dmetal_dispatch_init_3,
++    d3dmetal_dispatch_init_4, d3dmetal_dispatch_init_5,
++    d3dmetal_dispatch_init_6, d3dmetal_dispatch_init_7,
++};
++
++static void d3dmetal_hook_table( unixlib_entry_t *table )
++{
++    unsigned int i;
++
++    for (i = 0; i < d3dmetal_hooked_count; i++)
++        if (d3dmetal_hooked_table[i] == table) return;
++
++    if (d3dmetal_hooked_count == D3DMETAL_MAX_UNIXLIBS)
++    {
++        ERR( "too many gptk unixlibs to hook\n" );
++        return;
++    }
++    i = d3dmetal_hooked_count++;
++    d3dmetal_hooked_table[i] = table;
++    d3dmetal_orig_init[i] = table[0];
++    table[0] = d3dmetal_init_wrappers[i];
++    TRACE( "hooked gptk dispatch table %p, original init %p\n", table, d3dmetal_orig_init[i] );
++}
++
++/* gptk 4.0b2 dispatches through each graphics module's own unixlib table
++ * (dxgi.so, d3d12.so, ...), not through libd3dshared's, so hooking only the
++ * latter leaves the 0x160-byte dispatch table unsanitised and the first entry
++ * wine 11 does not populate is called as NULL.  every gptk module links
++ * libd3dshared, which wine's own same-named modules never do; that is the
++ * discriminator. */
++void d3dmetal_hook_unixlib( void *so_handle, const void **funcs )
++{
++    unixlib_entry_t *table = (unixlib_entry_t *)*funcs;
++
++    if (!table || !d3dmetal_bridge_active) return;
++    if (!dlsym( so_handle, "_Z18D3DRMDispatch_InitPv" )) return;
++    d3dmetal_hook_table( table );
 +}
 +
 +static void enable_d3dmetal_unix_calls( void *handle )
@@ -192,9 +334,9 @@ index e9b8375..875ac6e 100644
 +    d3dmetal_patch_win32_calls = dlsym( handle, "_Z27PatchWin32DispatchFunctionsP13Win32Dispatch" );
 +    if (d3dmetal_enable_unix_call) *d3dmetal_enable_unix_call = TRUE;
 +
++    d3dmetal_bridge_active = TRUE;
 +    if (!(unix_call_funcs = dlsym( handle, "__wine_unix_call_funcs" ))) return;
-+    d3dmetal_dispatch_init = unix_call_funcs[0];
-+    unix_call_funcs[0] = d3dmetal_dispatch_init_compat;
++    d3dmetal_hook_table( unix_call_funcs );
 +    TRACE( "enabled D3DMetal Unix calls\n" );
 +}
 +
@@ -240,10 +382,11 @@ index e9b8375..875ac6e 100644
 +    (void)size;
 +}
 +#endif
- 
++
  /* die on a fatal error; use only during initialization */
  static void fatal_error( const char *err, ... )
-@@ -1016,6 +1158,7 @@ static const unixlib_entry_t unix_call_funcs[] =
+ {
+@@ -1016,6 +1274,7 @@
      unixcall_wine_server_handle_to_fd,
      unixcall_wine_spawnvp,
      system_time_precise,
@@ -251,7 +394,7 @@ index e9b8375..875ac6e 100644
  };
  
  
-@@ -1023,6 +1166,7 @@ static const unixlib_entry_t unix_call_funcs[] =
+@@ -1023,6 +1282,7 @@
  
  static NTSTATUS wow64_load_so_dll( void *args ) { return STATUS_INVALID_IMAGE_FORMAT; }
  static NTSTATUS wow64_unwind_builtin_dll( void *args ) { return STATUS_UNSUCCESSFUL; }
@@ -259,7 +402,7 @@ index e9b8375..875ac6e 100644
  
  const unixlib_entry_t unix_call_wow64_funcs[] =
  {
-@@ -1034,6 +1178,7 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
+@@ -1034,6 +1294,7 @@
      wow64_wine_server_handle_to_fd,
      wow64_wine_spawnvp,
      system_time_precise,
@@ -267,7 +410,7 @@ index e9b8375..875ac6e 100644
  };
  
  #endif  /* _WIN64 */
-@@ -1437,6 +1582,11 @@ static NTSTATUS open_main_image( UNICODE_STRING *nt_name, void **module, SECTION
+@@ -1437,6 +1698,11 @@
      if (!status)
      {
          status = virtual_map_module( mapping, module, &size, info, 0, 0, machine );
@@ -279,7 +422,7 @@ index e9b8375..875ac6e 100644
          if (status == STATUS_IMAGE_MACHINE_TYPE_MISMATCH && info->ComPlusNativeReady)
          {
              info->Machine = native_machine;
-@@ -1566,6 +1716,7 @@ static void load_ntdll_functions( HMODULE module )
+@@ -1566,6 +1832,7 @@
      if (!(p##name = (void *)find_named_export( module, exports, #name ))) \
          ERR( "%s not found\n", #name )
  
@@ -287,7 +430,7 @@ index e9b8375..875ac6e 100644
      GET_FUNC( DbgUiRemoteBreakin );
      GET_FUNC( KiRaiseUserExceptionDispatcher );
      GET_FUNC( KiUserExceptionDispatcher );
-@@ -1859,10 +2010,12 @@ static void start_main_thread(void)
+@@ -1859,10 +2126,12 @@
      dbg_init();
      startup_info_size = server_init_process();
      msync_init();
@@ -300,8 +443,6 @@ index e9b8375..875ac6e 100644
      *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();
      set_load_order_app_name( main_wargv[0] );
      init_thread_stack( teb, 0, 0, 0 );
-diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
-index 546963a..02ebd46 100644
 --- a/dlls/ntdll/unix/thread.c
 +++ b/dlls/ntdll/unix/thread.c
 @@ -32,6 +32,7 @@
@@ -320,20 +461,39 @@ index 546963a..02ebd46 100644
  #include "unix_private.h"
  
  WINE_DEFAULT_DEBUG_CHANNEL(thread);
-@@ -1242,6 +1244,61 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
- }
- 
- 
+@@ -1238,6 +1240,76 @@
+     teb->Tib.StackBase = stack.StackBase;
+     teb->Tib.StackLimit = stack.StackLimit;
+     teb->DeallocationStack = stack.DeallocationStack;
++    return STATUS_SUCCESS;
++}
++
++
 +#ifdef __APPLE__
 +static BOOL is_d3dmetal_native_address( void *address )
 +{
 +    Dl_info info;
 +    const char *name;
 +
++    static const char * const owners[] =
++    {
++        "libd3dshared.dylib", "D3DMetal",
++        /* gptk 4.0b2 moved the worker entry out of libd3dshared into the
++         * per-module unixlibs; 4.0b1 (which soju-wine targets) did not, so an
++         * allowlist of just the first two rejects every b2 thread and the
++         * worker then runs as a wine PE thread and faults in
++         * pthread_setname_np.  reaching here already required the exact
++         * Thunk_Thread prologue, which wine's own dxgi/d3d1x never emit. */
++        "d3d10.so", "d3d11.so", "d3d12.so", "dxgi.so",
++    };
++    unsigned int i;
++
 +    if (!dladdr( address, &info ) || !info.dli_fname) return FALSE;
 +    name = strrchr( info.dli_fname, '/' );
 +    name = name ? name + 1 : info.dli_fname;
-+    return !strcmp( name, "libd3dshared.dylib" ) || !strcmp( name, "D3DMetal" );
++    for (i = 0; i < ARRAY_SIZE(owners); i++)
++        if (!strcmp( name, owners[i] )) return TRUE;
++    return FALSE;
 +}
 +
 +static void *get_native_d3dmetal_thread( PRTL_THREAD_START_ROUTINE start )
@@ -375,20 +535,16 @@ index 546963a..02ebd46 100644
 +
 +    if (!start) return STATUS_INVALID_PARAMETER;
 +    params->result = start( thread_data->native_param );
-+    return STATUS_SUCCESS;
-+}
-+
-+
- /***********************************************************************
-  *           create_server_thread
-  */
-@@ -1298,8 +1355,28 @@ static NTSTATUS create_server_thread( HANDLE *handle, struct thread_data **data_
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1298,9 +1370,29 @@
  
      data->request_fd = request_pipe[1];
      data->tid        = tid;
 -    data->start      = start;
 -    data->param      = param;
-+
+ 
 +    /* D3DMetal worker threads have native entry points that cannot run on a
 +     * wine thread; route them through __wine_native_thread_start.  wine 11
 +     * moved this assignment here from NtCreateThreadEx, which also covers
@@ -410,14 +566,13 @@ index 546963a..02ebd46 100644
 +            data->param = param;
 +        }
 +    }
- 
++
      *data_ret = data;
      return STATUS_SUCCESS;
-diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
-index c8ca97d..b28109e 100644
+ }
 --- a/dlls/ntdll/unix/unix_private.h
 +++ b/dlls/ntdll/unix/unix_private.h
-@@ -102,6 +102,8 @@ static inline BOOL is_arm64ec(void)
+@@ -102,6 +102,8 @@
  
  struct thread_data
  {
@@ -426,7 +581,7 @@ index c8ca97d..b28109e 100644
      TEB         *teb;               /* TEB */
      int          request_fd;        /* fd for sending server requests */
      int          reply_fd;          /* fd for receiving server replies */
-@@ -188,9 +190,12 @@ extern void *pKiUserEmulationDispatcher;
+@@ -188,9 +190,17 @@
  extern void *pLdrInitializeThunk;
  extern void *pRtlUserThreadStart;
  extern void *p__wine_ctrl_routine;
@@ -436,14 +591,37 @@ index c8ca97d..b28109e 100644
  struct _FILE_FS_DEVICE_INFORMATION;
 +extern NTSTATUS run_native_thread(void *args);
 +extern void register_non_native_code_region(void *base, SIZE_T size);
++#if defined(__APPLE__) && defined(__x86_64__)
++extern void d3dmetal_hook_unixlib(void *so_handle, const void **funcs);
++#else
++static inline void d3dmetal_hook_unixlib(void *so_handle, const void **funcs) { }
++#endif
  
  extern const char wine_build[];
  
-diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
-index db820a8..3143b98 100644
 --- a/dlls/ntdll/unix/virtual.c
 +++ b/dlls/ntdll/unix/virtual.c
-@@ -3846,6 +3846,7 @@ NTSTATUS virtual_map_builtin_module( HANDLE mapping, void **module, SIZE_T *size
+@@ -844,6 +844,7 @@
+ {
+     *funcs = dlsym( so_handle, wow ? "__wine_unix_call_wow64_funcs" : "__wine_unix_call_funcs" );
+     if (!*funcs) *entry = dlsym( so_handle, "__wine_unix_lib_init" );
++    else d3dmetal_hook_unixlib( so_handle, funcs );
+     return *funcs || *entry ? STATUS_SUCCESS : STATUS_ENTRYPOINT_NOT_FOUND;
+ }
+ 
+@@ -3477,6 +3478,11 @@
+     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+     if (needs_close) close( unix_fd );
+     if (shared_needs_close) close( shared_fd );
++    /* every PE image in the process is non-native x86 code.  wine 11.14 maps
++       DLLs here rather than through virtual_map_module (which now only sees the
++       main image) or virtual_create_builtin_view, so this is the only site that
++       covers gptk's d3d12/dxgi before their native callees touch pthread TSD. */
++    if (!status) register_non_native_code_region( *addr_ptr, *size_ptr );
+     return status;
+ }
+ 
+@@ -3846,6 +3852,7 @@
  NTSTATUS virtual_map_module( HANDLE mapping, void **module, SIZE_T *size, SECTION_IMAGE_INFORMATION *info,
                               ULONG_PTR limit_low, ULONG_PTR limit_high, USHORT machine )
  {
@@ -451,7 +629,7 @@ index db820a8..3143b98 100644
      unsigned int status;
      mem_size_t full_size;
      unsigned int sec_flags;
-@@ -3866,8 +3867,12 @@ NTSTATUS virtual_map_module( HANDLE mapping, void **module, SIZE_T *size, SECTIO
+@@ -3866,8 +3873,12 @@
          status = virtual_map_image( mapping, module, size, limit_low, limit_high, 0,
                                      pe_mapping, machine, FALSE, 0 );
          virtual_fill_image_information( &pe_mapping->image, info );
@@ -464,27 +642,152 @@ index db820a8..3143b98 100644
      return status;
  }
  
-diff --git a/dlls/ntdll/unixlib.h b/dlls/ntdll/unixlib.h
-index 9cb4443..61c0c19 100644
---- a/dlls/ntdll/unixlib.h
-+++ b/dlls/ntdll/unixlib.h
-@@ -59,6 +59,11 @@ struct load_so_dll_params
-     void                      **module;
- };
- 
-+struct native_thread_params
-+{
-+    ULONG result;
-+};
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -521,6 +521,83 @@
+ C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct teb_data *)0)->cpu_data) );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, pthread_teb ) == 0x320 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, frame_size ) == 0x328 );
 +
- struct unwind_builtin_dll_params
- {
-     ULONG                       type;
-@@ -76,6 +81,7 @@ enum ntdll_unix_funcs
-     unix_wine_server_handle_to_fd,
-     unix_wine_spawnvp,
-     unix_system_time_precise,
-+    unix_run_native_thread,
- };
- 
- extern unixlib_handle_t __wine_unixlib_handle;
++#ifdef __APPLE__
++/* gptk 4.0b2 dropped the unix-call fallbacks for part of its graphics dispatch
++   table, so the PE side calls apple's native code directly and it runs with
++   wine's TEB in %gs -- native callees then fault in pthread_setspecific.
++   Wrap the affected entries so %gs holds the real pthread TSD across the call.
++
++   This has to be asm: a C wrapper lets the compiler emit %gs-dependent code
++   between the swap and the call.  Nothing here touches %gs after the swap.
++   Stack arguments are copied so signatures wider than four registers work. */
++void *d3dmetal_direct_call_target[8];
++
++#define D3DMETAL_GS_THUNK(n,off)                                                  \
++    void d3dmetal_gs_thunk_##n(void);                                             \
++    __ASM_GLOBAL_FUNC( d3dmetal_gs_thunk_##n,                                     \
++                       "pushq %rbp\n\t"                                           \
++                       "movq %rsp,%rbp\n\t"                                       \
++                       "pushq %rbx\n\t"                                           \
++                       "pushq %r12\n\t"                                           \
++                       "pushq %r13\n\t"                                           \
++                       "pushq %r14\n\t"                                           \
++                       "subq $0xb0,%rsp\n\t"                                      \
++                       /* still in PE context here, so %gs:0x30 is the TEB */     \
++                       "movq %gs:0x30,%rbx\n\t"                                   \
++                       "movq 0x320(%rbx),%r13\n\t"   /* pthread_teb */            \
++                       "movq %rcx,%r12\n\t"                                       \
++                       "movq %rdx,%r14\n\t"                                       \
++                       "movq %r8,0xa0(%rsp)\n\t"                                  \
++                       "movq %r9,0xa8(%rsp)\n\t"                                  \
++                       /* copy 16 qwords of inbound stack args into place */      \
++                       "xorl %eax,%eax\n"                                         \
++                       "1:\tmovq 0x30(%rbp,%rax,8),%r10\n\t"                      \
++                       "movq %r10,0x20(%rsp,%rax,8)\n\t"                          \
++                       "incq %rax\n\t"                                            \
++                       "cmpq $16,%rax\n\t"                                        \
++                       "jb 1b\n\t"                                                \
++                       /* gsbase = pthread TSD */                                 \
++                       "movq %r13,%rdi\n\t"                                       \
++                       "xorl %esi,%esi\n\t"                                       \
++                       "movl $0x3000003,%eax\n\t"                                 \
++                       "syscall\n\t"                                              \
++                       "movq %r12,%rcx\n\t"                                       \
++                       "movq %r14,%rdx\n\t"                                       \
++                       "movq 0xa0(%rsp),%r8\n\t"                                  \
++                       "movq 0xa8(%rsp),%r9\n\t"                                  \
++                       "movq " __ASM_NAME("d3dmetal_direct_call_target") "+" #off "(%rip),%r10\n\t" \
++                       "callq *%r10\n\t"                                          \
++                       /* gsbase = TEB again, preserving the return value */      \
++                       "movq %rax,%r12\n\t"                                       \
++                       "movq %rbx,%rdi\n\t"                                       \
++                       "xorl %esi,%esi\n\t"                                       \
++                       "movl $0x3000003,%eax\n\t"                                 \
++                       "syscall\n\t"                                              \
++                       "movq %r12,%rax\n\t"                                       \
++                       "addq $0xb0,%rsp\n\t"                                      \
++                       "popq %r14\n\t"                                            \
++                       "popq %r13\n\t"                                            \
++                       "popq %r12\n\t"                                            \
++                       "popq %rbx\n\t"                                            \
++                       "popq %rbp\n\t"                                            \
++                       "retq" )
++D3DMETAL_GS_THUNK(0,0)
++D3DMETAL_GS_THUNK(1,8)
++D3DMETAL_GS_THUNK(2,16)
++D3DMETAL_GS_THUNK(3,24)
++D3DMETAL_GS_THUNK(4,32)
++D3DMETAL_GS_THUNK(5,40)
++D3DMETAL_GS_THUNK(6,48)
++D3DMETAL_GS_THUNK(7,56)
++#undef D3DMETAL_GS_THUNK
++
++void *d3dmetal_gs_thunks[8] =
++{
++    d3dmetal_gs_thunk_0, d3dmetal_gs_thunk_1, d3dmetal_gs_thunk_2, d3dmetal_gs_thunk_3,
++    d3dmetal_gs_thunk_4, d3dmetal_gs_thunk_5, d3dmetal_gs_thunk_6, d3dmetal_gs_thunk_7,
++};
++#endif
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, instrumentation_callback ) == 0x330 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs ) == 0x338 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
+@@ -2888,6 +2965,26 @@
+     sysarch( X86_64_SET_GSBASE, &teb );
+ #elif defined (__APPLE__)
+     thread_data->pthread_teb = mac_thread_gsbase();
++    /* Apple's pthread_self()/pthread_setspecific() read the thread pointer from
++       %gs:0x0 and index off it.  Native code called straight from PE (gptk's
++       vtable trampolines) therefore needs a valid self pointer at %gs:0 while
++       wine's TEB is in %gs.  NT_TIB.ExceptionList sits at offset 0 and is
++       unused on x86_64 (SEH there is table-based), so it can carry it. */
++    /* pthread_teb points at &tsd[0], so tsd[n] is readable from it.  Mirror the
++       slots apple's libplatform reads straight off %gs into the TEB fields that
++       sit at the same offsets and are unused on x86_64:
++         tsd[0] -> Tib.ExceptionList  (0x00) thread self
++         tsd[3] -> Tib.SubSystemTib   (0x18) mach thread self port
++       tsd[1] (errno) would land on Tib.StackBase and cannot be mirrored. */
++    {
++        void **tsd = thread_data->pthread_teb;
++
++        teb->Tib.ExceptionList = tsd[0];
++        /* tsd[3] (mach thread self port, read by os_unfair_lock) would land on
++           Tib.SubSystemTib -- mirroring it there breaks wine outright, so that
++           slot cannot be covered this way.  Same for tsd[1] (errno) on
++           Tib.StackBase.  Mirroring is therefore only a partial answer. */
++    }
+ #else
+ # error Please define setting %gs for your architecture
+ #endif
+@@ -3122,9 +3219,16 @@
+                    "2:\n\t"
+ #elif defined __APPLE__
+                    "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
++                   /* the linux path below guards this; without the same guard a
++                      thread whose pthread_teb is not set yet gets gsbase zeroed,
++                      and the next pthread call writes to a low absolute address
++                      (observed: write to 0x910 in pthread_setspecific). */
++                   "testq %rdi,%rdi\n\t"
++                   "jz 9f\n\t"
+                    "xorl %esi,%esi\n\t"
+                    "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+-                   "syscall\n\t"
++                   "syscall\n"
++                   "9:\n\t"
+                    "leaq -0x98(%rbp),%rcx\n"
+ #endif
+                    "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
+@@ -3438,9 +3542,16 @@
+                    "2:\n\t"
+ #elif defined __APPLE__
+                    "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
++                   /* the linux path below guards this; without the same guard a
++                      thread whose pthread_teb is not set yet gets gsbase zeroed,
++                      and the next pthread call writes to a low absolute address
++                      (observed: write to 0x910 in pthread_setspecific). */
++                   "testq %rdi,%rdi\n\t"
++                   "jz 9f\n\t"
+                    "xorl %esi,%esi\n\t"
+                    "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+-                   "syscall\n\t"
++                   "syscall\n"
++                   "9:\n\t"
+ #endif
+                    "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
+                    "movq %r8,%rdi\n\t"             /* args */
