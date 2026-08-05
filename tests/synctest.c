@@ -188,16 +188,27 @@ int main(int argc, char **argv)
     ResetEvent(done_ev);
     t0 = now_ms();
     for (i = 0; i < THREADS; i++) threads[i] = CreateThread(NULL, 0, event_worker, NULL, 0, NULL);
-    for (i = 0; i < iterations + THREADS; i++)
+    /* an auto-reset event does not queue: signalling while nobody waits leaves
+     * exactly one pending, and every further signal is discarded.  a producer
+     * that fires a fixed number of times as fast as it can therefore starves
+     * its consumers for reasons that have nothing to do with the backend, and
+     * asserting only an upper bound on the counter reports that starvation as
+     * a pass.  drive it as a real handoff instead: keep signalling until the
+     * consumers have actually taken `iterations` wakeups, bounded by a
+     * deadline, then require that they got there. */
     {
-        SetEvent(ev_auto);
-        if (WaitForSingleObject(done_ev, 0) == WAIT_OBJECT_0) break;
+        ULONGLONG deadline = now_ms() + 30000;
+
+        while (WaitForSingleObject(done_ev, 0) != WAIT_OBJECT_0 && now_ms() < deadline)
+            SetEvent(ev_auto);
+
+        check("auto event handoff completed", WaitForSingleObject(done_ev, 0) == WAIT_OBJECT_0);
     }
-    WaitForSingleObject(done_ev, 30000);
     for (i = 0; i < THREADS; i++) SetEvent(ev_auto);
     for (i = 0; i < THREADS; i++) WaitForSingleObject(threads[i], 10000);
     for (i = 0; i < THREADS; i++) CloseHandle(threads[i]);
     check("auto event woke no more than set", counter <= (LONG)(iterations + THREADS));
+    check("auto event lost no wakeups", counter >= (LONG)iterations);
     printf("  auto event: %llu ms, counter %ld\n",
            (unsigned long long)(now_ms() - t0), (long)counter);
 
