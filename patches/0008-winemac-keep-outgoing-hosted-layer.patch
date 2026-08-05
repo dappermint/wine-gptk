@@ -1,0 +1,95 @@
+winemac: Keep the outgoing hosted layer until its replacement takes over.
+
+A client that resizes does not resize its swapchain in place: it destroys the
+whole client surface and builds a new one.  Measured on steam's client with
+WINEDEBUG=trace+macdrv, a single resize step produces
+
+  2  macdrv_client_surface_destroy
+  4  remote layer messages:  RELEASE(old) ... CREATE(new) ... RELEASE(old)
+
+so the sequence on the hosting side is release-then-create, and the new
+CALayerHost hosts nothing until the client presents its first frame at the new
+size.  removeCALayerHostView: dropped the outgoing host out of the layer tree
+immediately, which left the window with no layer at all across that gap: one
+black frame per resize step, and an interactive drag turns that into visible
+strobing.
+
+Retain the outgoing host in the layer tree instead of dropping it.  A new host
+is added as a sublayer above it, so the stale frame is only ever visible
+through the replacement's content-less period and is covered as soon as the
+first new frame lands.  It is dropped on the next release, on setRetinaMode
+(where a stale frame at the wrong scale would be worse than none) and on
+dealloc, so at most one is ever retained.
+
+This supersedes an earlier attempt that parked a copy of the last drawable in
+the container layer on the sending side: that treated a resize as a geometry
+change on a persistent layer, which is not what happens, and left a ghost
+frame behind wherever the live layer did not cover the container.
+
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+index 1de9f0a..949c175 100644
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -394,6 +394,7 @@ @interface WineContentView : WineBaseView <NSTextInputClient, NSViewLayerContent
+ 
+     WineMetalView *_metalView;
+     NSMutableDictionary<NSNumber*, CALayerHost*>* _caLayerHosts;
++    CALayerHost* _retiredCALayerHost;
+ }
+ 
+ @property (readonly, nonatomic) BOOL everHadGLContext;
+@@ -518,6 +519,8 @@ - (void) dealloc
+         [markedText release];
+         [glContexts release];
+         [pendingGlContexts release];
++        [_retiredCALayerHost removeFromSuperlayer];
++        [_retiredCALayerHost release];
+         [_caLayerHosts release];
+         CGImageRelease(colorImage);
+         CGImageRelease(shapeImage);
+@@ -742,11 +745,34 @@ - (void) addCALayerHostViewWithContextId:(CAContextID)contextId
+         [(WineWindow*)self.window windowDidDrawContent];
+     }
+ 
++    /* A client that resizes releases its old context BEFORE publishing the
++       replacement, and the replacement hosts nothing until it presents its
++       first frame.  Dropping the outgoing host here therefore leaves the
++       window with no layer at all for the width of that gap -- one black
++       frame per resize step, which an interactive drag turns into strobing.
++       Keep the outgoing host in the tree instead.  A newly added host is
++       stacked above it, so the stale frame is only ever visible through the
++       replacement's content-less period, and it is dropped on the next
++       release, on setRetinaMode, and on dealloc.  At most one is retained. */
+     - (void) removeCALayerHostView:(CAContextID)contextId
+     {
+         NSNumber* key = @(contextId);
+-        [[_caLayerHosts objectForKey:key] removeFromSuperlayer];
++        CALayerHost* host = [[_caLayerHosts objectForKey:key] retain];
++
+         [_caLayerHosts removeObjectForKey:key];
++        if (!host) return;
++
++        [_retiredCALayerHost removeFromSuperlayer];
++        [_retiredCALayerHost release];
++        _retiredCALayerHost = host;
++    }
++
++    /* for the paths that must not leave a stale frame behind */
++    - (void) discardRetiredCALayerHost
++    {
++        [_retiredCALayerHost removeFromSuperlayer];
++        [_retiredCALayerHost release];
++        _retiredCALayerHost = nil;
+     }
+ 
+     - (void) setLayerRetinaProperties:(BOOL)mode
+@@ -790,6 +816,9 @@ - (void) setRetinaMode:(BOOL)mode
+ 
+         for (CALayerHost* host in [_caLayerHosts allValues])
+             host.contentsScale = mode ? 2.0 : 1.0;
++        /* a retired host cannot be rescaled meaningfully, and a stale frame at
++           the wrong scale is worse than none */
++        [self discardRetiredCALayerHost];
+ 
+         [super setRetinaMode:mode];
+     }
