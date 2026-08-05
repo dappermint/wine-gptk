@@ -8,6 +8,11 @@ on:
         type: choice
         default: standard
         options: [standard, release, fast]
+      runner:
+        description: "where to build: self-hosted is ~10x faster, hosted is the clean-room check"
+        type: choice
+        default: self-hosted
+        options: [self-hosted, hosted]
   push:
     branches: [main]
 
@@ -18,7 +23,7 @@ env:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner == 'hosted' && fromJSON('["macos-15"]') || fromJSON('["self-hosted","macOS","ARM64"]') }}
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v7.0.1
@@ -28,7 +33,11 @@ jobs:
           /usr/sbin/softwareupdate --install-rosetta --agree-to-license || true
           arch -x86_64 /usr/bin/true && echo "rosetta ok"
 
+      # the self-hosted runner is nix-darwin managed and already carries
+      # extra-platforms = x86_64-darwin; installing over it would clobber a
+      # real machine's daemon and store
       - name: install nix
+        if: inputs.runner == 'hosted'
         uses: DeterminateSystems/nix-installer-action@v22
         with:
           extra-conf: |
