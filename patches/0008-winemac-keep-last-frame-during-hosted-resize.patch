@@ -13,10 +13,10 @@ the moment it has a drawable, so the stale frame is only ever visible in the
 gap the swapchain rebuild leaves.
 
 diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
-index 1de9f0a..8860465 100644
+index 1de9f0a..70a448c 100644
 --- a/dlls/winemac.drv/cocoa_window.m
 +++ b/dlls/winemac.drv/cocoa_window.m
-@@ -4160,6 +4160,19 @@ - (void) setContainer:(CGRect)container frame:(CGRect)frame
+@@ -4160,6 +4160,31 @@ - (void) setContainer:(CGRect)container frame:(CGRect)frame
      /* no implicit animation, a resize must land in one frame */
      [CATransaction begin];
      [CATransaction setDisableActions:YES];
@@ -24,13 +24,25 @@ index 1de9f0a..8860465 100644
 +    /* the client tears its swapchain down and rebuilds it on resize, and the
 +       metal layer has no contents until the first drawable at the new size is
 +       presented; without a stale frame parked behind it, every resize step is
-+       a black flash of the layer background.  the container shows the old
-+       frame stretched into the gap and the metal layer covers it again as
-+       soon as it has contents. */
++       a black flash of the layer background.  the parked frame MUST be
++       cleared again shortly after: left in place it ghosts through wherever
++       the live layer does not cover the container, which showed up as a
++       doubled ui band after every resize.  by 400ms the client has presented
++       at the new size, and if it has not, a late flash beats a permanent
++       ghost.  the block captures the layer, not self, so a swapchain freed
++       before the timer fires is safe; and if another resize re-parked in the
++       meantime, the pointer comparison sees the newer contents and leaves
++       them alone. */
 +    if (o.contents)
 +    {
-+        c.contents = o.contents;
++        id parked = o.contents;
++        CALayer* cl = c;
++        c.contents = parked;
 +        c.contentsGravity = kCAGravityResize;
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC),
++                       dispatch_get_main_queue(), ^{
++            if (cl.contents == parked) cl.contents = nil;
++        });
 +    }
 +
      c.bounds = CGRectMake(0, 0, CGRectGetWidth(container), CGRectGetHeight(container));
