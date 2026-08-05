@@ -15,23 +15,28 @@ long since published.  Exactly one set is ever held, so nothing accumulates.
 Together with the hosting-side change the sequence is now continuous: the old
 context keeps publishing its last frame, the new host is stacked above the old
 one, and the old host is only dropped once its replacement has taken over.
-
+The held set is keyed by hwnd rather than a single global slot: a window can
+host more than one cross-process surface at a time, and with one slot only the
+last context released was covered.  Measured on steam -- its library is a
+single surface and stopped flashing, its store page has a separate renderer
+surface and did not.
 diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
-index 949c175..9d29f14 100644
+index 949c175..ab95f2f 100644
 --- a/dlls/winemac.drv/cocoa_window.m
 +++ b/dlls/winemac.drv/cocoa_window.m
-@@ -4118,6 +4118,10 @@ @interface CAContextSwapChain : NSObject <WineMetalSwapChain>
+@@ -4118,6 +4118,11 @@ @interface CAContextSwapChain : NSObject <WineMetalSwapChain>
  
  - (instancetype) initWithHwnd:(void*)hwnd container:(CGRect)container frame:(CGRect)frame;
  - (void) setContainer:(CGRect)container frame:(CGRect)frame;
 ++ (void) deferTeardownOfContext:(CAContext *)context
 +                         layer:(CAMetalLayer *)layer
 +                     container:(CALayer *)container
-+                        device:(macdrv_metal_device)dev;
++                        device:(macdrv_metal_device)dev
++                       forHwnd:(void *)owner;
  
  @end
  
-@@ -4201,14 +4205,19 @@ - (CAMetalLayer*) layer
+@@ -4201,14 +4206,19 @@ - (CAMetalLayer*) layer
      return offscreen_layer;
  }
  
@@ -58,7 +63,7 @@ index 949c175..9d29f14 100644
      OnMainThreadAsync(^{
          [context setLayer:nil];
          [context release];
-@@ -4216,10 +4225,41 @@ - (void) dealloc
+@@ -4216,10 +4226,60 @@ - (void) dealloc
          [container release];
          if (dev) macdrv_release_metal_device(dev);
      });
@@ -72,7 +77,8 @@ index 949c175..9d29f14 100644
 +    [CAContextSwapChain deferTeardownOfContext:remote_context
 +                                         layer:offscreen_layer
 +                                     container:container_layer
-+                                        device:device];
++                                        device:device
++                                       forHwnd:hwnd];
  
      [super dealloc];
  }
@@ -81,20 +87,38 @@ index 949c175..9d29f14 100644
 +                         layer:(CAMetalLayer *)layer
 +                     container:(CALayer *)container
 +                        device:(macdrv_metal_device)dev
++                       forHwnd:(void *)owner
 +{
-+    static CAContext *held_context;
-+    static CAMetalLayer *held_layer;
-+    static CALayer *held_container;
-+    static macdrv_metal_device held_device;
++    /* keyed by hwnd, not a single global slot.  a window can host more than
++       one cross-process surface at a time -- steam's store page has a separate
++       renderer surface from the client chrome, its library does not -- and a
++       single slot only ever covers whichever context happened to be released
++       last, leaving the others to blank exactly as before.  one held set per
++       window bounds this the same way while covering all of them. */
++    static NSMutableDictionary<NSNumber *, NSArray *> *held;
++    NSNumber *key = @((uintptr_t)owner);
++    NSArray *previous;
 +
-+    /* the previously held set has now been superseded, let it go */
-+    if (held_context || held_layer || held_container || held_device)
-+        release_swapchain_resources(held_context, held_layer, held_container, held_device);
++    if (!held) held = [[NSMutableDictionary alloc] init];
 +
-+    held_context   = context;
-+    held_layer     = layer;
-+    held_container = container;
-+    held_device    = dev;
++    previous = [held objectForKey:key];
++    if (previous)
++    {
++        /* superseded: this window already published a replacement */
++        release_swapchain_resources([previous objectAtIndex:0] == [NSNull null] ? nil : [previous objectAtIndex:0],
++                                    [previous objectAtIndex:1] == [NSNull null] ? nil : [previous objectAtIndex:1],
++                                    [previous objectAtIndex:2] == [NSNull null] ? nil : [previous objectAtIndex:2],
++                                    (macdrv_metal_device)[[previous objectAtIndex:3] pointerValue]);
++        [held removeObjectForKey:key];
++    }
++
++    if (!context && !layer && !container && !dev) return;
++
++    [held setObject:@[ context   ? (id)context   : (id)[NSNull null],
++                       layer     ? (id)layer     : (id)[NSNull null],
++                       container ? (id)container : (id)[NSNull null],
++                       [NSValue valueWithPointer:dev] ]
++             forKey:key];
 +}
 +
  @end
