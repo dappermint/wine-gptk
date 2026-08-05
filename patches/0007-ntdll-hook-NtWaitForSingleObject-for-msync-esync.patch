@@ -1,0 +1,54 @@
+ntdll: Route NtWaitForSingleObject through msync/esync as well.
+
+NtWaitForSingleObject is not a wrapper around NtWaitForMultipleObjects in
+wine 11: it has its own body which goes straight to inproc_wait() and then to
+the server select.  0004 hooks NtWaitForMultipleObjects, NtSignalAndWait-
+ForSingleObject and NtDelayExecution but not this one, so a handle created by
+msync_create_semaphore() or its event and mutex siblings reaches a wait path
+that has no object for it and fails immediately.
+
+Measured against the wine-11.14 build with WINEMSYNC=1, using tests/synctest.c
+which asserts an invariant per primitive rather than timing a loop:
+
+  WaitAll times out when unsignalled     PASS     <- NtWaitForMultipleObjects
+  WaitAny returns the signalled one      PASS     <- hooked, works
+  WaitAll returns when both signalled    PASS
+  manual reset event stays signalled     FAIL     <- WaitForSingleObject
+  manual reset event resets              FAIL     <- unhooked, fails
+  abandoned mutex reported               FAIL
+  semaphore+mutex count exact            FAIL     80000 ops in 2 ms, counter 0
+
+Every multi-object case passed and every single-object case failed, which is
+the signature of exactly one missing hook.  The workers return on the first
+non-WAIT_OBJECT_0, so a counter of 0 means the very first wait failed rather
+than the loop running wrong.
+
+The hook goes ahead of inproc_wait() to match where 0004 placed the one in
+NtWaitForMultipleObjects, and uses the same STATUS_NOT_IMPLEMENTED fallthrough
+so a handle the backend does not own still reaches the normal path.
+
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -2443,6 +2443,21 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
+
+     TRACE( "handle %p, alertable %u, timeout %s\n", handle, alertable, debugstr_timeout(timeout) );
+
++    /* this is not a wrapper around NtWaitForMultipleObjects, so hooking that
++     * one is not enough: without this an msync or esync backed handle reaches
++     * the server wait path, which has no object for it, and fails immediately */
++    if (do_msync())
++    {
++        NTSTATUS status = msync_wait_objects( 1, &handle, TRUE, alertable, timeout );
++        if (status != STATUS_NOT_IMPLEMENTED) return status;
++    }
++
++    if (do_esync())
++    {
++        NTSTATUS status = esync_wait_objects( 1, &handle, TRUE, alertable, timeout );
++        if (status != STATUS_NOT_IMPLEMENTED) return status;
++    }
++
+     if ((ret = inproc_wait( 1, &handle, WaitAny, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
+     {
+         TRACE( "-> %#x\n", ret );
