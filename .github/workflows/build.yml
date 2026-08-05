@@ -190,7 +190,14 @@ jobs:
           export CC="ccache /usr/bin/clang"
           export PKG_CONFIG_PATH="$pcp"
           mkdir build-tools && cd build-tools
+          # --enable-archs=x86_64 is required, not cosmetic: wine 11 refuses to
+          # configure without a PE cross-compiler for the HOST arch, and there
+          # is no aarch64-w64-mingw32 here ("PE cross-compilation is required
+          # for aarch64-apple-darwin"). naming x86_64 points it at the mingw we
+          # do have. only __tooldeps__ is built from this tree, so no PE module
+          # is ever produced by it.
           ../winecx/configure \
+            --enable-archs=x86_64 \
             --without-x --without-wayland --without-gstreamer \
             --without-oss --without-alsa --without-pulse --without-sane \
             --without-usb --without-v4l2 --without-pcap --without-capi \
