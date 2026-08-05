@@ -147,6 +147,51 @@ jobs:
           } >> "$GITHUB_ENV"
           cat store-outs.txt
 
+      - name: wine-mono, wine-gecko and the graphics payloads
+        run: |
+          set -eu
+          # the extracted form, which is what the stock whisky engine ships and
+          # what mscoree and mshtml load straight out of the datadir. without
+          # them a fresh prefix stops on a modal wine-mono dialog and waits
+          # for a click, which is a hang with no error (measured 2026-08-04).
+          mono_ver=$(sed -n 's/^#define MONO_VERSION "\(.*\)"/\1/p' winecx/dlls/appwiz.cpl/addons.c)
+          gecko_ver=$(sed -n 's/^#define GECKO_VERSION "\(.*\)"/\1/p' winecx/dlls/appwiz.cpl/addons.c)
+          [ "$mono_ver" = "11.2.0" ] && [ "$gecko_ver" = "2.47.4" ] || {
+            echo "::error::wine now wants mono $mono_ver gecko $gecko_ver; update the pinned hashes"
+            exit 1
+          }
+
+          fetch() {
+            curl -fsSL -o "$2" "$1"
+            got=$(shasum -a 256 "$2" | cut -d' ' -f1)
+            [ "$got" = "$3" ] || { echo "::error::hash mismatch for $2: $got != $3"; exit 1; }
+          }
+
+          mkdir -p addons/mono addons/gecko payload
+          fetch "https://dl.winehq.org/wine/wine-mono/$mono_ver/wine-mono-$mono_ver-x86.tar.xz" \
+                mono.tar.xz c9fb2e2823acf30b000b8806177db0f40751786136dd3f8fb2be7897b1643d06
+          fetch "https://dl.winehq.org/wine/wine-gecko/$gecko_ver/wine-gecko-$gecko_ver-x86.tar.xz" \
+                gecko-x86.tar.xz 2cfc8d5c948602e21eff8a78613e1826f2d033df9672cace87fed56e8310afb6
+          fetch "https://dl.winehq.org/wine/wine-gecko/$gecko_ver/wine-gecko-$gecko_ver-x86_64.tar.xz" \
+                gecko-x64.tar.xz fd88fc7e537d058d7a8abf0c1ebc90c574892a466de86706a26d254710a82814
+          tar -xJf mono.tar.xz -C addons/mono
+          tar -xJf gecko-x86.tar.xz -C addons/gecko
+          tar -xJf gecko-x64.tar.xz -C addons/gecko
+          [ -d "addons/mono/wine-mono-$mono_ver" ] || { echo "::error::mono layout changed"; exit 1; }
+
+          # a runtime with no d3d11 implementation cannot render chromium:
+          # wined3d goes through apple's opengl, frozen at 4.1, which gives
+          # ANGLE feature level 9_3 and a hard "GLES 3.0 > max supported 2.0".
+          # measured on the first gcc artifact: steam logged in and painted
+          # nothing. dxvk and dxmt are what make the ui appear.
+          fetch "https://github.com/Gcenx/DXVK-macOS/releases/download/v$DXVK_VERSION-20230507-repack/dxvk-macOS-async-v$DXVK_VERSION-20230507-repack.tar.gz" \
+                dxvk.tar.gz acd1520ad105d8ef124a09c8e11a259a5dc8bdc565ad18e0e52693f9807b2477
+          fetch "https://github.com/3Shain/dxmt/releases/download/v$DXMT_VERSION/dxmt-v$DXMT_VERSION-builtin.tar.gz" \
+                dxmt.tar.gz 8f260e36b5739e68f3bad613381441385c4dc7b85b78ba8de653d5a6a264529d
+          tar -xzf dxvk.tar.gz -C payload
+          tar -xzf dxmt.tar.gz -C payload
+          ls payload
+
       - name: configure
         env:
           OPT_LEVEL: ${{ inputs.opt }}
@@ -206,51 +251,6 @@ jobs:
             ccache -s
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: wine-mono, wine-gecko and the graphics payloads
-        run: |
-          set -eu
-          # the extracted form, which is what the stock whisky engine ships and
-          # what mscoree and mshtml load straight out of the datadir. without
-          # them a fresh prefix stops on a modal wine-mono dialog and waits
-          # for a click, which is a hang with no error (measured 2026-08-04).
-          mono_ver=$(sed -n 's/^#define MONO_VERSION "\(.*\)"/\1/p' winecx/dlls/appwiz.cpl/addons.c)
-          gecko_ver=$(sed -n 's/^#define GECKO_VERSION "\(.*\)"/\1/p' winecx/dlls/appwiz.cpl/addons.c)
-          [ "$mono_ver" = "11.2.0" ] && [ "$gecko_ver" = "2.47.4" ] || {
-            echo "::error::wine now wants mono $mono_ver gecko $gecko_ver; update the pinned hashes"
-            exit 1
-          }
-
-          fetch() {
-            curl -fsSL -o "$2" "$1"
-            got=$(shasum -a 256 "$2" | cut -d' ' -f1)
-            [ "$got" = "$3" ] || { echo "::error::hash mismatch for $2: $got != $3"; exit 1; }
-          }
-
-          mkdir -p addons/mono addons/gecko payload
-          fetch "https://dl.winehq.org/wine/wine-mono/$mono_ver/wine-mono-$mono_ver-x86.tar.xz" \
-                mono.tar.xz c9fb2e2823acf30b000b8806177db0f40751786136dd3f8fb2be7897b1643d06
-          fetch "https://dl.winehq.org/wine/wine-gecko/$gecko_ver/wine-gecko-$gecko_ver-x86.tar.xz" \
-                gecko-x86.tar.xz 2cfc8d5c948602e21eff8a78613e1826f2d033df9672cace87fed56e8310afb6
-          fetch "https://dl.winehq.org/wine/wine-gecko/$gecko_ver/wine-gecko-$gecko_ver-x86_64.tar.xz" \
-                gecko-x64.tar.xz fd88fc7e537d058d7a8abf0c1ebc90c574892a466de86706a26d254710a82814
-          tar -xJf mono.tar.xz -C addons/mono
-          tar -xJf gecko-x86.tar.xz -C addons/gecko
-          tar -xJf gecko-x64.tar.xz -C addons/gecko
-          [ -d "addons/mono/wine-mono-$mono_ver" ] || { echo "::error::mono layout changed"; exit 1; }
-
-          # a runtime with no d3d11 implementation cannot render chromium:
-          # wined3d goes through apple's opengl, frozen at 4.1, which gives
-          # ANGLE feature level 9_3 and a hard "GLES 3.0 > max supported 2.0".
-          # measured on the first gcc artifact: steam logged in and painted
-          # nothing. dxvk and dxmt are what make the ui appear.
-          fetch "https://github.com/Gcenx/DXVK-macOS/releases/download/v$DXVK_VERSION-20230507-repack/dxvk-macOS-async-v$DXVK_VERSION-20230507-repack.tar.gz" \
-                dxvk.tar.gz acd1520ad105d8ef124a09c8e11a259a5dc8bdc565ad18e0e52693f9807b2477
-          fetch "https://github.com/3Shain/dxmt/releases/download/v$DXMT_VERSION/dxmt-v$DXMT_VERSION-builtin.tar.gz" \
-                dxmt.tar.gz 8f260e36b5739e68f3bad613381441385c4dc7b85b78ba8de653d5a6a264529d
-          tar -xzf dxvk.tar.gz -C payload
-          tar -xzf dxmt.tar.gz -C payload
-          ls payload
 
       - name: install and package
         run: |
@@ -408,7 +408,11 @@ jobs:
               | grep -E '^/' | grep -vE '^(/usr/lib/|/System/)' \
               | sed "s|^|rpath $f -> |" >> /tmp/badrefs || true
           done < <(find Libraries -type f ! -type l -print0)
-          [ "$scanned" -gt 1000 ] || {
+          # a wine tree holds ~60 Mach-O files: the unix modules, the bundled
+          # dylibs and the loaders. the PE half is COFF and is skipped, so a
+          # floor in the thousands is wrong -- this is only here to catch a
+          # sweep that scanned nothing because find or file broke.
+          [ "$scanned" -gt 40 ] || {
             echo "::error::sweep scanned only $scanned Mach-O files; the scan broke"
             exit 1
           }
