@@ -1,0 +1,124 @@
+winemac: Push geometry changes into a hosted child window's layer tree.
+
+The cross-process child window swapchain publishes its geometry once, at
+creation, and macdrv_swapchain_set_frame() had no caller at all:
+client_surface_present() runs funcs->update on every present, but
+macdrv_client_surface_update() returns at get_win_data(toplevel), which cannot
+succeed for a top level owned by another process.  So a resized window kept
+rendering at whatever size it had when the GPU process first attached, leaving
+Steam's client stretched or clipped after any resize until the swapchain
+happened to be recreated.
+
+Take the offscreen case before that early return and push the rects into the
+published tree instead.  The rects are compared against the last ones sent
+because this runs per present, and a CATransaction commit per frame would flush
+the render server for nothing.
+
+surface->cocoa_view is not the discriminator here: macdrv_CreateClientSurface()
+creates one for every surface including cross-process ones.  surface->toplevel
+is, since it is set only once an offscreen swapchain has been acquired.
+
+diff --git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
+index 18134dcd55..ec1a9a33fa 100644
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -204,6 +204,8 @@ extern BOOL macdrv_SystemParametersInfo(UINT action, UINT int_param, void *ptr_p
+     macdrv_view             cocoa_view;
+     macdrv_metal_swapchain  metal_swapchain;
+     HWND                    toplevel;       /* window hosting our layer, only set when offscreen */
++    RECT                    hosted_container;  /* geometry last pushed into the hosted layer tree */
++    RECT                    hosted_frame;
+ };
+ 
+ extern struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client);
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index 020046b21b..d35c5c3dfb 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -1100,6 +1100,41 @@ static void macdrv_client_surface_detach(struct client_surface *client)
+     }
+ }
+ 
++/* Client rect of hwnd, and of its top level, both in the top level's client
++ * coordinates.  This is the space the hosted layer tree lives in. */
++static BOOL get_hosted_rects(HWND hwnd, HWND toplevel, RECT *container, RECT *frame)
++{
++    UINT dpi = NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI);
++
++    if (!NtUserGetClientRect(toplevel, container, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI)))
++        return FALSE;
++    if (!NtUserGetClientRect(hwnd, frame, dpi)) return FALSE;
++    if (hwnd != toplevel) NtUserMapWindowPoints(hwnd, toplevel, (POINT *)frame, 2, dpi);
++    return TRUE;
++}
++
++/* An offscreen surface has no view of its own and its top level belongs to
++ * another process, so the update below is unreachable for it and its geometry
++ * has to be pushed into the published layer tree instead.  This runs on every
++ * present, hence the compare: a CATransaction per frame would flush the render
++ * server for nothing. */
++static void update_hosted_geometry(struct macdrv_client_surface *surface)
++{
++    HWND hwnd = surface->client.hwnd;
++    RECT container, frame;
++
++    if (!get_hosted_rects(hwnd, surface->toplevel, &container, &frame)) return;
++    if (EqualRect(&container, &surface->hosted_container) && EqualRect(&frame, &surface->hosted_frame))
++        return;
++
++    TRACE("%s container %s frame %s\n", debugstr_client_surface(&surface->client),
++          wine_dbgstr_rect(&container), wine_dbgstr_rect(&frame));
++
++    macdrv_swapchain_set_frame(surface->metal_swapchain, cgrect_from_rect(container), cgrect_from_rect(frame));
++    surface->hosted_container = container;
++    surface->hosted_frame = frame;
++}
++
+ static void macdrv_client_surface_update(struct client_surface *client)
+ {
+     struct macdrv_client_surface *surface = impl_from_client_surface(client);
+@@ -1108,6 +1143,15 @@ static void macdrv_client_surface_update(struct client_surface *client)
+ 
+     TRACE("%s\n", debugstr_client_surface(client));
+ 
++    /* surface->toplevel is set only once an offscreen swapchain has been
++     * acquired, which is the case this early return cannot serve.  Note it is
++     * not client->toplevel, which win32u fills in for every surface. */
++    if (surface->toplevel)
++    {
++        update_hosted_geometry(surface);
++        return;
++    }
++
+     if (!(data = get_win_data(toplevel))) return;
+     macdrv_set_view_frame(surface->cocoa_view, cgrect_from_rect(client->monitor_rect));
+     macdrv_set_view_superview(surface->cocoa_view, toplevel == hwnd ? NULL : data->client_view, data->cocoa_window, NULL, NULL);
+@@ -1162,19 +1206,6 @@ struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format)
+     return &surface->client;
+ }
+ 
+-/* Client rect of hwnd, and of its top level, both in the top level's client
+- * coordinates.  This is the space the hosted layer tree lives in. */
+-static BOOL get_hosted_rects(HWND hwnd, HWND toplevel, RECT *container, RECT *frame)
+-{
+-    UINT dpi = NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI);
+-
+-    if (!NtUserGetClientRect(toplevel, container, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI)))
+-        return FALSE;
+-    if (!NtUserGetClientRect(hwnd, frame, dpi)) return FALSE;
+-    if (hwnd != toplevel) NtUserMapWindowPoints(hwnd, toplevel, (POINT *)frame, 2, dpi);
+-    return TRUE;
+-}
+-
+ BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface *surface)
+ {
+     HWND hwnd = surface->client.hwnd;
+@@ -1199,6 +1230,8 @@ BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface
+         }
+ 
+         surface->toplevel = toplevel;
++        surface->hosted_container = container;
++        surface->hosted_frame = frame;
+         surface->metal_swapchain = macdrv_create_offscreen_swapchain(toplevel,
+                 cgrect_from_rect(container), cgrect_from_rect(frame));
+     }
