@@ -156,6 +156,39 @@ jobs:
           } >> "$GITHUB_ENV"
           cat store-outs.txt
 
+      # the host tools (makedep, winebuild, wrc, widl, wmc) get exec'd
+      # thousands of times per build. built x86_64 they are all rosetta
+      # processes, and macos 27.0's ecosystemanalyticsd grinds the whole
+      # machine analyzing them (unbounded retry loop, it can never reach
+      # com.apple.bird from the system domain, so every analysis requeues).
+      # building them native and pointing the main configure at them keeps
+      # rosetta out of the hot path; the only translated processes left per
+      # run are the smoke test's. native freetype is needed because sfnt2fon
+      # links it and the x86_64 nix libs above are the wrong arch here.
+      - name: native tools build
+        run: |
+          NIXPKGS="github:NixOS/nixpkgs/nixos-25.05"
+          outs=$(nix build --no-link --print-out-paths \
+            "$NIXPKGS#freetype.dev" "$NIXPKGS#freetype.out" \
+            "$NIXPKGS#libpng.dev" "$NIXPKGS#zlib.dev" \
+            "$NIXPKGS#brotli.dev" "$NIXPKGS#bzip2.dev")
+          pcp=""
+          for d in $outs; do
+            [ -d "$d/lib/pkgconfig" ] && pcp="$d/lib/pkgconfig:$pcp"
+          done
+          export PATH="$NIX_TOOL_PATH$PATH"
+          export SDKROOT="$(/usr/bin/xcrun --show-sdk-path)"
+          export CC="ccache /usr/bin/clang"
+          export PKG_CONFIG_PATH="$pcp"
+          mkdir build-tools && cd build-tools
+          ../winecx/configure \
+            --without-x --without-wayland --without-gstreamer \
+            --without-oss --without-alsa --without-pulse --without-sane \
+            --without-usb --without-v4l2 --without-pcap --without-capi \
+            --without-opencl --without-ffmpeg --without-cups \
+            --disable-tests
+          make -j"$(sysctl -n hw.ncpu)" __tooldeps__
+
       - name: wine-mono, wine-gecko and the graphics payloads
         run: |
           set -eu
@@ -235,6 +268,7 @@ jobs:
           mkdir build && cd build
           ../winecx/configure \
             --host=x86_64-apple-darwin24 \
+            --with-wine-tools=../build-tools \
             --enable-archs=i386,x86_64 \
             --disable-tests \
             --without-x --without-wayland --without-gstreamer \
