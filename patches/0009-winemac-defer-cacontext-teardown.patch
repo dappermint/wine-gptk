@@ -1,42 +1,47 @@
-winemac: Keep the outgoing CAContext alive until its successor publishes.
+winemac: Keep the outgoing CAContext alive until this window makes its next one.
 
-Following on from keeping the outgoing CALayerHost in the hosting window: that
-alone is not enough, because a CALayerHost owns no pixels.  It mirrors a remote
-CAContext, so the moment the rendering process tears its context down the
-hosting window has nothing to show regardless of what the hosting side does
-with its layers.  The residual flash after that change is this teardown.
+A CALayerHost owns no pixels: it mirrors a remote CAContext.  The hosting
+window therefore has nothing to show the instant the rendering process tears
+its context down, and a client that resizes does not resize in place -- it
+destroys the whole client surface and builds a new one -- so that teardown
+lands in the middle of every resize step.  Measured on steam's client with
+WINEDEBUG=trace+macdrv, one resize step produces two client_surface_destroy
+calls and RELEASE(old) before CREATE(new).  The result is one black frame per
+step, which an interactive drag turns into visible strobing.
 
-A resizing client destroys its whole client surface and builds a new one, so
-CAContextSwapChain dealloc ran mid-resize and released the context, its metal
-layer and the container together.  Hold that set back instead and release it
-when the next swapchain is torn down, by which time a successor context has
-long since published.  Exactly one set is ever held, so nothing accumulates.
+Hold the outgoing context, its metal layer and the container back, and release
+them when this window's next swapchain is torn down, by which point a successor
+has long since published.
 
-Together with the hosting-side change the sequence is now continuous: the old
-context keeps publishing its last frame, the new host is stacked above the old
-one, and the old host is only dropped once its replacement has taken over.
-The held set is keyed by hwnd rather than a single global slot: a window can
-host more than one cross-process surface at a time, and with one slot only the
-last context released was covered.  Measured on steam -- its library is a
-single surface and stopped flashing, its store page has a separate renderer
-surface and did not.
+Keyed by hwnd, not a single global slot: a window can host more than one
+cross-process surface at a time -- steam's store page has a separate renderer
+surface from the client chrome, its library does not -- and with one slot only
+whichever context was released last is covered, so the store page kept flashing
+while the library stopped.
+
+Only the publisher's half of the pair is held.  An earlier version of this also
+retained the hosting side's CALayerHost, on the theory that keeping it in the
+tree preserved the last frame; it does not, for the reason in the first
+paragraph, and once its context was released that host became a permanently
+black layer in the window -- the store page flashed and then stayed black.
+
 diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
-index 949c175..ab95f2f 100644
+index 1de9f0a..55a18c6 100644
 --- a/dlls/winemac.drv/cocoa_window.m
 +++ b/dlls/winemac.drv/cocoa_window.m
-@@ -4118,6 +4118,11 @@ @interface CAContextSwapChain : NSObject <WineMetalSwapChain>
+@@ -4089,6 +4089,11 @@ @interface CAContextSwapChain : NSObject <WineMetalSwapChain>
  
  - (instancetype) initWithHwnd:(void*)hwnd container:(CGRect)container frame:(CGRect)frame;
  - (void) setContainer:(CGRect)container frame:(CGRect)frame;
-++ (void) deferTeardownOfContext:(CAContext *)context
-+                         layer:(CAMetalLayer *)layer
-+                     container:(CALayer *)container
-+                        device:(macdrv_metal_device)dev
-+                       forHwnd:(void *)owner;
+++ (void) deferTeardownForHwnd:(void *)owner
++                     context:(CAContext *)context
++                       layer:(CAMetalLayer *)layer
++                   container:(CALayer *)container
++                      device:(macdrv_metal_device)dev;
  
  @end
  
-@@ -4201,14 +4206,19 @@ - (CAMetalLayer*) layer
+@@ -4172,14 +4177,19 @@ - (CAMetalLayer*) layer
      return offscreen_layer;
  }
  
@@ -47,69 +52,48 @@ index 949c175..ab95f2f 100644
 -    CAMetalLayer *layer = offscreen_layer;
 -    CALayer *container = container_layer;
 -    macdrv_metal_device dev = device;
-+/* A CALayerHost owns no pixels: it mirrors a remote CAContext, so the instant
-+   this process tears its context down the hosting window has nothing to show,
-+   no matter what the hosting side does with its layers.  A client that resizes
-+   destroys the whole surface and builds a new one, so releasing here left a gap
-+   with no content anywhere -- one black frame per resize step.
++/* A CALayerHost owns no pixels: it mirrors a remote CAContext.  The hosting
++   window therefore goes blank the instant this process tears its context down,
++   and a resizing client destroys its whole surface and builds a new one, so
++   that teardown lands mid-resize -- one black frame per step.
  
-+   Keep the outgoing context, and the layers it publishes, alive until the next
-+   swapchain has published its replacement.  Exactly one is held back, and it is
-+   released as soon as a successor exists or the process is done creating them,
-+   so nothing accumulates. */
++   Keep the outgoing context, and the layers it publishes, alive until this
++   window creates its next one.  Keyed by hwnd because a window can host more
++   than one cross-process surface at a time (steam's store page has a separate
++   renderer surface from the client chrome, its library does not), so a single
++   global slot would only ever cover whichever context was released last. */
 +static void release_swapchain_resources(CAContext *context, CAMetalLayer *layer,
 +                                        CALayer *container, macdrv_metal_device dev)
 +{
      OnMainThreadAsync(^{
          [context setLayer:nil];
          [context release];
-@@ -4216,10 +4226,60 @@ - (void) dealloc
+@@ -4187,6 +4197,50 @@ - (void) dealloc
          [container release];
          if (dev) macdrv_release_metal_device(dev);
      });
 +}
 +
-+- (void) dealloc
+++ (void) deferTeardownForHwnd:(void *)owner
++                     context:(CAContext *)context
++                       layer:(CAMetalLayer *)layer
++                   container:(CALayer *)container
++                      device:(macdrv_metal_device)dev
 +{
-+    if (context_id) macdrv_release_remote_layer(hwnd, context_id);
-+
-+    /* handing these to the deferred slot rather than releasing them now */
-+    [CAContextSwapChain deferTeardownOfContext:remote_context
-+                                         layer:offscreen_layer
-+                                     container:container_layer
-+                                        device:device
-+                                       forHwnd:hwnd];
- 
-     [super dealloc];
- }
- 
-++ (void) deferTeardownOfContext:(CAContext *)context
-+                         layer:(CAMetalLayer *)layer
-+                     container:(CALayer *)container
-+                        device:(macdrv_metal_device)dev
-+                       forHwnd:(void *)owner
-+{
-+    /* keyed by hwnd, not a single global slot.  a window can host more than
-+       one cross-process surface at a time -- steam's store page has a separate
-+       renderer surface from the client chrome, its library does not -- and a
-+       single slot only ever covers whichever context happened to be released
-+       last, leaving the others to blank exactly as before.  one held set per
-+       window bounds this the same way while covering all of them. */
 +    static NSMutableDictionary<NSNumber *, NSArray *> *held;
 +    NSNumber *key = @((uintptr_t)owner);
-+    NSArray *previous;
++    NSArray *prev;
 +
 +    if (!held) held = [[NSMutableDictionary alloc] init];
 +
-+    previous = [held objectForKey:key];
-+    if (previous)
++    if ((prev = [[held objectForKey:key] retain]))
 +    {
-+        /* superseded: this window already published a replacement */
-+        release_swapchain_resources([previous objectAtIndex:0] == [NSNull null] ? nil : [previous objectAtIndex:0],
-+                                    [previous objectAtIndex:1] == [NSNull null] ? nil : [previous objectAtIndex:1],
-+                                    [previous objectAtIndex:2] == [NSNull null] ? nil : [previous objectAtIndex:2],
-+                                    (macdrv_metal_device)[[previous objectAtIndex:3] pointerValue]);
 +        [held removeObjectForKey:key];
++        release_swapchain_resources([prev objectAtIndex:0] == [NSNull null] ? nil : [prev objectAtIndex:0],
++                                    [prev objectAtIndex:1] == [NSNull null] ? nil : [prev objectAtIndex:1],
++                                    [prev objectAtIndex:2] == [NSNull null] ? nil : [prev objectAtIndex:2],
++                                    (macdrv_metal_device)[[prev objectAtIndex:3] pointerValue]);
++        [prev release];
 +    }
 +
 +    if (!context && !layer && !container && !dev) return;
@@ -121,6 +105,17 @@ index 949c175..ab95f2f 100644
 +             forKey:key];
 +}
 +
- @end
++- (void) dealloc
++{
++    /* the hosting side drops its CALayerHost as usual; only the publisher's
++       side of the pair is held back, so nothing dead is left in a layer tree */
++    if (context_id) macdrv_release_remote_layer(hwnd, context_id);
++
++    [CAContextSwapChain deferTeardownForHwnd:hwnd
++                                     context:remote_context
++                                       layer:offscreen_layer
++                                   container:container_layer
++                                      device:device];
  
- macdrv_metal_swapchain macdrv_create_view_swapchain(macdrv_view v)
+     [super dealloc];
+ }
