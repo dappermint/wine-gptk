@@ -279,12 +279,21 @@ jobs:
           cp -R addons/mono/* Libraries/Wine/share/wine/mono/
           cp -R addons/gecko/* Libraries/Wine/share/wine/gecko/
 
-          # dxmt ships a wine-side builtin half as well as the per-bottle
-          # dlls; the builtin half is what puts winemetal.so in the tree
+          # dxmt's wine-side half is ONLY the winemetal bridge. copying the whole
+          # payload dir in here overwrote wine's builtin d3d11/dxgi with dxmt's,
+          # which made every fresh prefix run dxmt silently -- and dxmt refuses
+          # the cross-process swapchains steam's post-2026-08 webhelper creates
+          # ("CreateSwapChain: cross-process swapchain not supported yet"), so
+          # the login window never mapped. it also put nvapi64.dll in the
+          # builtins, which must never be visible to the webhelper. the d3d
+          # frontends stay per-bottle in Libraries/DXMT, deployed by whisky's
+          # backend picker with explicit overrides.
           dxmt=payload/v$DXMT_VERSION
           cp -R "$dxmt/x86_64-unix/." Libraries/Wine/lib/wine/x86_64-unix/
-          cp -R "$dxmt/x86_64-windows/." Libraries/Wine/lib/wine/x86_64-windows/
-          cp -R "$dxmt/i386-windows/." Libraries/Wine/lib/wine/i386-windows/
+          cp "$dxmt/x86_64-windows/winemetal.dll" Libraries/Wine/lib/wine/x86_64-windows/
+          if [ -f "$dxmt/i386-windows/winemetal.dll" ]; then
+            cp "$dxmt/i386-windows/winemetal.dll" Libraries/Wine/lib/wine/i386-windows/
+          fi
 
           # and the per-bottle payloads whisky's backend picker offers
           dxvk=payload/dxvk-macOS-async-v$DXVK_VERSION-20230507-repack
@@ -449,6 +458,17 @@ jobs:
           # without a d3d11 implementation chromium cannot start a gl context
           [ -f Libraries/DXVK/x64/d3d11.dll ] || { echo "::error::no dxvk payload"; exit 1; }
           [ -f Libraries/Wine/lib/wine/x86_64-unix/winemetal.so ] || { echo "::error::no dxmt builtin"; exit 1; }
+          # the builtin d3d must be wine's own: a dxmt-flavoured builtin hijacks
+          # every prefix that has no explicit override and cannot serve steam's
+          # cross-process webhelper swapchains
+          for d in d3d11 dxgi d3d10core; do
+            if strings "Libraries/Wine/lib/wine/x86_64-windows/$d.dll" 2>/dev/null | grep -q 'DXMT_\|dxmt\.con'; then
+              echo "::error::builtin $d.dll is dxmt, not wine"; exit 1
+            fi
+          done
+          if [ -f Libraries/Wine/lib/wine/x86_64-windows/nvapi64.dll ]; then
+            echo "::error::nvapi64.dll leaked into the builtins"; exit 1
+          fi
           echo "addons and graphics payloads: ok"
 
       - name: verify the runtime can open a window
