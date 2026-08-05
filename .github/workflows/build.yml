@@ -265,12 +265,19 @@ jobs:
         run: |
           export PATH="$PWD/ccache-bin:$NIX_TOOL_PATH$PATH"
           cd build
-          make install DESTDIR="$PWD/../staging"
+          # install-lib, not install: the full install target re-generates an
+          # import lib per dll (thousands of winebuild spawns, each taxed by
+          # macOS's per-exec rosetta analytics) and the strip step used to
+          # delete every one of those .a files anyway. measured 2026-08-05:
+          # the relink phase alone was ~25 minutes of the packaging step.
+          make install-lib DESTDIR="$PWD/../staging"
           cd ..
           mkdir -p Libraries/Wine
-          cp -R staging/opt/whiskywine/bin Libraries/Wine/bin
-          cp -R staging/opt/whiskywine/lib Libraries/Wine/lib
-          cp -R staging/opt/whiskywine/share Libraries/Wine/share
+          # cp -c is an apfs clone: metadata only, no byte copy. fallback for
+          # non-apfs filesystems
+          cp -Rc staging/opt/whiskywine/bin Libraries/Wine/bin 2>/dev/null || cp -R staging/opt/whiskywine/bin Libraries/Wine/bin
+          cp -Rc staging/opt/whiskywine/lib Libraries/Wine/lib 2>/dev/null || cp -R staging/opt/whiskywine/lib Libraries/Wine/lib
+          cp -Rc staging/opt/whiskywine/share Libraries/Wine/share 2>/dev/null || cp -R staging/opt/whiskywine/share Libraries/Wine/share
 
           # the addons go in extracted, in the same place the stock engine
           # puts them, so mscoree and mshtml find them in the datadir and no
@@ -307,8 +314,12 @@ jobs:
           # 332MB. one file per invocation, since a non-COFF entry would
           # otherwise take the rest of its batch down with it.
           find Libraries/Wine/lib/wine/*-windows -name '*.a' -delete
+          # batched: gnu strip prints an error for a non-COFF file and keeps
+          # going with the rest of the batch (verified 2026-08-05), so the
+          # old one-file-per-spawn form burned ~10k process launches, each
+          # taxed by the rosetta analytics daemons
           find Libraries/Wine/lib/wine/*-windows -type f -print0 \
-            | xargs -0 -P "$(sysctl -n hw.logicalcpu)" -n 1 \
+            | xargs -0 -P "$(sysctl -n hw.logicalcpu)" -n 64 \
                 x86_64-w64-mingw32-strip --strip-debug 2>/dev/null || true
           # CW HACK 22144: on apple without a preloader the loader expects its
           # own binary to be named wineloader; whisky expects wine64
@@ -407,7 +418,9 @@ jobs:
           PLIST
           sed -i '' "s/DXVK_VER/$DXVK_VERSION/; s/DXMT_VER/$DXMT_VERSION/" Libraries/WhiskyWineVersion.plist
 
-          tar -czf Libraries.tar.gz Libraries
+          # gzip -3: the ci artifact gets zipped again by upload-artifact
+          # anyway, and -9-grade compression here bought ~4 minutes for ~6%
+          tar -cf - Libraries | gzip -3 > Libraries.tar.gz
           shasum -a 256 Libraries.tar.gz | tee Libraries.tar.gz.sha256
 
       - name: verify the tree is relocatable
