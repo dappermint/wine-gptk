@@ -5,34 +5,41 @@ MR !6866 switched macOS from TSD coexistence to gsbase swapping and names
 D3DMetal as a casualty that "will need to be changed to use Unix calls"; this is
 that route rather than a port of CrossOver's TSD model.
 
-Three mechanisms:
   - ntdll loads libd3dshared.dylib, flips its internal enableUnixCall flag by
-    walking the mach-o symtab, and calls its three Patch* entry points, so the
-    PE side reaches wine through __wine_unix_call instead of jumping straight
-    into native code
+    walking the mach-o symtab, and calls its three Patch* entry points
   - every native PE region is registered with rosetta via
-    register_non_native_code_region, which is what lets rosetta use the windows
-    TEB for %gs inside those regions -- the TLS seam is crossed on Apple's side
-    rather than by changing wine's
-  - D3DMetal's own worker threads are detected by their thunk prologue and
-    routed through __wine_native_thread_start, so they run with a native stack
+    register_non_native_code_region, so rosetta uses the windows TEB for %gs
+    inside those regions -- the TLS seam is crossed on Apple's side
+  - D3DMetal's worker threads are detected by their thunk prologue and routed
+    through __wine_native_thread_start so they run with a native stack
 
-Ported rather than applied: soju's patches are zero-context diffs against wine
-11.0 and place purely by line number, so most hunks land in the wrong function
-on 11.14.  Each was re-placed against a named anchor, plus three real changes:
+Ported rather than applied: soju's are zero-context diffs against wine 11.0 that
+place purely by line number, so most hunks land in the wrong function on 11.14.
+Each was re-placed against a named anchor.  Real 11.14 differences:
 
   - struct ntdll_thread_data and ntdll_get_thread_data() were renamed to
-    struct thread_data and get_thread_data() in wine 11
-  - NtCreateThreadEx no longer assigns thread_data->start itself; wine 11 moved
-    that into create_server_thread(), so the thread bridge hooks there instead,
-    which also covers PsCreateSystemThread since it shares the helper
-  - virtual_map_module() was restructured; the native-region registration now
-    hangs off the STATUS_IMAGE_ALREADY_LOADED path, which is the case where a
-    real PE image was mapped rather than replaced by a builtin
+    struct thread_data and get_thread_data()
+  - NtCreateThreadEx no longer assigns thread_data->start; wine 11 moved that
+    into create_server_thread(), so the thread bridge hooks there, which also
+    covers PsCreateSystemThread since it shares the helper
+  - virtual_map_module() was restructured, so native-region registration hangs
+    off the STATUS_IMAGE_ALREADY_LOADED path -- a real PE image rather than a
+    builtin
+  - register_non_native_code_region() for the main image must come AFTER
+    init_startup_info(), because that is what calls load_main_exe(); earlier
+    and the image is not mapped yet
 
-Builds clean; ntdll.so exports __wine_native_thread_start, run_native_thread,
-register_non_native_code_region and winemac.so exports macdrv_functions.
-Runtime behaviour is not yet verified.
+The entry in unix_call_funcs[] goes at the END, matching where
+unix_run_native_thread sits in enum ntdll_unix_funcs.  Putting it at the head
+of the table while the enum has it last shifts every unix call by one index,
+which corrupts the whole unix-call ABI: wineboot and cmd both die with
+c0000005 in a system thread.  The same applies to unix_call_wow64_funcs[].
+
+Verified on a tree configured exactly as CI is (--host=x86_64-apple-darwin24,
+--enable-archs=i386,x86_64): builds clean, wineboot and cmd both exit 0, and
+ntdll.so exports __wine_native_thread_start, run_native_thread and
+register_non_native_code_region.  D3DMetal itself is not yet exercised.
+
 diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
 index d0912cc..5db62c3 100644
 --- a/dlls/ntdll/ntdll.spec
@@ -70,7 +77,7 @@ index fe083be..a8ee93c 100644
  /***********************************************************************
   *           RtlExitUserThread  (NTDLL.@)
 diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
-index e9b8375..4a6853b 100644
+index e9b8375..875ac6e 100644
 --- a/dlls/ntdll/unix/loader.c
 +++ b/dlls/ntdll/unix/loader.c
 @@ -67,6 +67,8 @@
@@ -236,15 +243,15 @@ index e9b8375..4a6853b 100644
  
  /* die on a fatal error; use only during initialization */
  static void fatal_error( const char *err, ... )
-@@ -1008,6 +1150,7 @@ static NTSTATUS unwind_builtin_dll( void *args )
- 
- static const unixlib_entry_t unix_call_funcs[] =
- {
+@@ -1016,6 +1158,7 @@ static const unixlib_entry_t unix_call_funcs[] =
+     unixcall_wine_server_handle_to_fd,
+     unixcall_wine_spawnvp,
+     system_time_precise,
 +    run_native_thread,
-     load_so_dll,
-     unwind_builtin_dll,
-     unixcall_wine_dbg_write,
-@@ -1023,9 +1166,11 @@ static const unixlib_entry_t unix_call_funcs[] =
+ };
+ 
+ 
+@@ -1023,6 +1166,7 @@ static const unixlib_entry_t unix_call_funcs[] =
  
  static NTSTATUS wow64_load_so_dll( void *args ) { return STATUS_INVALID_IMAGE_FORMAT; }
  static NTSTATUS wow64_unwind_builtin_dll( void *args ) { return STATUS_UNSUCCESSFUL; }
@@ -252,10 +259,14 @@ index e9b8375..4a6853b 100644
  
  const unixlib_entry_t unix_call_wow64_funcs[] =
  {
+@@ -1034,6 +1178,7 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
+     wow64_wine_server_handle_to_fd,
+     wow64_wine_spawnvp,
+     system_time_precise,
 +    wow64_run_native_thread,
-     wow64_load_so_dll,
-     wow64_unwind_builtin_dll,
-     wow64_wine_dbg_write,
+ };
+ 
+ #endif  /* _WIN64 */
 @@ -1437,6 +1582,11 @@ static NTSTATUS open_main_image( UNICODE_STRING *nt_name, void **module, SECTION
      if (!status)
      {
@@ -276,15 +287,19 @@ index e9b8375..4a6853b 100644
      GET_FUNC( DbgUiRemoteBreakin );
      GET_FUNC( KiRaiseUserExceptionDispatcher );
      GET_FUNC( KiUserExceptionDispatcher );
-@@ -1859,6 +2010,8 @@ static void start_main_thread(void)
+@@ -1859,10 +2010,12 @@ static void start_main_thread(void)
      dbg_init();
      startup_info_size = server_init_process();
      msync_init();
 +    init_non_native_support();
-+    register_non_native_code_region( main_image_base, main_image_size );
      virtual_map_user_shared_data();
      init_cpu_info();
      init_files();
+     init_startup_info();
++    register_non_native_code_region( main_image_base, main_image_size );
+     *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();
+     set_load_order_app_name( main_wargv[0] );
+     init_thread_stack( teb, 0, 0, 0 );
 diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
 index 546963a..02ebd46 100644
 --- a/dlls/ntdll/unix/thread.c
