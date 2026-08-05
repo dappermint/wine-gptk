@@ -46,13 +46,13 @@ index d0912cc..5db62c3 100644
  @ stdcall -syscall NtCreateToken(ptr long ptr long ptr ptr ptr ptr ptr ptr ptr ptr ptr)
  @ stdcall -syscall NtCreateTransaction(ptr long ptr ptr long long long long ptr ptr)
 diff --git a/dlls/ntdll/thread.c b/dlls/ntdll/thread.c
-index fe083be..1e40e66 100644
+index fe083be..a8ee93c 100644
 --- a/dlls/ntdll/thread.c
 +++ b/dlls/ntdll/thread.c
-@@ -196,6 +196,18 @@ int __cdecl __wine_dbg_output( const char *str )
-  *           set_native_thread_name
-  */
- void set_native_thread_name( DWORD tid, const char *name )
+@@ -229,6 +229,19 @@ void set_native_thread_name( DWORD tid, const char *name )
+         NtClose(h);
+ }
+ 
 +/***********************************************************************
 + *           __wine_native_thread_start  (NTDLL.@)
 + */
@@ -65,9 +65,10 @@ index fe083be..1e40e66 100644
 +    if ((status = WINE_UNIX_CALL( unix_run_native_thread, &params ))) return status;
 +    return params.result;
 +}
- {
-     THREAD_NAME_INFORMATION info;
-     HANDLE h = GetCurrentThread();
++
+ 
+ /***********************************************************************
+  *           RtlExitUserThread  (NTDLL.@)
 diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
 index e9b8375..4a6853b 100644
 --- a/dlls/ntdll/unix/loader.c
