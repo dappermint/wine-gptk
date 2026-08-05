@@ -24,9 +24,15 @@ This adopts that design:
     CrossOver's wine 11 versions
   - server/inproc_sync.c and dlls/ntdll/unix/sync.c gain the __APPLE__ branch,
     converted to wine 11.14's designated-initializer object_ops style
-  - no protocol.def changes, no object_ops extension, no per-type hooks: the
-    old port needed 23 protocol entries and touched a dozen server files,
-    this needs none of them
+  - one protocol field, get_inproc_sync_fd's reply gains shm_idx, because an
+    shm index is not a descriptor and cannot travel over the socket; the same
+    reasoning adds a do_msync() branch to get_inproc_alert_fd and to the three
+    client sites that would otherwise call wine_server_receive_fd()
+  - msync_init_shm()/msync_init() in server/main.c and msync_init() in the
+    client loader: without these do_msync() reports enabled while nothing is
+    initialised, and every wait parks forever
+  - no object_ops extension and no per-type hooks: the old port needed 23
+    protocol entries and touched a dozen server files
 
 Dropped with the old port: its esync half, which has no equivalent in
 CrossOver's macOS branch and which crashed the wineserver outright here
@@ -35,7 +41,6 @@ NtWaitForSingleObject hook, which is unnecessary because that path already
 goes through inproc_wait().
 
 Both halves build clean.  Runtime behaviour is not yet verified.
-
 diff --git a/dlls/ntdll/Makefile.in b/dlls/ntdll/Makefile.in
 index 9a15bc3..7a73243 100644
 --- a/dlls/ntdll/Makefile.in
@@ -48,6 +53,26 @@ index 9a15bc3..7a73243 100644
  	unix/server.c \
  	unix/signal_arm.c \
  	unix/signal_arm64.c \
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index c1321ce..e9b8375 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -86,6 +86,7 @@
+ #include "winioctl.h"
+ #include "winternl.h"
+ #include "unix_private.h"
++#include "msync.h"
+ #include "wine/list.h"
+ #include "wine/debug.h"
+ 
+@@ -1857,6 +1858,7 @@ static void start_main_thread(void)
+ 
+     dbg_init();
+     startup_info_size = server_init_process();
++    msync_init();
+     virtual_map_user_shared_data();
+     init_cpu_info();
+     init_files();
 diff --git a/dlls/ntdll/unix/msync.c b/dlls/ntdll/unix/msync.c
 new file mode 100644
 index 0000000..ae46bf3
@@ -1272,7 +1297,7 @@ index 0000000..43af926
 +
 +#endif /* __APPLE__ */
 diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
-index fbf054e..a3511af 100644
+index fbf054e..b05d355 100644
 --- a/dlls/ntdll/unix/sync.c
 +++ b/dlls/ntdll/unix/sync.c
 @@ -70,6 +70,7 @@
@@ -1338,6 +1363,79 @@ index fbf054e..a3511af 100644
  #else /* NTSYNC_IOC_EVENT_READ */
  
  static NTSTATUS linux_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
+@@ -634,7 +683,14 @@ static void release_inproc_sync( struct inproc_sync *sync )
+     LONG ref = InterlockedDecrement( &sync->refcount );
+ 
+     assert( ref >= 0 );
+-    if (!ref) close( fd );
++    if (!ref)
++    {
++        /* an shm index is not a descriptor */
++        if (do_msync())
++            msync_close( fd );
++        else
++            close( fd );
++    }
+ }
+ 
+ static struct inproc_sync *get_cached_inproc_sync( HANDLE handle )
+@@ -675,8 +731,15 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync
+         {
+             obj_handle_t fd_handle;
+             sync->refcount = 1;
+-            sync->fd = wine_server_receive_fd( &fd_handle );
+-            assert( wine_server_ptr_handle(fd_handle) == handle );
++            if (do_msync())
++            {
++                sync->fd = reply->shm_idx;
++            }
++            else
++            {
++                sync->fd = wine_server_receive_fd( &fd_handle );
++                assert( wine_server_ptr_handle(fd_handle) == handle );
++            }
+             sync->access = reply->access;
+             sync->type = reply->type;
+             sync->closed = 0;
+@@ -884,8 +947,15 @@ static int get_inproc_alert_fd(void)
+         {
+             if (!server_call_unlocked( req ))
+             {
+-                data->alert_fd = fd = wine_server_receive_fd( &token );
+-                assert( token == reply->handle );
++                if (do_msync())
++                {
++                    data->alert_fd = fd = reply->handle;
++                }
++                else
++                {
++                    data->alert_fd = fd = wine_server_receive_fd( &token );
++                    assert( token == reply->handle );
++                }
+             }
+         }
+         SERVER_END_REQ;
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index b667504..27b2494 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -6061,6 +6061,8 @@ struct get_inproc_sync_fd_reply
+     struct reply_header __header;
+     int           type;
+     unsigned int access;
++    unsigned int shm_idx;
++    char __pad_20[4];
+ };
+ 
+ 
+@@ -7177,6 +7179,6 @@ union generic_reply
+     struct alpc_create_port_reply alpc_create_port_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 957
++#define SERVER_PROTOCOL_VERSION 958
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
 diff --git a/server/Makefile.in b/server/Makefile.in
 index 0dd5395..28e5ff0 100644
 --- a/server/Makefile.in
@@ -1351,7 +1449,7 @@ index 0dd5395..28e5ff0 100644
  	mapping.c \
  	mutex.c \
 diff --git a/server/inproc_sync.c b/server/inproc_sync.c
-index 522d9a4..677e465 100644
+index 522d9a4..c97ceb7 100644
 --- a/server/inproc_sync.c
 +++ b/server/inproc_sync.c
 @@ -30,6 +30,7 @@
@@ -1540,6 +1638,46 @@ index 522d9a4..677e465 100644
  #else /* NTSYNC_IOC_EVENT_READ */
  
  int get_inproc_device_fd(void)
+@@ -284,7 +456,13 @@ DECL_HANDLER(get_inproc_sync_fd)
+     reply->access = get_handle_access( current->process, req->handle );
+ 
+     if ((fd = get_obj_inproc_sync( obj, &reply->type )) < 0) set_error( STATUS_NOT_IMPLEMENTED );
+-    else send_client_fd( current->process, fd, req->handle );
++    else
++    {
++        /* under msync this is an shm index rather than a descriptor, so it
++           travels in the reply instead of over the socket */
++        if (do_msync()) reply->shm_idx = (unsigned int)fd;
++        else send_client_fd( current->process, fd, req->handle );
++    }
+ 
+     release_object( obj );
+ }
+diff --git a/server/main.c b/server/main.c
+index 46419a0..9ffd807 100644
+--- a/server/main.c
++++ b/server/main.c
+@@ -39,6 +39,7 @@
+ #include "file.h"
+ #include "thread.h"
+ #include "request.h"
++#include "msync.h"
+ #include "unicode.h"
+ 
+ /* command-line options */
+@@ -257,7 +258,12 @@ int main( int argc, char *argv[] )
+     init_limits();
+ 
+     sock_init();
++    /* the shm has to exist before any client can attach, and msync_init must
++       follow the master socket so the mach bootstrap name is registered once
++       the server is reachable -- this is CrossOver's ordering */
++    msync_init_shm();
+     open_master_socket();
++    msync_init();
+ 
+     if (debug_level) fprintf( stderr, "wineserver: starting (pid=%ld)\n", (long) getpid() );
+     set_current_time();
 diff --git a/server/msync.c b/server/msync.c
 new file mode 100644
 index 0000000..eecf9b3
@@ -2424,3 +2562,68 @@ index 0000000..4d834c4
 +extern void msync_abandon_mutexes( thread_id_t tid );
 +
 +#endif /* __APPLE__ */
+diff --git a/server/protocol.def b/server/protocol.def
+index 1399b69..766c6c9 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4223,6 +4223,7 @@ enum inproc_sync_type
+ @REPLY
+     int           type;         /* inproc sync type */
+     unsigned int access;        /* handle access rights */
++    unsigned int shm_idx;       /* optional for index-based sync implementations */
+ @END
+ 
+ 
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index 0528795..11f07b0 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -2330,7 +2330,8 @@ C_ASSERT( offsetof(struct get_inproc_sync_fd_request, handle) == 12 );
+ C_ASSERT( sizeof(struct get_inproc_sync_fd_request) == 16 );
+ C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, type) == 8 );
+ C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, access) == 12 );
+-C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 16 );
++C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, shm_idx) == 16 );
++C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 24 );
+ C_ASSERT( sizeof(struct get_inproc_alert_fd_request) == 16 );
+ C_ASSERT( offsetof(struct get_inproc_alert_fd_reply, handle) == 8 );
+ C_ASSERT( sizeof(struct get_inproc_alert_fd_reply) == 16 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 50fa4a9..78cc200 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3411,6 +3411,7 @@ static void dump_get_inproc_sync_fd_reply( const struct get_inproc_sync_fd_reply
+ {
+     fprintf( stderr, " type=%d", req->type );
+     fprintf( stderr, ", access=%08x", req->access );
++    fprintf( stderr, ", shm_idx=%08x", req->shm_idx );
+ }
+ 
+ static void dump_get_inproc_alert_fd_request( const struct get_inproc_alert_fd_request *req )
+diff --git a/server/thread.c b/server/thread.c
+index f0f128a..a7e3e54 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -59,6 +59,7 @@
+ #include "request.h"
+ #include "user.h"
+ #include "security.h"
++#include "msync.h"
+ 
+ 
+ /* thread queues */
+@@ -2376,6 +2377,14 @@ DECL_HANDLER(get_inproc_alert_fd)
+     if ((fd = get_inproc_sync_fd( current->alert_sync )) < 0) set_error( STATUS_INVALID_PARAMETER );
+     else
+     {
++        /* under msync this is an shm index, not a descriptor: it cannot be
++           passed over the socket, so return it in the reply directly */
++        if (do_msync())
++        {
++            reply->handle = (unsigned int)fd;
++            return;
++        }
++
+         reply->handle = get_thread_id( current ) | 1; /* arbitrary token */
+         send_client_fd( current->process, fd, reply->handle );
+     }
