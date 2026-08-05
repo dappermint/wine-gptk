@@ -86,7 +86,12 @@ jobs:
             echo "CCACHE_INODECACHE=1"
           } >> "$GITHUB_ENV"
 
+      # only on hosted runners. the self-hosted runner keeps its ccache on a
+      # local volume across runs, so round-tripping gigabytes to github's cache
+      # service just to overwrite an already-correct cache is pure latency --
+      # measured 2026-08-05, it stalled a build for minutes at a trickle.
       - name: restore compiler cache
+        if: inputs.runner == 'hosted'
         uses: actions/cache@v4
         with:
           path: ~/.ccache
