@@ -791,3 +791,18 @@ environment variables set.
  #endif
                     "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
                     "movq %r8,%rdi\n\t"             /* args */
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -346,6 +346,12 @@
+ {
+     void *handle;
+     char *path;
++
++    /* The d3dmetal bridge is opt-in.  With gptk deployed it gets d3d12 as far
++       as a feature-level 12_2 device, but device methods still fault on the
++       native vtable path, so leaving it on by default would replace wine's
++       working (if slower) vkd3d with a crash.  Set WINE_D3DMETAL=1 to enable. */
++    if (!getenv( "WINE_D3DMETAL" )) return;
+ 
+     if (asprintf( &path, "%s/../../external/libd3dshared.dylib", ntdll_dir ) == -1) return;
+     handle = dlopen( path, RTLD_NOW | RTLD_GLOBAL );
