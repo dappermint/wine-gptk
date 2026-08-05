@@ -262,20 +262,28 @@ jobs:
           # -O2 unless asked otherwise: what wine itself ships and where a
           # push build should stay. -O3 is opt-in for runtimes we release,
           # -O0 for runs that only need to answer whether a patch works
+          # thin LTO applies to the clang-built unix half only: the PE half is
+          # mingw-w64 gcc, where -flto=thin is not a valid flag.  ar/ranlib must
+          # understand llvm bitcode for this, hence the llvm- prefixed tools.
+          LTO=""
           case "$OPT_LEVEL" in
-            release) OPT="-O3" ;;
+            release)
+              OPT="-O3"
+              LTO="-flto=thin"
+              export AR=llvm-ar RANLIB=llvm-ranlib NM=llvm-nm
+              ;;
             fast)
               OPT="-O0"
               echo "::warning::fast build, -O0; do not publish this artifact"
               ;;
             *) OPT="-O2" ;;
           esac
-          echo "optimisation: $OPT" | tee -a "$GITHUB_STEP_SUMMARY"
-          export CFLAGS="$OPT -Wno-error=implicit-function-declaration $NIX_INCS"
+          echo "optimisation: $OPT${LTO:+ $LTO (unix half only)}" | tee -a "$GITHUB_STEP_SUMMARY"
+          export CFLAGS="$OPT $LTO -Wno-error=implicit-function-declaration $NIX_INCS"
           # the PE half is built by mingw-w64 gcc and takes CROSSCFLAGS, which
           # otherwise defaults to "-g -O2"
           export CROSSCFLAGS="-g $OPT"
-          export LDFLAGS="$NIX_LDFS"
+          export LDFLAGS="$LTO $NIX_LDFS"
           export ac_cv_lib_soname_freetype="libfreetype.6.dylib"
           export ac_cv_lib_soname_gnutls="libgnutls.30.dylib"
           # wine dlopens MoltenVK by soname; the bundled copy is found via
