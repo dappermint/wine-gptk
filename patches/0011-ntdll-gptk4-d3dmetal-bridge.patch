@@ -1,0 +1,473 @@
+ntdll: Bridge Apple's GPTK 4 D3DMetal onto wine 11.14.
+
+Ported from rishiad/soju-wine, which proves the approach on wine 11.0.  Upstream
+MR !6866 switched macOS from TSD coexistence to gsbase swapping and names
+D3DMetal as a casualty that "will need to be changed to use Unix calls"; this is
+that route rather than a port of CrossOver's TSD model.
+
+Three mechanisms:
+  - ntdll loads libd3dshared.dylib, flips its internal enableUnixCall flag by
+    walking the mach-o symtab, and calls its three Patch* entry points, so the
+    PE side reaches wine through __wine_unix_call instead of jumping straight
+    into native code
+  - every native PE region is registered with rosetta via
+    register_non_native_code_region, which is what lets rosetta use the windows
+    TEB for %gs inside those regions -- the TLS seam is crossed on Apple's side
+    rather than by changing wine's
+  - D3DMetal's own worker threads are detected by their thunk prologue and
+    routed through __wine_native_thread_start, so they run with a native stack
+
+Ported rather than applied: soju's patches are zero-context diffs against wine
+11.0 and place purely by line number, so most hunks land in the wrong function
+on 11.14.  Each was re-placed against a named anchor, plus three real changes:
+
+  - struct ntdll_thread_data and ntdll_get_thread_data() were renamed to
+    struct thread_data and get_thread_data() in wine 11
+  - NtCreateThreadEx no longer assigns thread_data->start itself; wine 11 moved
+    that into create_server_thread(), so the thread bridge hooks there instead,
+    which also covers PsCreateSystemThread since it shares the helper
+  - virtual_map_module() was restructured; the native-region registration now
+    hangs off the STATUS_IMAGE_ALREADY_LOADED path, which is the case where a
+    real PE image was mapped rather than replaced by a builtin
+
+Builds clean; ntdll.so exports __wine_native_thread_start, run_native_thread,
+register_non_native_code_region and winemac.so exports macdrv_functions.
+Runtime behaviour is not yet verified.
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index d0912cc..5db62c3 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -208,6 +208,7 @@
+ @ stdcall -syscall NtCreateSymbolicLinkObject(ptr long ptr ptr)
+ @ stdcall -syscall=0x004e NtCreateThread(ptr long ptr long ptr ptr ptr long)
+ @ stdcall -syscall NtCreateThreadEx(ptr long ptr long ptr ptr long long long long ptr)
++@ stdcall -private __wine_native_thread_start(ptr)
+ @ stdcall -syscall NtCreateTimer(ptr long ptr long)
+ @ stdcall -syscall NtCreateToken(ptr long ptr long ptr ptr ptr ptr ptr ptr ptr ptr ptr)
+ @ stdcall -syscall NtCreateTransaction(ptr long ptr ptr long long long long ptr ptr)
+diff --git a/dlls/ntdll/thread.c b/dlls/ntdll/thread.c
+index fe083be..1e40e66 100644
+--- a/dlls/ntdll/thread.c
++++ b/dlls/ntdll/thread.c
+@@ -196,6 +196,18 @@ int __cdecl __wine_dbg_output( const char *str )
+  *           set_native_thread_name
+  */
+ void set_native_thread_name( DWORD tid, const char *name )
++/***********************************************************************
++ *           __wine_native_thread_start  (NTDLL.@)
++ */
++ULONG WINAPI __wine_native_thread_start( void *arg )
++{
++    struct native_thread_params params = { 0 };
++    NTSTATUS status;
++
++    (void)arg;
++    if ((status = WINE_UNIX_CALL( unix_run_native_thread, &params ))) return status;
++    return params.result;
++}
+ {
+     THREAD_NAME_INFORMATION info;
+     HANDLE h = GetCurrentThread();
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index e9b8375..4a6853b 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -67,6 +67,8 @@
+ # undef GetCurrentThread
+ # include <pthread.h>
+ # include <mach/mach.h>
++# include <mach-o/loader.h>
++# include <mach-o/nlist.h>
+ # include <mach/mach_error.h>
+ # include <mach-o/getsect.h>
+ # include <crt_externs.h>
+@@ -105,6 +107,7 @@ void *pKiUserEmulationDispatcher = NULL;
+ void *pLdrInitializeThunk = NULL;
+ void *pRtlUserThreadStart = NULL;
+ void *p__wine_ctrl_routine = NULL;
++void *p__wine_native_thread_start = NULL;
+ SYSTEM_DLL_INIT_BLOCK *pLdrSystemDllInitBlock = NULL;
+ 
+ #ifdef __GNUC__
+@@ -126,6 +129,145 @@ const char **dll_paths = NULL;
+ const char **system_dll_paths = NULL;
+ const char *user_name = NULL;
+ SECTION_IMAGE_INFORMATION main_image_info = { NULL };
++static void *main_image_base;
++static SIZE_T main_image_size;
++
++#if defined(__APPLE__) && defined(__x86_64__)
++static BOOL (*supports_non_native_code_regions)(void);
++static void (*p_register_non_native_code_region)(void *, SIZE_T);
++static BYTE *d3dmetal_enable_unix_call;
++static void *d3dmetal_win32_dispatch;
++static void (*d3dmetal_patch_entrypoint_calls)(void);
++static void (*d3dmetal_patch_unix_calls)(void);
++static void (*d3dmetal_patch_win32_calls)(void *);
++static unixlib_entry_t d3dmetal_dispatch_init;
++
++static void *find_macho_symbol( void *base, const char *name )
++{
++    const struct mach_header_64 *header = base;
++    const struct load_command *command;
++    const struct segment_command_64 *text = NULL, *linkedit = NULL;
++    const struct symtab_command *symtab = NULL;
++    const struct nlist_64 *symbols;
++    const char *strings;
++    UINT_PTR slide, linkedit_base;
++    unsigned int i;
++
++    if (header->magic != MH_MAGIC_64) return NULL;
++    command = (const struct load_command *)(header + 1);
++    for (i = 0; i < header->ncmds; i++)
++    {
++        if (command->cmd == LC_SEGMENT_64)
++        {
++            const struct segment_command_64 *segment = (const struct segment_command_64 *)command;
++            if (!strcmp( segment->segname, SEG_TEXT )) text = segment;
++            else if (!strcmp( segment->segname, SEG_LINKEDIT )) linkedit = segment;
++        }
++        else if (command->cmd == LC_SYMTAB) symtab = (const struct symtab_command *)command;
++        command = (const struct load_command *)((const BYTE *)command + command->cmdsize);
++    }
++    if (!text || !linkedit || !symtab) return NULL;
++
++    slide = (UINT_PTR)base - text->vmaddr;
++    linkedit_base = slide + linkedit->vmaddr - linkedit->fileoff;
++    symbols = (const struct nlist_64 *)(linkedit_base + symtab->symoff);
++    strings = (const char *)(linkedit_base + symtab->stroff);
++    for (i = 0; i < symtab->nsyms; i++)
++    {
++        if (!symbols[i].n_un.n_strx) continue;
++        if (!strcmp( strings + symbols[i].n_un.n_strx, name ))
++            return (void *)(slide + symbols[i].n_value);
++    }
++    return NULL;
++}
++
++static NTSTATUS d3dmetal_dispatch_init_compat( void *args )
++{
++    void **dispatch = args;
++    NTSTATUS status;
++    unsigned int i;
++
++    status = d3dmetal_dispatch_init( args );
++    if (status) return status;
++
++    if (d3dmetal_enable_unix_call) *d3dmetal_enable_unix_call = TRUE;
++    if (d3dmetal_patch_win32_calls && d3dmetal_win32_dispatch)
++        d3dmetal_patch_win32_calls( d3dmetal_win32_dispatch );
++    if (d3dmetal_patch_entrypoint_calls) d3dmetal_patch_entrypoint_calls();
++    if (d3dmetal_patch_unix_calls) d3dmetal_patch_unix_calls();
++
++    for (i = 0; i < 0x160 / sizeof(*dispatch); i++)
++    {
++        if (i == 0 || i == 0x48 / 8 || i == 0x58 / 8 || i == 0x150 / 8 || i == 0x158 / 8)
++            continue;
++        dispatch[i] = NULL;
++    }
++    return status;
++}
++
++static void enable_d3dmetal_unix_calls( void *handle )
++{
++    unixlib_entry_t *unix_call_funcs;
++    Dl_info info;
++    void *symbol;
++
++    if (!(symbol = dlsym( handle, "supports_non_native_code_regions" ))) return;
++    if (!dladdr( symbol, &info ) || !info.dli_fbase) return;
++    d3dmetal_enable_unix_call = find_macho_symbol( info.dli_fbase, "__ZL14enableUnixCall" );
++    d3dmetal_win32_dispatch = find_macho_symbol( info.dli_fbase, "__ZL14gWin32Dispatch" );
++    d3dmetal_patch_entrypoint_calls = dlsym( handle, "_Z24PatchEntrypointCallTablev" );
++    d3dmetal_patch_unix_calls = dlsym( handle, "_Z18PatchUnixCallTablev" );
++    d3dmetal_patch_win32_calls = dlsym( handle, "_Z27PatchWin32DispatchFunctionsP13Win32Dispatch" );
++    if (d3dmetal_enable_unix_call) *d3dmetal_enable_unix_call = TRUE;
++
++    if (!(unix_call_funcs = dlsym( handle, "__wine_unix_call_funcs" ))) return;
++    d3dmetal_dispatch_init = unix_call_funcs[0];
++    unix_call_funcs[0] = d3dmetal_dispatch_init_compat;
++    TRACE( "enabled D3DMetal Unix calls\n" );
++}
++
++static void init_non_native_support(void)
++{
++    void *handle;
++    char *path;
++
++    if (asprintf( &path, "%s/../../external/libd3dshared.dylib", ntdll_dir ) == -1) return;
++    handle = dlopen( path, RTLD_NOW | RTLD_GLOBAL );
++    if (!handle)
++    {
++        TRACE( "failed to load %s: %s\n", path, dlerror() );
++        free( path );
++        return;
++    }
++    free( path );
++
++    enable_d3dmetal_unix_calls( handle );
++    supports_non_native_code_regions = dlsym( handle, "supports_non_native_code_regions" );
++    p_register_non_native_code_region = dlsym( handle, "register_non_native_code_region" );
++    if (!supports_non_native_code_regions || !p_register_non_native_code_region ||
++        !supports_non_native_code_regions())
++    {
++        supports_non_native_code_regions = NULL;
++        p_register_non_native_code_region = NULL;
++    }
++}
++
++void register_non_native_code_region( void *base, SIZE_T size )
++{
++    if (p_register_non_native_code_region && base && size)
++        p_register_non_native_code_region( base, size );
++}
++#else
++static void init_non_native_support(void)
++{
++}
++
++void register_non_native_code_region( void *base, SIZE_T size )
++{
++    (void)base;
++    (void)size;
++}
++#endif
+ 
+ /* die on a fatal error; use only during initialization */
+ static void fatal_error( const char *err, ... )
+@@ -1008,6 +1150,7 @@ static NTSTATUS unwind_builtin_dll( void *args )
+ 
+ static const unixlib_entry_t unix_call_funcs[] =
+ {
++    run_native_thread,
+     load_so_dll,
+     unwind_builtin_dll,
+     unixcall_wine_dbg_write,
+@@ -1023,9 +1166,11 @@ static const unixlib_entry_t unix_call_funcs[] =
+ 
+ static NTSTATUS wow64_load_so_dll( void *args ) { return STATUS_INVALID_IMAGE_FORMAT; }
+ static NTSTATUS wow64_unwind_builtin_dll( void *args ) { return STATUS_UNSUCCESSFUL; }
++static NTSTATUS wow64_run_native_thread( void *args ) { return STATUS_NOT_SUPPORTED; }
+ 
+ const unixlib_entry_t unix_call_wow64_funcs[] =
+ {
++    wow64_run_native_thread,
+     wow64_load_so_dll,
+     wow64_unwind_builtin_dll,
+     wow64_wine_dbg_write,
+@@ -1437,6 +1582,11 @@ static NTSTATUS open_main_image( UNICODE_STRING *nt_name, void **module, SECTION
+     if (!status)
+     {
+         status = virtual_map_module( mapping, module, &size, info, 0, 0, machine );
++        if (NT_SUCCESS(status))
++        {
++            main_image_base = *module;
++            main_image_size = size;
++        }
+         if (status == STATUS_IMAGE_MACHINE_TYPE_MISMATCH && info->ComPlusNativeReady)
+         {
+             info->Machine = native_machine;
+@@ -1566,6 +1716,7 @@ static void load_ntdll_functions( HMODULE module )
+     if (!(p##name = (void *)find_named_export( module, exports, #name ))) \
+         ERR( "%s not found\n", #name )
+ 
++    GET_FUNC( __wine_native_thread_start );
+     GET_FUNC( DbgUiRemoteBreakin );
+     GET_FUNC( KiRaiseUserExceptionDispatcher );
+     GET_FUNC( KiUserExceptionDispatcher );
+@@ -1859,6 +2010,8 @@ static void start_main_thread(void)
+     dbg_init();
+     startup_info_size = server_init_process();
+     msync_init();
++    init_non_native_support();
++    register_non_native_code_region( main_image_base, main_image_size );
+     virtual_map_user_shared_data();
+     init_cpu_info();
+     init_files();
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index 546963a..02ebd46 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -32,6 +32,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <dlfcn.h>
+ #include <pthread.h>
+ #include <signal.h>
+ #include <sys/types.h>
+@@ -74,6 +75,7 @@
+ #include "ddk/wdm.h"
+ #include "wine/server.h"
+ #include "wine/debug.h"
++#include "unixlib.h"
+ #include "unix_private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(thread);
+@@ -1242,6 +1244,61 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
+ }
+ 
+ 
++#ifdef __APPLE__
++static BOOL is_d3dmetal_native_address( void *address )
++{
++    Dl_info info;
++    const char *name;
++
++    if (!dladdr( address, &info ) || !info.dli_fname) return FALSE;
++    name = strrchr( info.dli_fname, '/' );
++    name = name ? name + 1 : info.dli_fname;
++    return !strcmp( name, "libd3dshared.dylib" ) || !strcmp( name, "D3DMetal" );
++}
++
++static void *get_native_d3dmetal_thread( PRTL_THREAD_START_ROUTINE start )
++{
++    static const BYTE thunk_prefix[] =
++    {
++        0x48, 0x83, 0xec, 0x28, /* sub $0x28,%rsp */
++        0x49, 0x89, 0xc8,       /* mov %rcx,%r8 */
++        0x48, 0x8b, 0x05,       /* mov disp32(%rip),%rax */
++    };
++    BYTE code[14];
++    LONG displacement;
++    void **slot;
++    void *target;
++
++    if (virtual_uninterrupted_read_memory( (void *)start, code, sizeof(code) ) != sizeof(code)) return NULL;
++    if (memcmp( code, thunk_prefix, sizeof(thunk_prefix) )) return NULL;
++
++    memcpy( &displacement, code + sizeof(thunk_prefix), sizeof(displacement) );
++    slot = (void **)((BYTE *)start + sizeof(code) + displacement);
++    if (virtual_uninterrupted_read_memory( slot, &target, sizeof(target) ) != sizeof(target)) return NULL;
++    return is_d3dmetal_native_address( target ) ? target : NULL;
++}
++#else
++static void *get_native_d3dmetal_thread( PRTL_THREAD_START_ROUTINE start )
++{
++    (void)start;
++    return NULL;
++}
++#endif
++
++
++NTSTATUS run_native_thread( void *args )
++{
++    typedef ULONG (__attribute__((ms_abi)) *native_thread_proc)(void *);
++    struct native_thread_params *params = args;
++    struct thread_data *thread_data = get_thread_data();
++    native_thread_proc start = (void *)thread_data->native_start;
++
++    if (!start) return STATUS_INVALID_PARAMETER;
++    params->result = start( thread_data->native_param );
++    return STATUS_SUCCESS;
++}
++
++
+ /***********************************************************************
+  *           create_server_thread
+  */
+@@ -1298,8 +1355,28 @@ static NTSTATUS create_server_thread( HANDLE *handle, struct thread_data **data_
+ 
+     data->request_fd = request_pipe[1];
+     data->tid        = tid;
+-    data->start      = start;
+-    data->param      = param;
++
++    /* D3DMetal worker threads have native entry points that cannot run on a
++     * wine thread; route them through __wine_native_thread_start.  wine 11
++     * moved this assignment here from NtCreateThreadEx, which also covers
++     * PsCreateSystemThread since it shares this helper. */
++    {
++        void *native_start = get_native_d3dmetal_thread( start );
++
++        if (p__wine_native_thread_start && native_start)
++        {
++            TRACE( "bridging native D3DMetal thread entry %p through %p\n", start, native_start );
++            data->native_start = native_start;
++            data->native_param = param;
++            data->start        = (void *)p__wine_native_thread_start;
++            data->param        = NULL;
++        }
++        else
++        {
++            data->start = start;
++            data->param = param;
++        }
++    }
+ 
+     *data_ret = data;
+     return STATUS_SUCCESS;
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index c8ca97d..b28109e 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -102,6 +102,8 @@ static inline BOOL is_arm64ec(void)
+ 
+ struct thread_data
+ {
++    void                     *native_start;  /* native thread entry point */
++    void                     *native_param;  /* native thread entry point parameter */
+     TEB         *teb;               /* TEB */
+     int          request_fd;        /* fd for sending server requests */
+     int          reply_fd;          /* fd for receiving server replies */
+@@ -188,9 +190,12 @@ extern void *pKiUserEmulationDispatcher;
+ extern void *pLdrInitializeThunk;
+ extern void *pRtlUserThreadStart;
+ extern void *p__wine_ctrl_routine;
++extern void *p__wine_native_thread_start;
+ extern SYSTEM_DLL_INIT_BLOCK *pLdrSystemDllInitBlock;
+ 
+ struct _FILE_FS_DEVICE_INFORMATION;
++extern NTSTATUS run_native_thread(void *args);
++extern void register_non_native_code_region(void *base, SIZE_T size);
+ 
+ extern const char wine_build[];
+ 
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index db820a8..3143b98 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -3846,6 +3846,7 @@ NTSTATUS virtual_map_builtin_module( HANDLE mapping, void **module, SIZE_T *size
+ NTSTATUS virtual_map_module( HANDLE mapping, void **module, SIZE_T *size, SECTION_IMAGE_INFORMATION *info,
+                              ULONG_PTR limit_low, ULONG_PTR limit_high, USHORT machine )
+ {
++    BOOL native = FALSE;
+     unsigned int status;
+     mem_size_t full_size;
+     unsigned int sec_flags;
+@@ -3866,8 +3867,12 @@ NTSTATUS virtual_map_module( HANDLE mapping, void **module, SIZE_T *size, SECTIO
+         status = virtual_map_image( mapping, module, size, limit_low, limit_high, 0,
+                                     pe_mapping, machine, FALSE, 0 );
+         virtual_fill_image_information( &pe_mapping->image, info );
++        /* a real PE image rather than a builtin: rosetta must know about it
++           before d3dmetal's native code calls in */
++        native = TRUE;
+     }
+     free_pe_mapping_info( pe_mapping );
++    if (native && NT_SUCCESS(status)) register_non_native_code_region( *module, *size );
+     return status;
+ }
+ 
+diff --git a/dlls/ntdll/unixlib.h b/dlls/ntdll/unixlib.h
+index 9cb4443..18f9cca 100644
+--- a/dlls/ntdll/unixlib.h
++++ b/dlls/ntdll/unixlib.h
+@@ -61,6 +61,10 @@ struct load_so_dll_params
+ 
+ struct unwind_builtin_dll_params
+ {
++struct native_thread_params
++{
++    ULONG result;
++};
+     ULONG                       type;
+     struct _DISPATCHER_CONTEXT *dispatch;
+     CONTEXT                    *context;
+@@ -76,6 +80,7 @@ enum ntdll_unix_funcs
+     unix_wine_server_handle_to_fd,
+     unix_wine_spawnvp,
+     unix_system_time_precise,
++    unix_run_native_thread,
+ };
+ 
+ extern unixlib_handle_t __wine_unixlib_handle;
