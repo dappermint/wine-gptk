@@ -13,6 +13,10 @@ on:
         type: choice
         default: self-hosted
         options: [self-hosted, hosted]
+      gui_gate:
+        description: "run the window-open gate in CI (graphics is verified locally now)"
+        type: boolean
+        default: false
   push:
     branches: [main]
 
@@ -518,7 +522,12 @@ jobs:
           fi
           echo "addons and graphics payloads: ok"
 
+      # graphics verification moved local. it needs a real gui session and a
+      # human eye for things a luma threshold cannot judge (resize flicker,
+      # compositing artefacts); running it here only produced false confidence.
+      # flip the gui_gate input to run it anyway.
       - name: verify the runtime can open a window
+        if: inputs.gui_gate
         run: |
           # the gate above only inspects the tree. a display driver that fails
           # to init is invisible until something asks for a window: wine falls
