@@ -265,12 +265,12 @@ jobs:
         run: |
           export PATH="$PWD/ccache-bin:$NIX_TOOL_PATH$PATH"
           cd build
-          # install-lib, not install: the full install target re-generates an
-          # import lib per dll (thousands of winebuild spawns, each taxed by
-          # macOS's per-exec rosetta analytics) and the strip step used to
-          # delete every one of those .a files anyway. measured 2026-08-05:
-          # the relink phase alone was ~25 minutes of the packaging step.
-          make install-lib DESTDIR="$PWD/../staging"
+          # install-lib skips install-dev (headers and static libs we do not
+          # ship). the expensive part is the import lib winebuild does per
+          # dll, which install-lib still performs -- so the lever is
+          # PARALLELISM: the make step runs -j15 while this ran single
+          # threaded, which is what made packaging take longer than the build.
+          make -j"$(( $(sysctl -n hw.logicalcpu) * 3 / 2 ))" install-lib DESTDIR="$PWD/../staging"
           cd ..
           mkdir -p Libraries/Wine
           # cp -c is an apfs clone: metadata only, no byte copy. fallback for
