@@ -1,0 +1,102 @@
+winemac: Keep the outgoing CAContext alive until its successor publishes.
+
+Following on from keeping the outgoing CALayerHost in the hosting window: that
+alone is not enough, because a CALayerHost owns no pixels.  It mirrors a remote
+CAContext, so the moment the rendering process tears its context down the
+hosting window has nothing to show regardless of what the hosting side does
+with its layers.  The residual flash after that change is this teardown.
+
+A resizing client destroys its whole client surface and builds a new one, so
+CAContextSwapChain dealloc ran mid-resize and released the context, its metal
+layer and the container together.  Hold that set back instead and release it
+when the next swapchain is torn down, by which time a successor context has
+long since published.  Exactly one set is ever held, so nothing accumulates.
+
+Together with the hosting-side change the sequence is now continuous: the old
+context keeps publishing its last frame, the new host is stacked above the old
+one, and the old host is only dropped once its replacement has taken over.
+
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+index 949c175..9d29f14 100644
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -4118,6 +4118,10 @@ @interface CAContextSwapChain : NSObject <WineMetalSwapChain>
+ 
+ - (instancetype) initWithHwnd:(void*)hwnd container:(CGRect)container frame:(CGRect)frame;
+ - (void) setContainer:(CGRect)container frame:(CGRect)frame;
+++ (void) deferTeardownOfContext:(CAContext *)context
++                         layer:(CAMetalLayer *)layer
++                     container:(CALayer *)container
++                        device:(macdrv_metal_device)dev;
+ 
+ @end
+ 
+@@ -4201,14 +4205,19 @@ - (CAMetalLayer*) layer
+     return offscreen_layer;
+ }
+ 
+-- (void) dealloc
+-{
+-    if (context_id) macdrv_release_remote_layer(hwnd, context_id);
+-    CAContext *context = remote_context;
+-    CAMetalLayer *layer = offscreen_layer;
+-    CALayer *container = container_layer;
+-    macdrv_metal_device dev = device;
++/* A CALayerHost owns no pixels: it mirrors a remote CAContext, so the instant
++   this process tears its context down the hosting window has nothing to show,
++   no matter what the hosting side does with its layers.  A client that resizes
++   destroys the whole surface and builds a new one, so releasing here left a gap
++   with no content anywhere -- one black frame per resize step.
+ 
++   Keep the outgoing context, and the layers it publishes, alive until the next
++   swapchain has published its replacement.  Exactly one is held back, and it is
++   released as soon as a successor exists or the process is done creating them,
++   so nothing accumulates. */
++static void release_swapchain_resources(CAContext *context, CAMetalLayer *layer,
++                                        CALayer *container, macdrv_metal_device dev)
++{
+     OnMainThreadAsync(^{
+         [context setLayer:nil];
+         [context release];
+@@ -4216,10 +4225,41 @@ - (void) dealloc
+         [container release];
+         if (dev) macdrv_release_metal_device(dev);
+     });
++}
++
++- (void) dealloc
++{
++    if (context_id) macdrv_release_remote_layer(hwnd, context_id);
++
++    /* handing these to the deferred slot rather than releasing them now */
++    [CAContextSwapChain deferTeardownOfContext:remote_context
++                                         layer:offscreen_layer
++                                     container:container_layer
++                                        device:device];
+ 
+     [super dealloc];
+ }
+ 
+++ (void) deferTeardownOfContext:(CAContext *)context
++                         layer:(CAMetalLayer *)layer
++                     container:(CALayer *)container
++                        device:(macdrv_metal_device)dev
++{
++    static CAContext *held_context;
++    static CAMetalLayer *held_layer;
++    static CALayer *held_container;
++    static macdrv_metal_device held_device;
++
++    /* the previously held set has now been superseded, let it go */
++    if (held_context || held_layer || held_container || held_device)
++        release_swapchain_resources(held_context, held_layer, held_container, held_device);
++
++    held_context   = context;
++    held_layer     = layer;
++    held_container = container;
++    held_device    = dev;
++}
++
+ @end
+ 
+ macdrv_metal_swapchain macdrv_create_view_swapchain(macdrv_view v)
