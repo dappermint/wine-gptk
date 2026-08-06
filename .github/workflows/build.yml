@@ -391,12 +391,19 @@ jobs:
 
           # assert it took: a marker surviving here resurrects the silent
           # wined3d fallback this strip exists to prevent
-          for f in Libraries/DXMT/x64/*.dll Libraries/DXMT/x32/*.dll; do
-            case "$(basename "$f")" in winemetal.dll) continue ;; esac
-            if dd if="$f" bs=1 skip=64 count=16 status=none | grep -q "Wine builtin DLL"; then
-              echo "::error::$f still carries the wine builtin marker; whisky will refuse dxmt"
-              exit 1
-            fi
+          # only the frontends stripped above: winemetal.dll really is a
+          # builtin, and nvapi64/nvngx must keep their markers so a stray copy
+          # in a prefix stays inert -- a live nvapi64 makes chromium load a
+          # graphics stack and takes steam's webhelper down with it.
+          for arch in x64 x32; do
+            for dll in d3d11.dll d3d10core.dll dxgi.dll; do
+              f="Libraries/DXMT/$arch/$dll"
+              [ -f "$f" ] || continue
+              if dd if="$f" bs=1 skip=64 count=16 status=none | grep -q "Wine builtin DLL"; then
+                echo "::error::$f still carries the wine builtin marker; whisky will refuse dxmt"
+                exit 1
+              fi
+            done
           done
           echo "dxmt frontends are markerless" | tee -a "$GITHUB_STEP_SUMMARY"
 
