@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       opt:
-        description: "standard -O2, release -O3, fast -O0 for iteration only"
+        description: "standard -O2, release -O3, release-lto -O3+thinLTO (known broken), fast -O0"
         type: choice
         default: standard
-        options: [standard, release, fast]
+        options: [standard, release, release-lto, fast]
       runner:
         description: "where to build: self-hosted is ~10x faster, hosted is the clean-room check"
         type: choice
@@ -267,7 +267,11 @@ jobs:
           # understand llvm bitcode for this, hence the llvm- prefixed tools.
           LTO=""
           case "$OPT_LEVEL" in
-            release)
+            release) OPT="-O3" ;;
+            release-lto)
+              # clang segfaults compiling loader/main.o under -O3 -flto=thin
+              # (frontend crash, not a wine problem), so this is not the
+              # shipping setting.  kept to retry on a newer toolchain.
               OPT="-O3"
               LTO="-flto=thin"
               export AR=llvm-ar RANLIB=llvm-ranlib NM=llvm-nm
